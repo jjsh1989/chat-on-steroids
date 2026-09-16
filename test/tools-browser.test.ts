@@ -43,13 +43,27 @@ describe('Desktop browser invocation boundary',()=>{
     expect(state.execute).toHaveBeenCalledTimes(1);
     expect(reg.tools.get('browser_tabs')!.annotations.idempotentHint).toBe(false);
   });
-  it('keeps unattributed permission explicit and checks it again at dispatch',async()=>{
+  it('keeps unattributed permission explicit and checks it again at dispatch for observation',async()=>{
     const reg=registrar();state.unattributed=false;
     expect((await reg.call('browser_tabs',{action:'list'})).content[0].text).toContain('IDENTITY_REQUIRED');
     expect(state.execute).not.toHaveBeenCalled();state.unattributed=true;
     await reg.call('browser_tabs',{action:'list'});
     const call=state.execute.mock.calls[0]!;expect(call[2]).toBe('unattributed');
     expect(await call[4]()).toBe(true);state.unattributed=false;expect(await call[4]()).toBe(false);
+  });
+  it('never lets Allow unattributed calls authorize a browser mutation',async()=>{
+    const reg=registrar();state.unattributed=true;
+    const blocked=await reg.call('browser_tabs',{action:'new',url:'https://example.com'});
+    expect(blocked.isError).toBe(true);
+    expect(blocked.content[0].text).toContain('DIRECTOR_AUTHORITY_REQUIRED');
+    expect(blocked.content[0].text).toContain('observation only');
+    expect(state.execute).not.toHaveBeenCalled();
+
+    state.caller={sessionId:'session-a',conversationId:'chat-a'};
+    const allowed=await reg.call('browser_tabs',{action:'new',url:'https://example.com'});
+    expect(allowed.isError).not.toBe(true);
+    expect(state.execute).toHaveBeenCalledOnce();
+    expect(state.execute.mock.calls[0]!.slice(2,4)).toEqual(['session:session-a','chat-a']);
   });
   it('retains exact session ownership and refuses superseded or blocked caller execution',async()=>{
     state.caller={sessionId:'session-a',conversationId:'chat-a'};
