@@ -97,7 +97,8 @@ async function refreshDirectorReceipt(sessionId: string | null | undefined): Pro
   if (!sessionId || !inputId) return;
   const receipt = (await listInputs()).find(row => row.id === inputId &&
     (row.sessionId === sessionId || row.deliveredSessionId === sessionId) &&
-    row.purpose !== 'decision' && row.state === 'sent' && Number.isFinite(row.deliveredAt));
+    row.purpose !== 'decision' && row.authoredSource !== 'none' &&
+    row.state === 'sent' && Number.isFinite(row.deliveredAt));
   if (receipt?.deliveredAt !== undefined) confirmDirectorInstruction(sessionId, inputId, receipt.deliveredAt);
 }
 
