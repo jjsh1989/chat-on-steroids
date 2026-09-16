@@ -45,8 +45,8 @@ async function deliver(entry: InputEntry, retry = false): Promise<InputEntry> {
 async function admitDirectorInput(input: InputArgs): Promise<InputEntry> {
   const entry = await enqueueInput(input);
   // This function is reached from the fixed local IPC surface, not from model/tool text.
-  // Durable admission is enough to mint the process-local Director lease; if delivery never
-  // happens there is no remote model capable of spending it, and restart fails closed again.
+  // Admission revokes any previous lease and registers this exact input as pending. It does NOT
+  // grant authority yet: browser/tool receipt evidence must prove ChatGPT received it first.
   noteDirectorInstruction(entry.sessionId, entry.id);
   return entry;
 }
