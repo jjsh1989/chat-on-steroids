@@ -90,7 +90,7 @@ jobs:
         run: npm ci
 
       - name: Re-run focused Director boundary tests
-        run: npx vitest run test/director-authority.test.ts test/tools-browser.test.ts
+        run: npx vitest run test/director-authority.test.ts test/director-write-interlock.test.ts test/input-startup.test.ts test/tools-browser.test.ts
 
       - name: Prove native runner target
         run: node -e "if(process.platform!=='darwin'||process.arch!=='${{ matrix.arch }}')throw new Error('Expected darwin-${{ matrix.arch }}, got '+process.platform+'-'+process.arch)"
