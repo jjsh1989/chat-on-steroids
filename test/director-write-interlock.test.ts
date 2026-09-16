@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Capabilities } from '../src/shared/types.js';
 import type { SurfaceRegistrar, ToolResult } from '../src/main/mcp/kernel.js';
 
 const state = vi.hoisted(() => ({
@@ -19,7 +20,7 @@ import {
 
 function registrar(): SurfaceRegistrar {
   return {
-    guarded: async (_cap, _name, fn) => fn()
+    guarded: async (_cap: keyof Capabilities, _name: string, fn: () => Promise<ToolResult>) => fn()
   } as unknown as SurfaceRegistrar;
 }
 function ok(): ToolResult { return { content: [{ type: 'text', text: 'ran' }] }; }
