@@ -18,6 +18,11 @@ vi.mock('../src/main/session/continuation.js',()=>({compactingConversation:()=>f
 vi.mock('../src/main/agents.js',()=>({dormantWorkerNotice:()=>null,endedWorkerNotice:()=>null,retiredWorkerForConversation:()=>null}));
 vi.mock('../src/main/codex/view-image.js',()=>({validateImageBytes:state.image}));
 import { registerBrowserTools } from '../src/main/mcp/tools-browser.js';
+import {
+  directorSecurityJournal,
+  noteDirectorInstruction,
+  resetDirectorAuthorityForTests
+} from '../src/main/security/director-authority.js';
 
 function registrar() {
   const tools = new Map<string,{schema:z.ZodType;annotations:Record<string,unknown>;handler:(input:unknown)=>Promise<any>}>();
@@ -30,6 +35,7 @@ function registrar() {
 const tabId='11111111-1111-4111-8111-111111111111:12';
 const pageId='22222222-2222-4222-8222-222222222222';
 beforeEach(()=>{
+  resetDirectorAuthorityForTests();
   state.caps={screen:true,control:true};state.unattributed=true;state.caller=null;state.attachment='current';state.blocked=false;
   state.execute.mockReset().mockResolvedValue({value:{ok:true}});state.image.mockClear();
 });
@@ -64,6 +70,30 @@ describe('Desktop browser invocation boundary',()=>{
     expect(allowed.isError).not.toBe(true);
     expect(state.execute).toHaveBeenCalledOnce();
     expect(state.execute.mock.calls[0]!.slice(2,4)).toEqual(['session:session-a','chat-a']);
+  });
+  it('requires a fresh Director instruction after external observation before page action',async()=>{
+    const reg=registrar();state.caller={sessionId:'session-a',conversationId:'chat-a'};
+    const action={tabId,pageId,action:'key',key:'Enter'};
+
+    const withoutDirector=await reg.call('browser_action',action);
+    expect(withoutDirector.isError).toBe(true);
+    expect(withoutDirector.content[0].text).toContain('DIRECTOR_AUTHORITY_REQUIRED');
+    expect(state.execute).not.toHaveBeenCalled();
+
+    noteDirectorInstruction('session-a','input-1',100);
+    await reg.call('browser_snapshot',{tabId});
+    expect(state.execute).toHaveBeenCalledOnce();
+
+    const afterObservation=await reg.call('browser_action',action);
+    expect(afterObservation.isError).toBe(true);
+    expect(afterObservation.content[0].text).toContain('DIRECTOR_REAUTHORIZATION_REQUIRED');
+    expect(state.execute).toHaveBeenCalledOnce();
+    expect(directorSecurityJournal()).toMatchObject([{sessionId:'session-a',tool:'browser_action',reason:'untrusted_external_content'}]);
+
+    noteDirectorInstruction('session-a','input-2',200);
+    const authorized=await reg.call('browser_action',action);
+    expect(authorized.isError).not.toBe(true);
+    expect(state.execute).toHaveBeenCalledTimes(2);
   });
   it('retains exact session ownership and refuses superseded or blocked caller execution',async()=>{
     state.caller={sessionId:'session-a',conversationId:'chat-a'};
