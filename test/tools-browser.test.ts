@@ -97,8 +97,9 @@ describe('Desktop browser invocation boundary',()=>{
     expect(afterObservation.content[0].text).toContain('DIRECTOR_REAUTHORIZATION_REQUIRED');
     expect(state.execute).toHaveBeenCalledOnce();
     expect(directorSecurityJournal()).toMatchObject([
+      {sessionId:'session-a',tool:'browser_action',reason:'missing_director_instruction'},
       {sessionId:'session-a',tool:'browser_action',reason:'director_instruction_pending_delivery'},
-      {sessionId:'session-a',tool:'browser_action',reason:'untrusted_external_content'}
+      {sessionId:'session-a',tool:'browser_action',reason:'untrusted_external_content',sources:['browser:browser_snapshot']}
     ]);
 
     noteDirectorInstruction('session-a','input-2',200);
