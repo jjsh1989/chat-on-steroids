@@ -6,12 +6,14 @@ import { z } from 'zod';
 const state = vi.hoisted(() => ({
   caps: {screen:true,control:true}, unattributed:true,
   caller: null as null | {sessionId:string;conversationId:string},
+  inputs: [] as Array<Record<string, unknown>>,
   attachment:'current', blocked:false, execute:vi.fn(), image:vi.fn(async()=> 'image/jpeg')
 }));
 vi.mock('../src/main/config.js',()=>({getConfig:()=>({multiAgent:{allowUnattributedCalls:state.unattributed}}),effectiveCapabilities:()=>state.caps}));
 vi.mock('../src/main/mcp/call-context.js',()=>({currentCall:()=>({caller:state.caller})}));
 vi.mock('../src/main/mcp/kernel.js',()=>({fail:(text:string)=>({isError:true,content:[{type:'text',text}]}),failIdentity:(text:string)=>({isError:true,content:[{type:'text',text}]})}));
 vi.mock('../src/main/browser-control.js',()=>({browserControl:{execute:state.execute}}));
+vi.mock('../src/main/session/input.js',()=>({listInputs:async()=>state.inputs}));
 vi.mock('../src/main/session/store.js',()=>({conversationAttachment:async()=>state.attachment}));
 vi.mock('../src/main/session/blocked-chats.js',()=>({isChatBlocked:()=>state.blocked}));
 vi.mock('../src/main/session/continuation.js',()=>({compactingConversation:()=>false}));
@@ -36,7 +38,7 @@ const tabId='11111111-1111-4111-8111-111111111111:12';
 const pageId='22222222-2222-4222-8222-222222222222';
 beforeEach(()=>{
   resetDirectorAuthorityForTests();
-  state.caps={screen:true,control:true};state.unattributed=true;state.caller=null;state.attachment='current';state.blocked=false;
+  state.caps={screen:true,control:true};state.unattributed=true;state.caller=null;state.inputs=[];state.attachment='current';state.blocked=false;
   state.execute.mockReset().mockResolvedValue({value:{ok:true}});state.image.mockClear();
 });
 
@@ -71,7 +73,7 @@ describe('Desktop browser invocation boundary',()=>{
     expect(state.execute).toHaveBeenCalledOnce();
     expect(state.execute.mock.calls[0]!.slice(2,4)).toEqual(['session:session-a','chat-a']);
   });
-  it('requires a fresh Director instruction after external observation before page action',async()=>{
+  it('requires exact receipt, then fresh Director instruction after external observation before page action',async()=>{
     const reg=registrar();state.caller={sessionId:'session-a',conversationId:'chat-a'};
     const action={tabId,pageId,action:'key',key:'Enter'};
 
@@ -81,6 +83,12 @@ describe('Desktop browser invocation boundary',()=>{
     expect(state.execute).not.toHaveBeenCalled();
 
     noteDirectorInstruction('session-a','input-1',100);
+    const pending=await reg.call('browser_action',action);
+    expect(pending.isError).toBe(true);
+    expect(pending.content[0].text).toContain('DIRECTOR_DELIVERY_PENDING');
+    expect(state.execute).not.toHaveBeenCalled();
+
+    state.inputs=[{id:'input-1',sessionId:'session-a',state:'sent',deliveredAt:110,purpose:'user'}];
     await reg.call('browser_snapshot',{tabId});
     expect(state.execute).toHaveBeenCalledOnce();
 
@@ -88,9 +96,18 @@ describe('Desktop browser invocation boundary',()=>{
     expect(afterObservation.isError).toBe(true);
     expect(afterObservation.content[0].text).toContain('DIRECTOR_REAUTHORIZATION_REQUIRED');
     expect(state.execute).toHaveBeenCalledOnce();
-    expect(directorSecurityJournal()).toMatchObject([{sessionId:'session-a',tool:'browser_action',reason:'untrusted_external_content'}]);
+    expect(directorSecurityJournal()).toMatchObject([
+      {sessionId:'session-a',tool:'browser_action',reason:'director_instruction_pending_delivery'},
+      {sessionId:'session-a',tool:'browser_action',reason:'untrusted_external_content'}
+    ]);
 
     noteDirectorInstruction('session-a','input-2',200);
+    const replacementPending=await reg.call('browser_action',action);
+    expect(replacementPending.isError).toBe(true);
+    expect(replacementPending.content[0].text).toContain('DIRECTOR_DELIVERY_PENDING');
+    expect(state.execute).toHaveBeenCalledOnce();
+
+    state.inputs.push({id:'input-2',sessionId:'session-a',state:'sent',deliveredAt:210,purpose:'user'});
     const authorized=await reg.call('browser_action',action);
     expect(authorized.isError).not.toBe(true);
     expect(state.execute).toHaveBeenCalledTimes(2);
