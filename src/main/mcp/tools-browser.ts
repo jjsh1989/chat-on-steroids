@@ -4,13 +4,11 @@ import { browserControl } from '../browser-control.js';
 import { browserToolWrites, BROWSER_LIMITS, type BrowserTool } from '../../shared/browser-control.js';
 import { effectiveCapabilities, getConfig } from '../config.js';
 import {
-  confirmDirectorInstruction,
   directorMutationDecision,
   noteBlockedDirectorMutation,
-  noteUntrustedExternalContent,
-  pendingDirectorInstruction
+  noteUntrustedExternalContent
 } from '../security/director-authority.js';
-import { listInputs } from '../session/input.js';
+import { refreshDirectorReceipt } from '../security/director-receipt.js';
 import { currentCall } from './call-context.js';
 import { fail, failIdentity, type SurfaceRegistrar, type ToolResult } from './kernel.js';
 import { toolDeclaration } from './tool-declarations.js';
@@ -86,20 +84,6 @@ function needsDirectorLease(tool: BrowserTool): boolean {
   // MAIN-world JavaScript cross the observation -> action boundary and therefore need a fresh
   // Director instruction after any external content has been observed.
   return tool === 'browser_action' || tool === 'browser_evaluate';
-}
-
-/**
- * Local acceptance is only a pending candidate. Promote it here from the outbox's existing
- * exact delivery receipt before any browser result can influence the authority state.
- */
-async function refreshDirectorReceipt(sessionId: string | null | undefined): Promise<void> {
-  const inputId = pendingDirectorInstruction(sessionId);
-  if (!sessionId || !inputId) return;
-  const receipt = (await listInputs()).find(row => row.id === inputId &&
-    (row.sessionId === sessionId || row.deliveredSessionId === sessionId) &&
-    row.purpose !== 'decision' && row.authoredSource !== 'none' &&
-    row.state === 'sent' && Number.isFinite(row.deliveredAt));
-  if (receipt?.deliveredAt !== undefined) confirmDirectorInstruction(sessionId, inputId, receipt.deliveredAt);
 }
 
 export function registerBrowserTools(reg: SurfaceRegistrar): void {
