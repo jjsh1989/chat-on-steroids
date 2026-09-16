@@ -47,7 +47,11 @@ async function admitDirectorInput(input: InputArgs): Promise<InputEntry> {
   // This function is reached from the fixed local IPC surface, not from model/tool text.
   // Admission revokes any previous lease and registers this exact input as pending. It does NOT
   // grant authority yet: browser/tool receipt evidence must prove ChatGPT received it first.
-  noteDirectorInstruction(entry.sessionId, entry.id);
+  // Generated checkpoints are explicitly authoredSource=none and can never become Director
+  // authority even if a future delivery path accidentally routes one through this IPC helper.
+  if (entry.purpose !== 'decision' && entry.authoredSource !== 'none') {
+    noteDirectorInstruction(entry.sessionId, entry.id);
+  }
   return entry;
 }
 // Only transient startup work lives here; the outbox owns accepted messages.
