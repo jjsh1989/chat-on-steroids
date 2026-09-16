@@ -3,11 +3,12 @@
  *
  * A local desktop input is the only event in this module that may become authority, but local
  * admission alone is deliberately insufficient. The accepted input remains pending until the
- * existing outbox proves ChatGPT received that exact input. External/browser observations can
- * revoke confirmed authority for subsequent mutations, but can never grant it. Restart forgets
- * all grants and therefore fails closed until a fresh local instruction is delivered again.
+ * existing outbox proves ChatGPT received that exact input. External observations can revoke
+ * confirmed authority — or establish a write interlock before any grant exists — but can never
+ * grant authority themselves. Restart forgets all grants and taint and therefore fails closed for
+ * explicit Director-gated operations until a fresh local instruction is delivered again.
  *
- * This is deliberately semantic-free: it does not try to decide whether page text is a prompt
+ * This is deliberately semantic-free: it does not try to decide whether external text is a prompt
  * injection. It enforces provenance. A blocked transition can later be reviewed as an injection
  * candidate without allowing attacker-controlled text to rewrite the policy itself.
  */
@@ -118,7 +119,7 @@ export function confirmDirectorInstruction(
   return true;
 }
 
-/** External observations may inform reasoning, but they revoke confirmed mutation authority. */
+/** External observations may inform reasoning, but they create/reinstate a mutation interlock. */
 export function noteUntrustedExternalContent(
   sessionId: string | null | undefined,
   source: string,
@@ -137,26 +138,31 @@ export function noteUntrustedExternalContent(
   });
 }
 
-/** Only a delivered Director lease with no later untrusted observation may authorize mutation. */
+/**
+ * Only a delivered Director lease with no later untrusted observation authorizes a strict
+ * Director-gated mutation. Taint is checked first so external content also creates a useful
+ * interlock in legacy sessions that have never established a Director lease.
+ */
 export function directorMutationDecision(sessionId: string | null | undefined): DirectorAuthorityDecision {
   if (!sessionId) {
     return { allowed: false, reason: 'missing_director_instruction', ...emptyState() };
   }
   const current = stateFor(sessionId);
+  if (current.taintedAt !== null &&
+      (current.authorizedAt === null || current.taintedAt >= current.authorizedAt)) {
+    return { allowed: false, reason: 'untrusted_external_content', ...current };
+  }
   if (!current.directorInputId) {
     return { allowed: false, reason: 'missing_director_instruction', ...current };
   }
   if (current.authorizedAt === null) {
     return { allowed: false, reason: 'director_instruction_pending_delivery', ...current };
   }
-  if (current.taintedAt !== null && current.taintedAt >= current.authorizedAt) {
-    return { allowed: false, reason: 'untrusted_external_content', ...current };
-  }
   return { allowed: true, reason: null, ...current };
 }
 
 /**
- * Bounded metadata-only quarantine. Raw page text is intentionally not accepted here: an
+ * Bounded metadata-only quarantine. Raw external text is intentionally not accepted here: an
  * attacker cannot persist instructions merely by triggering the defensive journal.
  */
 export function noteBlockedDirectorMutation(
