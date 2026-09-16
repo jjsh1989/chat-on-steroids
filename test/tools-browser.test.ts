@@ -73,6 +73,16 @@ describe('Desktop browser invocation boundary',()=>{
     expect(state.execute).toHaveBeenCalledOnce();
     expect(state.execute.mock.calls[0]!.slice(2,4)).toEqual(['session:session-a','chat-a']);
   });
+  it('never confirms a generated checkpoint as Director authority',async()=>{
+    const reg=registrar();state.caller={sessionId:'session-a',conversationId:'chat-a'};
+    const action={tabId,pageId,action:'key',key:'Enter'};
+    noteDirectorInstruction('session-a','generated-1',100);
+    state.inputs=[{id:'generated-1',sessionId:'session-a',state:'sent',deliveredAt:110,purpose:'user',authoredSource:'none'}];
+    const blocked=await reg.call('browser_action',action);
+    expect(blocked.isError).toBe(true);
+    expect(blocked.content[0].text).toContain('DIRECTOR_DELIVERY_PENDING');
+    expect(state.execute).not.toHaveBeenCalled();
+  });
   it('requires exact receipt, then fresh Director instruction after external observation before page action',async()=>{
     const reg=registrar();state.caller={sessionId:'session-a',conversationId:'chat-a'};
     const action={tabId,pageId,action:'key',key:'Enter'};
