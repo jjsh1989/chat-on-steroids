@@ -1,5 +1,6 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
+import { pendingDirectorInstruction, resetDirectorAuthorityForTests } from '../src/main/security/director-authority.js';
 const ports = vi.hoisted(() => ({ backgroundChats: false, running: false as boolean | null, connect: vi.fn(), status: { state: 'connected', detail: '' },
   browser: { connected: false, present: false, lastSeenAt: null as number | null }, open: vi.fn(), bridge: vi.fn(), enqueue: vi.fn(), cancel: vi.fn(), note: vi.fn(), rows: [] as InputEntry[], listeners: new Set<() => void>() }));
 vi.mock('../src/main/connection.js', () => ({ connect: ports.connect, getStatus: () => ports.status, onStatusChange: (fn: () => void) => { ports.listeners.add(fn); return () => ports.listeners.delete(fn); } }));
@@ -10,7 +11,7 @@ vi.mock('../src/main/session/input.js', () => ({ enqueueInput: ports.enqueue, ca
 import { sendDesktopInput, cancelDesktopInput, retryQueuedInputBrowser, resetInputStartupForTests, stopInputStartup } from '../src/main/session/start-input.js';
 const request: InputArgs = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', sessionId: null, text: 'Please start', mode: 'auto', dueAt: 0, model: null, reasoningEffort: null };
 beforeEach(() => {
-  vi.resetAllMocks(); resetInputStartupForTests();
+  vi.resetAllMocks(); resetInputStartupForTests(); resetDirectorAuthorityForTests();
   ports.rows = []; ports.listeners.clear(); ports.backgroundChats = false; ports.running = false;
   ports.status = { state: 'connected', detail: '' }; ports.browser = { connected: false, present: false, lastSeenAt: null };
   ports.bridge.mockResolvedValue(8765); ports.open.mockResolvedValue('chrome.exe');
@@ -31,6 +32,15 @@ it('accepts input before readiness, but waits for the connector before opening t
   for (const listener of ports.listeners) listener();
   await pending;
   expect(ports.enqueue).toHaveBeenCalledTimes(1); expect(ports.listeners.size).toBe(0);
+});
+it('never promotes a generated checkpoint into a pending Director instruction', async () => {
+  const sessionId = 'session-existing';
+  await sendDesktopInput({ ...request, sessionId, authoredSource: 'none', mode: 'finish' });
+  expect(pendingDirectorInstruction(sessionId)).toBeNull();
+
+  const id = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+  await sendDesktopInput({ ...request, id, sessionId, authoredSource: 'text', mode: 'finish' });
+  expect(pendingDirectorInstruction(sessionId)).toBe(id);
 });
 it('leaves explicit tool delivery on the durable queue without browser startup', async () => {
   const row = await sendDesktopInput({ ...request, sessionId: 'session-existing', delivery: 'tool' });
