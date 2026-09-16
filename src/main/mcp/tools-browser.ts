@@ -3,6 +3,11 @@ import { z } from 'zod';
 import { browserControl } from '../browser-control.js';
 import { browserToolWrites, BROWSER_LIMITS, type BrowserTool } from '../../shared/browser-control.js';
 import { effectiveCapabilities, getConfig } from '../config.js';
+import {
+  directorMutationDecision,
+  noteBlockedDirectorMutation,
+  noteUntrustedExternalContent
+} from '../security/director-authority.js';
 import { currentCall } from './call-context.js';
 import { fail, failIdentity, type SurfaceRegistrar, type ToolResult } from './kernel.js';
 import { toolDeclaration } from './tool-declarations.js';
@@ -73,6 +78,13 @@ const declarations: Record<BrowserTool, { description: string; inputSchema: z.Zo
   }
 };
 
+function needsDirectorLease(tool: BrowserTool): boolean {
+  // Navigation/tab orchestration is retained for autonomous research. Input into a page and
+  // MAIN-world JavaScript cross the observation -> action boundary and therefore need a fresh
+  // Director instruction after any external content has been observed.
+  return tool === 'browser_action' || tool === 'browser_evaluate';
+}
+
 export function registerBrowserTools(reg: SurfaceRegistrar): void {
   for (const [name, declaration] of Object.entries(declarations)) {
     const tool = name as BrowserTool;
@@ -88,12 +100,22 @@ export function registerBrowserTools(reg: SurfaceRegistrar): void {
         const caller = currentCall()?.caller;
         // Unattributed calls are useful for bounded observation, but they are not authority.
         // A model, page or third-party source must never turn the user's convenience setting
-        // into permission to mutate browser state. This is the first Director boundary: every
-        // browser write needs an exact local session + conversation proven outside model text.
+        // into permission to mutate browser state.
         if (writes && (!caller?.sessionId || !caller.conversationId)) {
           return failIdentity(
-            'DIRECTOR_AUTHORITY_REQUIRED: browser mutations require an exact local session and conversation proven by the Director boundary. "Allow unattributed calls" permits observation only; it never grants mutation authority. No browser operation ran.'
+            'DIRECTOR_AUTHORITY_REQUIRED: browser mutations require an exact local session and conversation. "Allow unattributed calls" permits observation only; it never grants mutation authority. No browser operation ran.'
           );
+        }
+        if (needsDirectorLease(tool)) {
+          const decision = directorMutationDecision(caller?.sessionId);
+          if (!decision.allowed) {
+            noteBlockedDirectorMutation(caller?.sessionId, tool, decision);
+            return failIdentity(
+              decision.reason === 'untrusted_external_content'
+                ? 'DIRECTOR_REAUTHORIZATION_REQUIRED: external browser content was observed after the last local instruction. Continue safe observation if useful, present the proposed action or roadmap change to the user, and wait for a fresh instruction from the local client. No browser action ran.'
+                : 'DIRECTOR_AUTHORITY_REQUIRED: this consequential browser action has no current authorization from a user-authored local desktop instruction. Ask the user to authorize the action from the client. No browser action ran.'
+            );
+          }
         }
         const owner = caller?.sessionId
           ? `session:${caller.sessionId}`
@@ -107,12 +129,17 @@ export function registerBrowserTools(reg: SurfaceRegistrar): void {
           if (owner === 'unattributed') return !writes && config.multiAgent.allowUnattributedCalls;
           const chat = caller?.conversationId;
           if (!chat || !caller?.sessionId) return false;
+          if (needsDirectorLease(tool) && !directorMutationDecision(caller.sessionId).allowed) return false;
           const attached = await conversationAttachment(chat, caller.sessionId);
           return attached === 'current' && !isChatBlocked(chat) && !compactingConversation(chat) &&
             !retiredWorkerForConversation(chat) && !dormantWorkerNotice(chat) && !endedWorkerNotice(chat) && effectiveCapabilities(getConfig())[capability];
         };
         const result = await browserControl.execute(tool, args, owner, caller?.conversationId ?? null, allowed);
         if (result.error) return fail(result.error);
+        // Any successful browser observation is external data, never renewed authority. Mark the
+        // exact session before returning it to the model so a subsequent action must come back
+        // through the Director. Unattributed observation cannot taint a session it does not own.
+        if (!writes && caller?.sessionId) noteUntrustedExternalContent(caller.sessionId, `browser:${tool}`);
         // No duplicate image in structured/text results. Reuse the existing full pixel validator.
         const response: ToolResult = { content: [{ type: 'text', text: JSON.stringify(result.value ?? null) }], structuredContent: { value: result.value ?? null } };
         if (result.image) {
