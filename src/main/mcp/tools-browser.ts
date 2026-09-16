@@ -4,10 +4,13 @@ import { browserControl } from '../browser-control.js';
 import { browserToolWrites, BROWSER_LIMITS, type BrowserTool } from '../../shared/browser-control.js';
 import { effectiveCapabilities, getConfig } from '../config.js';
 import {
+  confirmDirectorInstruction,
   directorMutationDecision,
   noteBlockedDirectorMutation,
-  noteUntrustedExternalContent
+  noteUntrustedExternalContent,
+  pendingDirectorInstruction
 } from '../security/director-authority.js';
+import { listInputs } from '../session/input.js';
 import { currentCall } from './call-context.js';
 import { fail, failIdentity, type SurfaceRegistrar, type ToolResult } from './kernel.js';
 import { toolDeclaration } from './tool-declarations.js';
@@ -85,6 +88,19 @@ function needsDirectorLease(tool: BrowserTool): boolean {
   return tool === 'browser_action' || tool === 'browser_evaluate';
 }
 
+/**
+ * Local acceptance is only a pending candidate. Promote it here from the outbox's existing
+ * exact delivery receipt before any browser result can influence the authority state.
+ */
+async function refreshDirectorReceipt(sessionId: string | null | undefined): Promise<void> {
+  const inputId = pendingDirectorInstruction(sessionId);
+  if (!sessionId || !inputId) return;
+  const receipt = (await listInputs()).find(row => row.id === inputId &&
+    (row.sessionId === sessionId || row.deliveredSessionId === sessionId) &&
+    row.purpose !== 'decision' && row.state === 'sent' && Number.isFinite(row.deliveredAt));
+  if (receipt?.deliveredAt !== undefined) confirmDirectorInstruction(sessionId, inputId, receipt.deliveredAt);
+}
+
 export function registerBrowserTools(reg: SurfaceRegistrar): void {
   for (const [name, declaration] of Object.entries(declarations)) {
     const tool = name as BrowserTool;
@@ -98,6 +114,7 @@ export function registerBrowserTools(reg: SurfaceRegistrar): void {
       const capability = writes ? 'control' : 'screen';
       return reg.guarded(capability, tool, async () => {
         const caller = currentCall()?.caller;
+        await refreshDirectorReceipt(caller?.sessionId);
         // Unattributed calls are useful for bounded observation, but they are not authority.
         // A model, page or third-party source must never turn the user's convenience setting
         // into permission to mutate browser state.
@@ -112,8 +129,10 @@ export function registerBrowserTools(reg: SurfaceRegistrar): void {
             noteBlockedDirectorMutation(caller?.sessionId, tool, decision);
             return failIdentity(
               decision.reason === 'untrusted_external_content'
-                ? 'DIRECTOR_REAUTHORIZATION_REQUIRED: external browser content was observed after the last local instruction. Continue safe observation if useful, present the proposed action or roadmap change to the user, and wait for a fresh instruction from the local client. No browser action ran.'
-                : 'DIRECTOR_AUTHORITY_REQUIRED: this consequential browser action has no current authorization from a user-authored local desktop instruction. Ask the user to authorize the action from the client. No browser action ran.'
+                ? 'DIRECTOR_REAUTHORIZATION_REQUIRED: external browser content was observed after the last delivered local instruction. Continue safe observation if useful, present the proposed action or roadmap change to the user, and wait for a fresh instruction from the local client. No browser action ran.'
+                : decision.reason === 'director_instruction_pending_delivery'
+                  ? 'DIRECTOR_DELIVERY_PENDING: a fresh local instruction was accepted but delivery to ChatGPT is not yet proven. The previous roadmap remains revoked until the exact receipt arrives. No browser action ran.'
+                  : 'DIRECTOR_AUTHORITY_REQUIRED: this consequential browser action has no current authorization from a delivered user-authored local desktop instruction. Ask the user to authorize the action from the client. No browser action ran.'
             );
           }
         }
