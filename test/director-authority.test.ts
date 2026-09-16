@@ -52,6 +52,23 @@ it('a newer local instruction revokes the old lease before delivery and stale re
   expect(directorMutationDecision('session-a')).toMatchObject({ allowed: true, directorInputId: 'input-2', authorizedAt: 130 });
 });
 
+it('external observation interlocks a legacy session even before its first Director lease', () => {
+  noteUntrustedExternalContent('session-a', 'browser:browser_snapshot', 100);
+  expect(directorMutationDecision('session-a')).toMatchObject({
+    allowed: false,
+    reason: 'untrusted_external_content',
+    directorInputId: null,
+    authorizedAt: null,
+    taintedAt: 100,
+    sources: ['browser:browser_snapshot']
+  });
+
+  noteDirectorInstruction('session-a', 'input-1', 110);
+  expect(directorMutationDecision('session-a').reason).toBe('director_instruction_pending_delivery');
+  expect(confirmDirectorInstruction('session-a', 'input-1', 120)).toBe(true);
+  expect(directorMutationDecision('session-a')).toMatchObject({ allowed: true, reason: null, authorizedAt: 120 });
+});
+
 it('lets external content inform the session but requires fresh delivered Director authority before mutation', () => {
   noteDirectorInstruction('session-a', 'input-1', 100);
   confirmDirectorInstruction('session-a', 'input-1', 110);
