@@ -3,6 +3,7 @@ import { connect, getStatus, onStatusChange } from '../connection.js';
 import { startBridge } from '../bridge.js';
 import { wakeBrowserUrl, resetBrowserStartupForTests } from '../browser-startup.js';
 import { getConfig } from '../config.js';
+import { noteDirectorInstruction } from '../security/director-authority.js';
 import { enqueueInput, cancelInput, listInputs, noteInputStartupError, type InputArgs, type InputEntry } from './input.js';
 
 function wakeBrowser(entry: InputEntry, retry = false): Promise<void> {
@@ -41,6 +42,14 @@ async function deliver(entry: InputEntry, retry = false): Promise<InputEntry> {
     return await noteInputStartupError(entry.id, `Message queued. Browser startup failed: ${(error as Error).message}`) ?? entry;
   }
 }
+async function admitDirectorInput(input: InputArgs): Promise<InputEntry> {
+  const entry = await enqueueInput(input);
+  // This function is reached from the fixed local IPC surface, not from model/tool text.
+  // Durable admission is enough to mint the process-local Director lease; if delivery never
+  // happens there is no remote model capable of spending it, and restart fails closed again.
+  noteDirectorInstruction(entry.sessionId, entry.id);
+  return entry;
+}
 // Only transient startup work lives here; the outbox owns accepted messages.
 const starting = new Map<string, AbortController>();
 let stopped = false;
@@ -65,10 +74,10 @@ async function startAcceptedInput(entry: InputEntry, controller: AbortController
 }
 export async function sendDesktopInput(input: InputArgs): Promise<InputEntry> {
   if (stopped) throw new Error('The app is shutting down');
-  if (input.mode === 'finish' || starting.has(input.id)) return enqueueInput(input);
+  if (input.mode === 'finish' || starting.has(input.id)) return admitDirectorInput(input);
   const controller = new AbortController(); starting.set(input.id, controller);
   try {
-    const entry = await enqueueInput(input);
+    const entry = await admitDirectorInput(input);
     if (controller.signal.aborted) { await cancelInput(input.id); controller.signal.throwIfAborted(); }
     if (entry.state !== 'queued' || entry.transportIntent === 'tool' || entry.attachmentDelivery === 'tool') {
       starting.delete(input.id); return entry;
