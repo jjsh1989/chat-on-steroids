@@ -55,9 +55,12 @@ jobs:
           COS_PLUGIN_LIVE_TEST: '1'
         run: npx vitest run test/plugins-live-proxy.test.ts test/plugins-python-live.test.ts test/plugins-catalog-live.test.ts
 
+  # Prototype packages are intentionally independent of the aggregate cross-platform verify
+  # matrix. The package jobs run the Director regression tests and native macOS smoke checks
+  # themselves, so an unrelated/flaky Windows verify must not prevent creation of a Mac test
+  # artifact. A green package job is prototype evidence, not a release-quality all-platform gate.
   package-director-test-macos:
     name: Package Director prototype · ${{ matrix.name }}
-    needs: verify
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
