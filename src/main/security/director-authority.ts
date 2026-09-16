@@ -107,7 +107,8 @@ export function confirmDirectorInstruction(
   if (!sessionId) return false;
   const current = stateFor(sessionId);
   const normalized = clean(inputId, 80);
-  if (!normalized || current.directorInputId !== normalized || current.authorizedAt !== null) return false;
+  if (!normalized || current.directorInputId !== normalized || current.authorizedAt !== null ||
+      (current.acceptedAt !== null && deliveredAt < current.acceptedAt)) return false;
   authority.set(sessionId, {
     ...current,
     authorizedAt: deliveredAt,
