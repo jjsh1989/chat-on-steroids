@@ -82,15 +82,29 @@ export function registerBrowserTools(reg: SurfaceRegistrar): void {
       annotations: { readOnlyHint: !normallyWrites && tool !== 'browser_tabs', destructiveHint: normallyWrites || tool === 'browser_tabs', idempotentHint: !normallyWrites && tool !== 'browser_tabs', openWorldHint: true }
     })), input => {
       const args = input as Record<string, unknown>;
-      const capability = browserToolWrites(tool, args) ? 'control' : 'screen';
+      const writes = browserToolWrites(tool, args);
+      const capability = writes ? 'control' : 'screen';
       return reg.guarded(capability, tool, async () => {
         const caller = currentCall()?.caller;
-        const owner = caller?.sessionId ? `session:${caller.sessionId}` : getConfig().multiAgent.allowUnattributedCalls ? 'unattributed' : null;
-        if (!owner) return failIdentity('BROWSER_IDENTITY_REQUIRED: exact local session or Allow unattributed calls is required. No browser operation ran.');
+        // Unattributed calls are useful for bounded observation, but they are not authority.
+        // A model, page or third-party source must never turn the user's convenience setting
+        // into permission to mutate browser state. This is the first Director boundary: every
+        // browser write needs an exact local session + conversation proven outside model text.
+        if (writes && (!caller?.sessionId || !caller.conversationId)) {
+          return failIdentity(
+            'DIRECTOR_AUTHORITY_REQUIRED: browser mutations require an exact local session and conversation proven by the Director boundary. "Allow unattributed calls" permits observation only; it never grants mutation authority. No browser operation ran.'
+          );
+        }
+        const owner = caller?.sessionId
+          ? `session:${caller.sessionId}`
+          : !writes && getConfig().multiAgent.allowUnattributedCalls
+            ? 'unattributed'
+            : null;
+        if (!owner) return failIdentity('BROWSER_IDENTITY_REQUIRED: exact local session or Allow unattributed calls is required for observation. No browser operation ran.');
         const allowed = async () => {
           const config = getConfig();
           if (!effectiveCapabilities(config)[capability]) return false;
-          if (owner === 'unattributed') return config.multiAgent.allowUnattributedCalls;
+          if (owner === 'unattributed') return !writes && config.multiAgent.allowUnattributedCalls;
           const chat = caller?.conversationId;
           if (!chat || !caller?.sessionId) return false;
           const attached = await conversationAttachment(chat, caller.sessionId);
