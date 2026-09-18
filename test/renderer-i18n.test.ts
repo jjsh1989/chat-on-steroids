@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { JSDOM } from 'jsdom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import zhCN from '../src/renderer/locales/zh-CN.json';
+import esES from '../src/renderer/locales/es-ES.json';
 
 let dom: JSDOM;
 beforeEach(() => {
@@ -13,6 +14,45 @@ beforeEach(() => {
 afterEach(() => dom.window.close());
 
 describe('Chinese app interface', () => {
+  it('offers Spanish in Setup and Settings and translates the first-run shell without replacing controls', async () => {
+    window.localStorage.setItem('cos.ui.language', 'es-ES');
+    const { initLanguage, setLanguage, currentLanguage, t } = await import('../src/renderer/i18n.js');
+    initLanguage();
+    const spanish = document.querySelector<HTMLButtonElement>('[data-language="es-ES"]')!;
+    const english = document.querySelector<HTMLButtonElement>('[data-language="en"]')!;
+    const select = document.getElementById('uiLanguage') as HTMLSelectElement;
+    const connect = document.getElementById('connectBtn')!;
+    expect(spanish).not.toBeNull();
+    expect(spanish.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+    expect(select.querySelector('option[value="es-ES"]')?.textContent).toBe('Español');
+    expect(spanish.getAttribute('aria-pressed')).toBe('true');
+    expect(select.value).toBe('es-ES');
+    expect(currentLanguage()).toBe('es-ES');
+    expect(document.documentElement.lang).toBe('es-ES');
+    expect(document.querySelector('.setup-heading h1')!.textContent).toBe('Configuración');
+    expect(document.getElementById('newChat')!.textContent!.trim()).toBe('Nuevo chat');
+    expect(connect.textContent!.trim()).toBe('Conectar');
+    expect(document.getElementById('welcomeDialogTitle')!.textContent).toBe('Bienvenido a Chat On Steroids');
+    expect(document.getElementById('welcomeOpenChatGPT')!.textContent!.trim()).toBe('Abrir ChatGPT');
+    const sameConnect = connect;
+    english.click();
+    expect(currentLanguage()).toBe('en');
+    expect(document.getElementById('connectBtn')).toBe(sameConnect);
+    expect(document.querySelector('.setup-heading h1')!.textContent).toBe('Setup');
+    setLanguage('es-ES');
+    expect(t('Sign in')).toBe('Iniciar sesión');
+    expect(window.localStorage.getItem('cos.ui.language')).toBe('es-ES');
+  });
+
+  it('auto-selects Spanish on a Spanish system only when no explicit language was saved', async () => {
+    Object.defineProperty(window.navigator, 'language', { value: 'es-ES', configurable: true });
+    const { initLanguage, currentLanguage } = await import('../src/renderer/i18n.js');
+    initLanguage();
+    expect(currentLanguage()).toBe('es-ES');
+    expect(document.documentElement.lang).toBe('es-ES');
+    expect((document.getElementById('uiLanguage') as HTMLSelectElement).value).toBe('es-ES');
+  });
+
   it('exposes flagged setup choices and keeps them synchronized with settings and reloads', async () => {
     window.localStorage.setItem('cos.ui.language', 'zh-CN');
     const { initLanguage } = await import('../src/renderer/i18n.js');
@@ -186,6 +226,11 @@ describe('Chinese app interface', () => {
     }
     expect(missing).toEqual([]);
     for (const [key, translation] of Object.entries(catalog)) {
+      expect(translation.trim(), key).not.toBe('');
+      expect([...translation.matchAll(/\{\d+\}/g)].map(match => match[0]).sort(), key)
+        .toEqual([...key.matchAll(/\{\d+\}/g)].map(match => match[0]).sort());
+    }
+    for (const [key, translation] of Object.entries(esES)) {
       expect(translation.trim(), key).not.toBe('');
       expect([...translation.matchAll(/\{\d+\}/g)].map(match => match[0]).sort(), key)
         .toEqual([...key.matchAll(/\{\d+\}/g)].map(match => match[0]).sort());
