@@ -166,7 +166,7 @@ function showTab(name: string): void {
   for (const id of FEEDS) stickToNewest(id);
 }
 
-$('welcomeOpenChatGPT').addEventListener('click', () => void run(api.openLink('https://chatgpt.com/')));
+$('welcomeOpenChatGPT').addEventListener('click', () => void run(api.openChatGPT()));
 $('welcomeOpenSetup').addEventListener('click', () => {
   closeWelcome();
   showAllSteps = true;
