@@ -208,32 +208,29 @@ describe('Localized app interface', () => {
     expect(confirmedComposerModel()).toEqual({ model: 'gpt-6-astra', reasoningEffort: 'high' });
   });
 
-  it('covers every static app label and keeps interpolated content in translated messages', () => {
-    const catalog: Record<string, string> = zhCN;
-    const walker = document.createTreeWalker(document.body, 4);
-    const missing: string[] = [];
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-      if (node.parentElement?.closest('script, style, svg, code, kbd, textarea, [translate="no"]')) continue;
-      const text = node.textContent!.replace(/\s+/g, ' ').trim();
-      if (/[a-zA-Z]{2}/.test(text) && !catalog[text]) missing.push(text);
-    }
-    for (const node of document.querySelectorAll('[title], [placeholder], [aria-label]')) {
-      for (const attr of ['title', 'placeholder', 'aria-label']) {
-        const text = node.getAttribute(attr);
-        if (text && /[a-zA-Z]{2}/.test(text) && !catalog[text]) missing.push(text);
+  it('covers every static app label in both translated catalogs and keeps interpolated content intact', () => {
+    const catalogs: Array<Record<string, string>> = [zhCN, esES];
+    for (const catalog of catalogs) {
+      const walker = document.createTreeWalker(document.body, 4);
+      const missing: string[] = [];
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        if (node.parentElement?.closest('script, style, svg, code, kbd, textarea, [translate="no"]')) continue;
+        const text = node.textContent!.replace(/\s+/g, ' ').trim();
+        if (/[a-zA-Z]{2}/.test(text) && !catalog[text]) missing.push(text);
       }
-    }
-    expect(missing).toEqual([]);
-    for (const [key, translation] of Object.entries(catalog)) {
-      expect(translation.trim(), key).not.toBe('');
-      expect([...translation.matchAll(/\{\d+\}/g)].map(match => match[0]).sort(), key)
-        .toEqual([...key.matchAll(/\{\d+\}/g)].map(match => match[0]).sort());
-    }
-    for (const [key, translation] of Object.entries(esES)) {
-      expect(translation.trim(), key).not.toBe('');
-      expect([...translation.matchAll(/\{\d+\}/g)].map(match => match[0]).sort(), key)
-        .toEqual([...key.matchAll(/\{\d+\}/g)].map(match => match[0]).sort());
+      for (const node of document.querySelectorAll('[title], [placeholder], [aria-label]')) {
+        for (const attr of ['title', 'placeholder', 'aria-label']) {
+          const text = node.getAttribute(attr);
+          if (text && /[a-zA-Z]{2}/.test(text) && !catalog[text]) missing.push(text);
+        }
+      }
+      expect(missing).toEqual([]);
+      for (const [key, translation] of Object.entries(catalog)) {
+        expect(translation.trim(), key).not.toBe('');
+        expect([...translation.matchAll(/\{\d+\}/g)].map(match => match[0]).sort(), key)
+          .toEqual([...key.matchAll(/\{\d+\}/g)].map(match => match[0]).sort());
+      }
     }
   });
 });
