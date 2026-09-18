@@ -54,3 +54,82 @@ jobs:
         env:
           COS_PLUGIN_LIVE_TEST: '1'
         run: npx vitest run test/plugins-live-proxy.test.ts test/plugins-python-live.test.ts test/plugins-catalog-live.test.ts
+
+  # Prototype packages are intentionally independent of the aggregate cross-platform verify
+  # matrix. The package jobs run the Director regression tests and native macOS smoke checks
+  # themselves, so an unrelated/flaky Windows verify must not prevent creation of a Mac test
+  # artifact. A green package job is prototype evidence, not a release-quality all-platform gate.
+  package-director-test-macos:
+    name: Package Director prototype · ${{ matrix.name }}
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Intel x64
+            runner: macos-15-intel
+            arch: x64
+            script: dist:mac:x64
+          - name: macOS Apple Silicon arm64
+            runner: macos-15
+            arch: arm64
+            script: dist:mac:arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          architecture: ${{ matrix.arch }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Re-run focused Director and first-run UI tests
+        run: npx vitest run test/director-authority.test.ts test/director-write-interlock.test.ts test/input-startup.test.ts test/tools-browser.test.ts test/renderer-i18n.test.ts
+
+      - name: Prove native runner target
+        run: node -e "if(process.platform!=='darwin'||process.arch!=='${{ matrix.arch }}')throw new Error('Expected darwin-${{ matrix.arch }}, got '+process.platform+'-'+process.arch)"
+
+      - name: Package macOS test build
+        run: npm run ${{ matrix.script }}
+
+      - name: Smoke packaged runtime natively
+        run: node scripts/smoke-packaged-runtime.mjs --platform darwin --arch ${{ matrix.arch }}
+
+      - name: Audit packaged macOS bundle
+        run: node scripts/smoke-macos-bundle.mjs ${{ matrix.arch }}
+
+      - name: Launch packaged macOS app normally
+        run: node scripts/smoke-macos-gui.mjs ${{ matrix.arch }}
+
+      - name: Verify DMG and ZIP and write checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="release/Chat-On-Steroids-macOS-${{ matrix.arch }}.dmg"
+          zip="release/Chat-On-Steroids-macOS-${{ matrix.arch }}.zip"
+          test -f "$dmg"
+          test -f "$zip"
+          hdiutil verify "$dmg"
+          unzip -tq "$zip"
+          (cd release && shasum -a 256 \
+            "Chat-On-Steroids-macOS-${{ matrix.arch }}.dmg" \
+            "Chat-On-Steroids-macOS-${{ matrix.arch }}.zip" \
+            > "SHA256-DIRECTOR-TEST-${{ matrix.arch }}.txt")
+          cat "release/SHA256-DIRECTOR-TEST-${{ matrix.arch }}.txt"
+
+      - name: Upload Director prototype macOS build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: director-authority-macos-${{ matrix.arch }}-${{ github.run_id }}
+          path: |
+            release/Chat-On-Steroids-macOS-${{ matrix.arch }}.dmg
+            release/Chat-On-Steroids-macOS-${{ matrix.arch }}.zip
+            release/SHA256-DIRECTOR-TEST-${{ matrix.arch }}.txt
+          if-no-files-found: error
+          retention-days: 14

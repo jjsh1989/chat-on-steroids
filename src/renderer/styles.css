@@ -1400,6 +1400,38 @@ details.connector[open] > summary::before { rotate: 90deg; }
 .setup-profile-option > :first-child { flex: 1; min-width: 0; justify-content: flex-start; text-align: left; overflow-wrap: anywhere; }
 .setup-profile-option > :last-child { flex: none; width: 30px; color: var(--muted); }
 .setup-profile-option > :last-child:hover:not(:disabled) { color: var(--red); }
+.welcome-dialog {
+  width: min(620px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: 0;
+  overflow: auto;
+  border: 1px solid var(--edge);
+  border-radius: 18px;
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: 0 24px 90px #0007;
+}
+.welcome-dialog::backdrop { background: #0009; backdrop-filter: blur(4px); }
+.welcome-dialog-head { display: flex; gap: 16px; align-items: flex-start; padding: 24px 24px 18px; border-bottom: 1px solid var(--line); }
+.welcome-dialog-head .mark { flex: none; display: grid; width: 42px; height: 42px; place-items: center; border-radius: 12px; background: var(--hover); }
+.welcome-dialog-head .mark .ico { width: 25px; height: 25px; }
+.welcome-dialog-head h2 { margin: 0; font-size: 21px; line-height: 1.25; }
+.welcome-dialog-head p { margin: 8px 0 0; color: var(--soft); line-height: 1.55; }
+.welcome-steps { display: grid; gap: 0; padding: 8px 24px; }
+.welcome-steps section { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 12px; padding: 18px 0; border-bottom: 1px solid var(--line); }
+.welcome-steps section:last-child { border-bottom: 0; }
+.welcome-step-number { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 999px; background: var(--hover); color: var(--soft); font-weight: 700; }
+.welcome-steps h3 { margin: 3px 0 5px; font-size: 15px; }
+.welcome-steps p { margin: 0 0 12px; color: var(--soft); line-height: 1.5; }
+.welcome-steps .btn-solid { display: inline-flex; gap: 7px; align-items: center; }
+.welcome-dialog-actions { display: flex; gap: 16px; align-items: center; justify-content: space-between; padding: 16px 24px 22px; border-top: 1px solid var(--line); }
+.welcome-dialog-actions p { margin: 0; color: var(--faint); font-size: 12px; line-height: 1.45; }
+@media (max-width: 520px) {
+  .welcome-dialog-head, .welcome-steps, .welcome-dialog-actions { padding-left: 18px; padding-right: 18px; }
+  .welcome-dialog-actions { align-items: flex-start; flex-direction: column; }
+}
+
 .setup-profile-dialog { width: min(320px, calc(100vw - 32px)); margin: auto; padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--ink); }
 .setup-profile-dialog::backdrop { background: #0008; }
 .setup-profile-dialog label { display: block; margin: 12px 0 6px; font-size: 12px; color: var(--soft); }

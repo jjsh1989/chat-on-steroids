@@ -21,6 +21,7 @@ import { registerCoreTools } from './tools-core.js';
 import { registerDesktopTools } from './tools-desktop.js';
 import { registerPluginTools } from './tools-plugins.js';
 import { registerCodeMode } from './code-mode-tool.js';
+import { withDirectorWriteInterlock } from './director-write-interlock.js';
 import { surfaceDefinition, type SurfaceId } from './surfaces.js';
 import { serverInstructions } from './instructions.js';
 import { APP_VERSION } from './../version.js';
@@ -43,18 +44,19 @@ export function buildServer(ctx: ToolContext, surface: SurfaceId, observe?: (con
     observe?.(definition.connectorName, APP_VERSION, instructions, declarations);
     return server;
   }
-  const registrar = createRegistrar(server, ctx, surface, observe ? (name, config) => {
+  const registrar = withDirectorWriteInterlock(createRegistrar(server, ctx, surface, observe ? (name, config) => {
     // Match the SDK's Standard Schema conversion target and object-root normalization.
     const schema = toolSchemaJson(config.inputSchema);
     tools.push({ name, description: config.description, inputSchema: { type: 'object', ...schema }, ...(config.annotations ? { annotations: { ...config.annotations } } : {}) });
-  } : undefined);
+  } : undefined));
   if (surface === 'core') registerCoreTools(registrar);
   else registerDesktopTools(registrar);
   registerCodeMode(registrar, (name, args, parent) => {
     // Reuse the same registration/validation/handler authority, refreshed for every child
-    // so a permission or approved-root change during an awaited script takes effect.
+    // so a permission or approved-root change during an awaited script takes effect. The
+    // Director interlock is reapplied too: code mode cannot bypass a tainted/pending session.
     const live = liveContext();
-    const nested = createRegistrar(null, surface === 'core' ? withManagedSkills(live) : live, surface);
+    const nested = withDirectorWriteInterlock(createRegistrar(null, surface === 'core' ? withManagedSkills(live) : live, surface));
     if (surface === 'core') registerCoreTools(nested);
     else registerDesktopTools(nested);
     return nested.invokeNested(name, args, parent);
