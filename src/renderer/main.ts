@@ -116,6 +116,25 @@ let openGroup: string | null = null;
 let showAllSteps: boolean | null = null;
 let setupProfileBusy = false;
 let setupKeySave: Promise<boolean> = Promise.resolve(true);
+const WELCOME_DISMISSED_KEY = 'cos.ui.welcome.v1.dismissed';
+
+function welcomeDismissed(): boolean {
+  try { return window.localStorage.getItem(WELCOME_DISMISSED_KEY) === '1'; }
+  catch { return false; }
+}
+function closeWelcome(remember = true): void {
+  const dialog = document.getElementById('welcomeDialog') as HTMLDialogElement | null;
+  if (remember) {
+    try { window.localStorage.setItem(WELCOME_DISMISSED_KEY, '1'); } catch { /* Window-only dismissal is still useful. */ }
+  }
+  if (dialog?.open) dialog.close();
+}
+function maybeShowWelcome(): void {
+  if (!state || welcomeDismissed() || missingStep(state) === null) return;
+  const dialog = document.getElementById('welcomeDialog') as HTMLDialogElement | null;
+  if (!dialog || dialog.open || typeof dialog.showModal !== 'function') return;
+  dialog.showModal();
+}
 
 // ------------------------------------------------------------------- tabs
 
@@ -146,6 +165,16 @@ function showTab(name: string): void {
   // opens on the newest line rather than on whatever was oldest in the buffer.
   for (const id of FEEDS) stickToNewest(id);
 }
+
+$('welcomeOpenChatGPT').addEventListener('click', () => void run(api.openLink('https://chatgpt.com/')));
+$('welcomeOpenSetup').addEventListener('click', () => {
+  closeWelcome();
+  showAllSteps = true;
+  if (state) apply(state);
+  showTab('setup');
+});
+$('welcomeLater').addEventListener('click', () => closeWelcome());
+$('welcomeDialog').addEventListener('cancel', () => closeWelcome());
 
 $('backToChat').addEventListener('click', () => showTab('chat'));
 $('workspaceSettings').addEventListener('click', () => showTab('home'));
@@ -1763,6 +1792,7 @@ void (async () => {
   await refresh();
   // A first run has nothing set up, so open on the wizard rather than an empty Home.
   showTab(state && missingStep(state)?.step === 'folder' ? 'setup' : 'chat');
+  maybeShowWelcome();
   const entries = await run(api.getLog());
   for (const entry of entries ?? []) addLogLine(entry);
   const swarm = await run(api.getSwarm());
