@@ -890,6 +890,13 @@ describe('every link the window offers', () => {
     expect(await open(null, { url: 'https://example.com/reference#section' })).toEqual({ ok: true, data: true });
   });
 
+  it('opens first-run ChatGPT in the configured browser through a fixed IPC action', async () => {
+    vi.mocked(openInPreferredBrowser).mockClear();
+    expect(await handlers.get('browser:openChatGPT')!(null, undefined)).toEqual({ ok: true, data: true });
+    expect(openInPreferredBrowser).toHaveBeenCalledOnce();
+    expect(openInPreferredBrowser).toHaveBeenCalledWith('https://chatgpt.com/');
+  });
+
   it.each(['https://example.com/path?q=hello', 'http://localhost:3000/', 'mailto:person@example.com?subject=Hello'])(
     'opens an authored external link: %s', async url => {
       expect(await handlers.get('link:open')!(null, { url })).toEqual({ ok: true, data: true });
