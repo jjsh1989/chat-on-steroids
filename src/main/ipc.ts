@@ -724,6 +724,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     await shell.openExternal(url);
     return true;
   });
+  handle('browser:openChatGPT', async () => {
+    await openInPreferredBrowser('https://chatgpt.com/');
+    return true;
+  });
 
   // ------------------------------------------------------------- sessions
 
