@@ -13,7 +13,7 @@ beforeEach(() => {
 });
 afterEach(() => dom.window.close());
 
-describe('Chinese app interface', () => {
+describe('Localized app interface', () => {
   it('offers Spanish in Setup and Settings and translates the first-run shell without replacing controls', async () => {
     window.localStorage.setItem('cos.ui.language', 'es-ES');
     const { initLanguage, setLanguage, currentLanguage, t } = await import('../src/renderer/i18n.js');
