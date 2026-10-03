@@ -13,7 +13,7 @@ import { compactingConversation } from '../session/continuation.js';
 import { dormantWorkerNotice, endedWorkerNotice, retiredWorkerForConversation } from '../agents.js';
 import { requestCorrelation } from '../session/correlation.js';
 import { strictChatAllowlistEnabled } from '../session/conversation-access.js';
-import { directorMutationDecision, noteBlockedDirectorMutation } from '../session/director-authority.js';
+import { directorMutationDecision, noteBlockedDirectorMutation, noteUntrustedExternalContent } from '../session/director-authority.js';
 import { refreshDirectorReceipt } from '../session/director-receipt.js';
 
 const tabId = z.string().regex(/^[a-f\d-]{36}:\d+$/i).describe('Exact tabId returned by browser_tabs.');
@@ -137,6 +137,9 @@ export function registerBrowserTools(reg: SurfaceRegistrar): void {
         };
         const result = await browserControl.execute(tool, args, owner, exact?.conversationId ?? caller?.conversationId ?? null, allowed);
         if (result.error) return fail(result.error);
+        if (strictChatAllowlistEnabled() && !writes && exact?.sessionId) {
+          noteUntrustedExternalContent(exact.sessionId, `browser:${tool}`);
+        }
         // No duplicate image in structured/text results. Reuse the existing full pixel validator.
         const response: ToolResult = { content: [{ type: 'text', text: JSON.stringify(result.value ?? null) }], structuredContent: { value: result.value ?? null } };
         if (result.image) {
