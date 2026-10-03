@@ -10,6 +10,7 @@ import {
   type DirectorAuthorityDecision
 } from '../session/director-authority.js';
 import { refreshDirectorReceipt } from '../session/director-receipt.js';
+import { directorAuthoritySessionId } from '../session/director-owner.js';
 
 function refusal(decision: DirectorAuthorityDecision): string {
   if (decision.reason === 'untrusted_external_content') {
@@ -35,7 +36,7 @@ export function withDirectorWriteInterlock(reg: SurfaceRegistrar): SurfaceRegist
 
         const caller = currentCall()?.caller;
         const exact = caller?.sessionId ? caller : requestCorrelation(caller?.requestId);
-        const sessionId = exact?.sessionId ?? null;
+        const sessionId = await directorAuthoritySessionId(exact?.sessionId, exact?.conversationId);
         const writes = WRITE_CAPABILITIES.some(item => item === cap);
         const browserSpecific = name.startsWith('browser_');
 
