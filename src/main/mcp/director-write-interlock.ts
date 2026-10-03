@@ -57,7 +57,7 @@ export function withDirectorWriteInterlock(reg: SurfaceRegistrar): SurfaceRegist
 
         // Screen/browser/clipboard observations can contain third-party instructions. They may
         // inform the model, but a successful read revokes mutation authority for the next step.
-        if (!result.isError && sessionId && (cap === 'screen' || cap === 'clipboardRead')) {
+        if (!result.isError && sessionId && !browserSpecific && (cap === 'screen' || cap === 'clipboardRead')) {
           noteUntrustedExternalContent(sessionId, `external:${name}`);
         }
         return result;
