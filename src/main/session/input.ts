@@ -750,6 +750,21 @@ function materializeStages(current: InputEntry[], entry: InputEntry): InputEntry
   });
   return next;
 }
+/**
+ * Exact receipt lookup for Director authority. This deliberately projects only delivery time,
+ * not message text or mutable queue state, and only for a human-authored ordinary input owned by
+ * this local session.
+ */
+export function inputDeliveryReceipt(sessionId: string, inputId: string): Promise<number | null> {
+  return serial(async () => {
+    const row = (await load()).find(entry => entry.id === inputId);
+    if (!row || row.purpose === 'decision' || row.authoredSource === 'none' || !manualInput(row) ||
+        (row.sessionId !== sessionId && row.deliveredSessionId !== sessionId) ||
+        deliveryProof(row) !== 'sent' || !Number.isFinite(row.deliveredAt)) return null;
+    return row.deliveredAt ?? null;
+  });
+}
+
 export function listInputs(): Promise<InputEntry[]> {
   return serial(async () => {
     const current = await retireRemovedSessionReceipts(await load(), true);
