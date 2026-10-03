@@ -4,7 +4,7 @@ import type { SurfaceRegistrar } from '../src/main/mcp/kernel.js';
 import { z } from 'zod';
 
 const state = vi.hoisted(() => ({
-  caps: {screen:true,control:true}, unattributed:true,
+  caps: {screen:true,control:true}, unattributed:true, strict:false,
   caller: null as null | {sessionId?:string;conversationId?:string;requestId?:string},
   proofs: new Map<string,{sessionId:string;conversationId:string}>(),
   attachment:'current', blocked:false, execute:vi.fn(), image:vi.fn(async()=> 'image/jpeg')
@@ -15,11 +15,20 @@ vi.mock('../src/main/mcp/kernel.js',()=>({fail:(text:string)=>({isError:true,con
 vi.mock('../src/main/browser-control.js',()=>({browserControl:{execute:state.execute}}));
 vi.mock('../src/main/session/store.js',()=>({conversationAttachment:async()=>state.attachment}));
 vi.mock('../src/main/session/correlation.js',()=>({requestCorrelation:(id:string)=>state.proofs.get(id) ?? null}));
+vi.mock('../src/main/session/conversation-access.js',()=>({strictChatAllowlistEnabled:()=>state.strict}));
+vi.mock('../src/main/session/director-receipt.js',()=>({refreshDirectorReceipt:async()=>undefined}));
+vi.mock('../src/main/session/director-owner.js',()=>({directorAuthoritySessionId:async(sessionId:string)=>sessionId ?? null}));
 vi.mock('../src/main/session/blocked-chats.js',()=>({isChatBlocked:()=>state.blocked}));
 vi.mock('../src/main/session/continuation.js',()=>({compactingConversation:()=>false}));
 vi.mock('../src/main/agents.js',()=>({dormantWorkerNotice:()=>null,endedWorkerNotice:()=>null,retiredWorkerForConversation:()=>null}));
 vi.mock('../src/main/codex/view-image.js',()=>({validateImageBytes:state.image}));
 import { registerBrowserTools } from '../src/main/mcp/tools-browser.js';
+import {
+  confirmDirectorInstruction,
+  directorMutationDecision,
+  noteDirectorInstruction,
+  resetDirectorAuthorityForTests
+} from '../src/main/session/director-authority.js';
 
 function registrar() {
   const tools = new Map<string,{schema:z.ZodType;annotations:Record<string,unknown>;handler:(input:unknown)=>Promise<any>}>();
@@ -32,7 +41,8 @@ function registrar() {
 const tabId='11111111-1111-4111-8111-111111111111:12';
 const pageId='22222222-2222-4222-8222-222222222222';
 beforeEach(()=>{
-  state.caps={screen:true,control:true};state.unattributed=true;state.caller=null;state.attachment='current';state.blocked=false;
+  resetDirectorAuthorityForTests();
+  state.caps={screen:true,control:true};state.unattributed=true;state.strict=false;state.caller=null;state.attachment='current';state.blocked=false;
   state.execute.mockReset().mockResolvedValue({value:{ok:true}});state.image.mockClear();
   state.proofs.clear();
 });
@@ -64,6 +74,39 @@ describe('Desktop browser invocation boundary',()=>{
     const call=state.execute.mock.calls[0]!;expect(call[2]).toBe('unattributed');
     expect(await call[4]()).toBe(true);state.unattributed=false;expect(await call[4]()).toBe(false);
   });
+  it('strict mode enforces authorize → observe → reauthorize before consequential page action',async()=>{
+    const reg=registrar();
+    state.strict=true;
+    state.caller={sessionId:'session-a',conversationId:'chat-a'};
+    const action={tabId,pageId,action:'key',key:'Enter'};
+
+    const missing=await reg.call('browser_action',action);
+    expect(missing.isError).toBe(true);
+    expect(missing.content[0].text).toContain('DIRECTOR_AUTHORITY_REQUIRED');
+    expect(state.execute).not.toHaveBeenCalled();
+
+    noteDirectorInstruction('session-a','input-1',100);
+    confirmDirectorInstruction('session-a','input-1',110);
+    const observation=await reg.call('browser_snapshot',{tabId});
+    expect(observation.isError).not.toBe(true);
+    expect(directorMutationDecision('session-a')).toMatchObject({
+      allowed:false,
+      reason:'untrusted_external_content',
+      sources:['browser:browser_snapshot']
+    });
+
+    const tainted=await reg.call('browser_action',action);
+    expect(tainted.isError).toBe(true);
+    expect(tainted.content[0].text).toContain('DIRECTOR_REAUTHORIZATION_REQUIRED');
+    expect(state.execute).toHaveBeenCalledTimes(1);
+
+    noteDirectorInstruction('session-a','input-2',120);
+    confirmDirectorInstruction('session-a','input-2',130);
+    const allowed=await reg.call('browser_action',action);
+    expect(allowed.isError).not.toBe(true);
+    expect(state.execute).toHaveBeenCalledTimes(2);
+  });
+
   it('retains exact session ownership and refuses superseded or blocked caller execution',async()=>{
     state.caller={sessionId:'session-a',conversationId:'chat-a'};
     await registrar().call('browser_tabs',{action:'attach',tabId});

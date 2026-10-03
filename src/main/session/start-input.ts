@@ -3,6 +3,8 @@ import { connect, getStatus, onStatusChange } from '../connection.js';
 import { startBridge } from '../bridge.js';
 import { wakeBrowserUrl, resetBrowserStartupForTests } from '../browser-startup.js';
 import { getConfig } from '../config.js';
+import { manualInput } from '../../shared/input.js';
+import { noteDirectorInstruction } from './director-authority.js';
 import { enqueueInput, cancelInput, listInputs, noteInputStartupError, type InputArgs, type InputEntry } from './input.js';
 
 function wakeBrowser(entry: InputEntry, retry = false): Promise<void> {
@@ -69,6 +71,11 @@ export async function sendDesktopInput(input: InputArgs): Promise<InputEntry> {
   const controller = new AbortController(); starting.set(input.id, controller);
   try {
     const entry = await enqueueInput(input);
+    // Only explicit human-authored desktop input may become Director authority. Generated
+    // checkpoints/continuations use authoredSource=none and can never renew a lease.
+    if (entry.sessionId && manualInput(entry) && entry.authoredSource !== 'none') {
+      noteDirectorInstruction(entry.sessionId, entry.id, entry.createdAt);
+    }
     if (controller.signal.aborted) { await cancelInput(input.id); controller.signal.throwIfAborted(); }
     if (entry.state !== 'queued' || entry.transportIntent === 'tool' || entry.attachmentDelivery === 'tool') {
       starting.delete(input.id); return entry;
