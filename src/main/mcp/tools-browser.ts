@@ -15,6 +15,7 @@ import { requestCorrelation } from '../session/correlation.js';
 import { strictChatAllowlistEnabled } from '../session/conversation-access.js';
 import { directorMutationDecision, noteBlockedDirectorMutation, noteUntrustedExternalContent } from '../session/director-authority.js';
 import { refreshDirectorReceipt } from '../session/director-receipt.js';
+import { directorAuthoritySessionId } from '../session/director-owner.js';
 
 const tabId = z.string().regex(/^[a-f\d-]{36}:\d+$/i).describe('Exact tabId returned by browser_tabs.');
 const pageId = z.string().uuid('Copy the top-level pageId from the observation, not a frameId or element ref.').describe('Exact top-level pageId UUID from attach, snapshot or screenshot. Do not extract it from an element ref. Navigation invalidates it.');
@@ -107,14 +108,17 @@ export function registerBrowserTools(reg: SurfaceRegistrar): void {
       return reg.guarded(capability, tool, async () => {
         const caller = currentCall()?.caller;
         const exact = caller?.sessionId ? caller : requestCorrelation(caller?.requestId);
+        const directorSessionId = strictChatAllowlistEnabled()
+          ? await directorAuthoritySessionId(exact?.sessionId, exact?.conversationId)
+          : null;
         if (strictChatAllowlistEnabled() && needsDirectorLease(tool)) {
-          if (!exact?.sessionId) {
-            return failIdentity('DIRECTOR_IDENTITY_REQUIRED: strict mode could not prove the local session for this browser mutation. No browser action ran.');
+          if (!directorSessionId) {
+            return failIdentity('DIRECTOR_IDENTITY_REQUIRED: strict mode could not prove the Director session for this browser mutation. No browser action ran.');
           }
-          await refreshDirectorReceipt(exact.sessionId);
-          const decision = directorMutationDecision(exact.sessionId);
+          await refreshDirectorReceipt(directorSessionId);
+          const decision = directorMutationDecision(directorSessionId);
           if (!decision.allowed) {
-            noteBlockedDirectorMutation(exact.sessionId, tool, decision);
+            noteBlockedDirectorMutation(directorSessionId, tool, decision);
             return failIdentity(directorRefusal(decision.reason));
           }
         }
@@ -127,8 +131,10 @@ export function registerBrowserTools(reg: SurfaceRegistrar): void {
           // Late proof also applies lifecycle restrictions before a queued browser action.
           const identity = exact?.sessionId ? exact : requestCorrelation(caller?.requestId);
           if (!identity?.sessionId) return config.multiAgent.allowUnattributedCalls;
-          if (strictChatAllowlistEnabled() && needsDirectorLease(tool) &&
-              !directorMutationDecision(identity.sessionId).allowed) return false;
+          if (strictChatAllowlistEnabled() && needsDirectorLease(tool)) {
+            const authoritySessionId = await directorAuthoritySessionId(identity.sessionId, identity.conversationId);
+            if (!authoritySessionId || !directorMutationDecision(authoritySessionId).allowed) return false;
+          }
           const chat = identity.conversationId;
           if (!chat) return false;
           const attached = await conversationAttachment(chat, identity.sessionId);
@@ -137,8 +143,8 @@ export function registerBrowserTools(reg: SurfaceRegistrar): void {
         };
         const result = await browserControl.execute(tool, args, owner, exact?.conversationId ?? caller?.conversationId ?? null, allowed);
         if (result.error) return fail(result.error);
-        if (strictChatAllowlistEnabled() && !writes && exact?.sessionId) {
-          noteUntrustedExternalContent(exact.sessionId, `browser:${tool}`);
+        if (strictChatAllowlistEnabled() && !writes && directorSessionId) {
+          noteUntrustedExternalContent(directorSessionId, `browser:${tool}`);
         }
         // No duplicate image in structured/text results. Reuse the existing full pixel validator.
         const response: ToolResult = { content: [{ type: 'text', text: JSON.stringify(result.value ?? null) }], structuredContent: { value: result.value ?? null } };
