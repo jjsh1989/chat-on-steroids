@@ -17,6 +17,7 @@ vi.mock('../src/main/session/conversation-access.js', () => ({
 vi.mock('../src/main/session/director-receipt.js', () => ({
   refreshDirectorReceipt: async () => undefined
 }));
+vi.mock('../src/main/session/director-owner.js',()=>({directorAuthoritySessionId:async(sessionId:string)=>sessionId ?? null}));
 vi.mock('../src/main/mcp/kernel.js', () => ({
   failIdentity: (text: string) => ({ isError: true, content: [{ type: 'text', text }] })
 }));
