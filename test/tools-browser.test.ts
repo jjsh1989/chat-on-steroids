@@ -17,6 +17,7 @@ vi.mock('../src/main/session/store.js',()=>({conversationAttachment:async()=>sta
 vi.mock('../src/main/session/correlation.js',()=>({requestCorrelation:(id:string)=>state.proofs.get(id) ?? null}));
 vi.mock('../src/main/session/conversation-access.js',()=>({strictChatAllowlistEnabled:()=>state.strict}));
 vi.mock('../src/main/session/director-receipt.js',()=>({refreshDirectorReceipt:async()=>undefined}));
+vi.mock('../src/main/session/director-owner.js',()=>({directorAuthoritySessionId:async(sessionId:string)=>sessionId ?? null}));
 vi.mock('../src/main/session/blocked-chats.js',()=>({isChatBlocked:()=>state.blocked}));
 vi.mock('../src/main/session/continuation.js',()=>({compactingConversation:()=>false}));
 vi.mock('../src/main/agents.js',()=>({dormantWorkerNotice:()=>null,endedWorkerNotice:()=>null,retiredWorkerForConversation:()=>null}));
