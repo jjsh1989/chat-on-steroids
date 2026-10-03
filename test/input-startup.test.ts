@@ -8,9 +8,10 @@ vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: ports.open, i
 vi.mock('../src/main/config.js', () => ({ getConfig: () => ({ ui: { backgroundChats: ports.backgroundChats } }) }));
 vi.mock('../src/main/session/input.js', () => ({ enqueueInput: ports.enqueue, cancelInput: ports.cancel, noteInputStartupError: ports.note, listInputs: async () => ports.rows }));
 import { sendDesktopInput, cancelDesktopInput, retryQueuedInputBrowser, resetInputStartupForTests, stopInputStartup } from '../src/main/session/start-input.js';
+import { directorMutationDecision, resetDirectorAuthorityForTests } from '../src/main/session/director-authority.js';
 const request: InputArgs = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', sessionId: null, text: 'Please start', mode: 'auto', dueAt: 0, model: null, reasoningEffort: null };
 beforeEach(() => {
-  vi.resetAllMocks(); resetInputStartupForTests();
+  vi.resetAllMocks(); resetInputStartupForTests(); resetDirectorAuthorityForTests();
   ports.rows = []; ports.listeners.clear(); ports.backgroundChats = false; ports.running = false;
   ports.status = { state: 'connected', detail: '' }; ports.browser = { connected: false, present: false, lastSeenAt: null };
   ports.bridge.mockResolvedValue(8765); ports.open.mockResolvedValue('chrome.exe');
@@ -35,10 +36,29 @@ it('accepts input before readiness, but waits for the connector before opening t
 it('leaves explicit tool delivery on the durable queue without browser startup', async () => {
   const row = await sendDesktopInput({ ...request, sessionId: 'session-existing', delivery: 'tool' });
   expect(row).toMatchObject({ state: 'queued', delivery: 'tool', transportIntent: 'tool' });
+  expect(directorMutationDecision('session-existing')).toMatchObject({
+    allowed: false,
+    reason: 'director_instruction_pending_delivery',
+    directorInputId: request.id
+  });
   await Promise.resolve();
   expect(ports.connect).not.toHaveBeenCalled();
   expect(ports.bridge).not.toHaveBeenCalled();
   expect(ports.open).not.toHaveBeenCalled();
+});
+
+it('never treats generated authoredSource=none work as Director authority', async () => {
+  await sendDesktopInput({
+    ...request,
+    id: 'cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa',
+    sessionId: 'session-existing',
+    delivery: 'tool',
+    authoredSource: 'none'
+  });
+  expect(directorMutationDecision('session-existing')).toMatchObject({
+    allowed: false,
+    reason: 'missing_director_instruction'
+  });
 });
 it('retries only the failed browser wake for the same queued UUID', async () => {
   ports.open.mockRejectedValueOnce(new Error('startup refused'));
