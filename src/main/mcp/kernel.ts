@@ -126,6 +126,8 @@ import {
   requestTurnOwnershipCutoff
 } from '../session/store.js';
 import { sessionFinishDeadline } from '../session/finish.js';
+import { noteUntrustedExternalContent } from '../session/director-authority.js';
+import { directorAuthoritySessionId } from '../session/director-owner.js';
 import type { ToolOutcome } from '../../shared/session.js';
 
 /** The page's exact proof of a request id, by which a running call counts for its chat. */
@@ -1038,6 +1040,16 @@ async function dispatchTracked(
   if (!context.caller.conversationId) {
     const resolved = callerConversation(name, startedAt, requestId);
     if (resolved) setCallerConversation(context, resolved);
+  }
+  // Plugin results are third-party content. Once exact caller identity is known, they may inform
+  // reasoning but cannot carry forward mutation authority. The worker case taints its owning
+  // Prime lease, never an independent worker lease.
+  if (surface === 'plugins' && handlerRan && strictChatAllowlistEnabled() && context.caller.sessionId) {
+    const directorSessionId = await directorAuthoritySessionId(
+      context.caller.sessionId,
+      context.caller.conversationId
+    );
+    if (directorSessionId) noteUntrustedExternalContent(directorSessionId, `plugin:${name}`);
   }
   await reconcileAgentRequestOwners().catch(error => {
     logWarn(`Worker ownership recovery deferred after tool completion: ${error instanceof Error ? error.message : String(error)}`);
