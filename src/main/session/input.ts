@@ -841,6 +841,23 @@ function materializeStages(current: InputEntry[], entry: InputEntry): InputEntry
   });
   return next;
 }
+/**
+ * Exact delivery receipt lookup for a pending Director instruction.
+ *
+ * The candidate input id is already process-local Director state created only by the desktop UI
+ * route. This function proves that exact durable row reached this local session; it never infers
+ * authority from text, timing, a turn boundary or a control-API request.
+ */
+export function inputDeliveryReceipt(sessionId: string, inputId: string): Promise<number | null> {
+  return serial(async () => {
+    const row = (await load()).find(entry => entry.id === inputId);
+    if (!row || row.purpose === 'decision' || row.authoredSource === 'none' || !manualInput(row) ||
+        (row.sessionId !== sessionId && row.deliveredSessionId !== sessionId) ||
+        deliveryProof(row) !== 'sent' || !Number.isFinite(row.deliveredAt)) return null;
+    return row.deliveredAt ?? null;
+  });
+}
+
 export function listInputs(): Promise<InputEntry[]> {
   return serial(async () => {
     const current = await retireRemovedSessionReceipts(await load(), true);
