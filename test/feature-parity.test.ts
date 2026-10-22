@@ -28,7 +28,8 @@ describe('portable browser-backed feature parity', () => {
         recoverAgentTabs: false,
         waitForSubAgents: false,
         autoWorktrees: false,
-        endSleepingWorkerProcesses: false
+        endSleepingWorkerProcesses: false,
+        archiveWorkerChats: false
       });
       expect(browserExtensionRequired(config)).toBe(true);
     }
@@ -73,6 +74,7 @@ describe('portable browser-backed feature parity', () => {
       'update_plan',
       'agents',
       'session_finish',
+      'usage',
       'exec'
     ]);
     expect(surfaceIsUseful('core', config.capabilities, 'darwin')).toBe(true);

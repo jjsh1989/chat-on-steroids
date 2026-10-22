@@ -7,7 +7,10 @@ import { eventTokens } from '../../shared/session.js';
 import { usageDateKey, usageMessageFamily, usageModelKey, usageWeekStart, type ModelUsage, type UsageMessageDay, type UsageModelTokens, type UsageOverview } from '../../shared/usage.js';
 import { getChatModels } from '../chat-models.js';
 import { isProModel } from '../../shared/chat-models.js';
-const row = z.object({ model: z.string().min(1).max(100), scope: z.enum(['model', 'feature', 'shared']), remaining: z.number().finite().nonnegative().nullable(), remainingPercent: z.number().min(0).max(100).nullable(), resetAt: z.number().finite().positive().nullable(), windowSeconds: z.number().finite().positive().nullable() });
+// An extension from before 2.1.40 sends wham/usage windows as "shared": they were Codex's all along.
+const legacyCodex = (entry: { model: string; scope: string }) => entry.scope === 'shared'
+  ? { ...entry, model: entry.model === 'Shared usage' ? 'Codex' : entry.model, scope: 'codex' as const } : entry;
+const row = z.object({ model: z.string().min(1).max(100), scope: z.enum(['model', 'feature', 'codex', 'shared']), remaining: z.number().finite().nonnegative().nullable(), remainingPercent: z.number().min(0).max(100).nullable(), resetAt: z.number().finite().positive().nullable(), windowSeconds: z.number().finite().positive().nullable() });
 let limits: ModelUsage[] = [];
 let latestObservedAt = 0;
 const FRESH_MS = 10 * 60000;
@@ -18,7 +21,11 @@ export function observeUsage(raw: unknown, capturedAt: unknown = Date.now()): vo
   // A snapshot is one account observation. Never merge old counters from another
   // account/tab into the latest response; an explicit empty snapshot clears them.
   latestObservedAt = capturedAt;
-  limits = parsed.map((entry) => ({ ...entry, observedAt: capturedAt }));
+  limits = parsed.map((entry) => ({ ...legacyCodex(entry), observedAt: capturedAt }) as ModelUsage);
+}
+/** ChatGPT's latest reported limits, as the page last showed them. */
+export function reportedUsageLimits(): ModelUsage[] {
+  return limits.map(row => ({ ...row }));
 }
 // One derived cache owns token totals and verified sends. Display preferences project
 // this baseline; only changed canonical session revisions reread transcripts.
@@ -68,6 +75,7 @@ async function computeOverview(signal?: AbortSignal): Promise<UsageOverview> {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const days = new Map<string, Map<string, UsageModelTokens>>();
   const models = new Map<string, UsageModelTokens>();
+  const projects = new Map<string | null, Map<string, UsageModelTokens>>();
   const messages = new Map<string, VerifiedMessage | null>();
   for (const session of sessions) {
     signal?.throwIfAborted();
@@ -148,6 +156,13 @@ async function computeOverview(signal?: AbortSignal): Promise<UsageOverview> {
       const totals = days.get(date) ?? new Map<string, UsageModelTokens>();
       mergeModels(totals, rows); days.set(date, totals); mergeModels(models, rows);
     }
+    // Grouped by the chat's project now, not when it ran: the cache holds no project, so moving
+    // a chat moves its whole history without rereading it.
+    if (cached.days.size) {
+      const project = projects.get(session.projectId ?? null) ?? new Map<string, UsageModelTokens>();
+      for (const rows of cached.days.values()) mergeModels(project, rows);
+      projects.set(session.projectId ?? null, project);
+    }
     for (const message of cached.messages) {
       const previous = messages.get(message.id);
       // Re-observing the same native ID never adds a send, including copied history.
@@ -180,6 +195,8 @@ async function computeOverview(signal?: AbortSignal): Promise<UsageOverview> {
     messages: { through, days: [...messageDays.values()].sort((a, b) => a.date.localeCompare(b.date)) },
     limits: limits.filter((entry) => Date.now() - entry.observedAt <= FRESH_MS && (entry.resetAt === null || entry.resetAt > Date.now())).map((entry) => ({ ...entry })),
     days: [...days].sort(([a], [b]) => a.localeCompare(b)).map(([date, rows]) => ({ date, tokens: [...rows.values()].reduce((sum, row) => sum + row.tokens, 0), models: [...rows.values()] })),
-    models: [...models.values()], tokens: [...models.values()].reduce((sum, row) => sum + row.tokens, 0), sessions: sessions.length
+    models: [...models.values()],
+    projects: [...projects].map(([projectId, rows]) => ({ projectId, tokens: [...rows.values()].reduce((sum, row) => sum + row.tokens, 0), models: [...rows.values()] })).sort((a, b) => b.tokens - a.tokens),
+    tokens: [...models.values()].reduce((sum, row) => sum + row.tokens, 0), sessions: sessions.length
   };
 }

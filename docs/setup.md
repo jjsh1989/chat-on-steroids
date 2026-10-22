@@ -37,7 +37,16 @@ Core, Desktop and Plugins are separate plugins in ChatGPT. Configure each surfac
 
 **Cloudflare quick tunnel:** connect in CoS and use the displayed public URL as the MCP server URL in ChatGPT. The random path is a secret and changes on restart.
 
-**Your own HTTPS tunnel:** forward to the loopback URL shown by CoS and preserve its secret path. Treat the resulting URL like a password.
+**Your own HTTPS tunnel** (for example a named Cloudflare tunnel): forward to the loopback URL shown by CoS and preserve its secret path. Treat the resulting URL like a password. By default the secret path changes every time CoS starts, even when your hostname stays the same, so after each restart you would update the URL in each Chat On Steroids app in ChatGPT and refresh it. Turn on **Settings → General → For developers → Keep plugin URLs across restarts** to keep the paths instead (they are stored in your system's secure storage; turning it off forgets them). It keeps the local port as well, so point your tunnel at the loopback address CoS shows after turning it on; if another program takes that port, CoS starts on a new one and says so under that setting, with both port numbers. The OpenAI Secure Tunnel needs neither, because ChatGPT stores its tunnel ID instead of a URL.
+
+### ChatGPT Business, Enterprise and Edu workspaces
+
+In these workspaces, the workspace's admins decide who may add custom apps, and the tunnel has to belong to the workspace's organization on Platform. A member without admin rights can run into two walls ([#1495](https://github.com/totec448-spec/chat-on-steroids/issues/1495)). Setup's **Add it in ChatGPT** step has the same advice under **ChatGPT workspace without admin rights**.
+
+- **Platform shows only your Personal organization.** Being a member of the workspace in ChatGPT doesn't make you a member of its organization on [platform.openai.com](https://platform.openai.com). Ask an admin to invite you to that organization, or to create the tunnel and a **Restricted** API key with **Tunnels: Read** and **Tunnels: Use** for you.
+- **Plugins offers no way to add a custom MCP server.** Ask an admin to add the **Core** plugin (and **Desktop** or **Plugins** if you use them) with the exact name and description Setup shows, connected to your tunnel ID.
+- **Use an address that doesn't change.** A tunnel ID never changes, so the admin adds the plugin once. With your own HTTPS tunnel, turn on **Keep plugin URLs across restarts** before sending the admin the URL. A Cloudflare quick tunnel gets a new URL on every start, so it doesn't work for a plugin an admin publishes.
+- **Keep it to yourself.** Anyone who can use the plugin can use your computer within the permissions you chose in CoS. Where the workspace allows it, ask the admin to make the plugin available only to you.
 
 ## Browser bridge port
 
@@ -89,22 +98,59 @@ It then serves these routes on `127.0.0.1` only:
 - `GET /v1/sessions/{id}/events/stream` (`from` by `seq`, `kinds`): the same events pushed as [Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html), so a caller does not have to poll. It sends what is recorded from `from` on (the first event when omitted), then each new or revised event as it is written. Each frame has `id` (the event's `seq`), `event` (its kind) and `data` (the same JSON as the paged read); a reconnect with `Last-Event-ID` continues after that event. Idle streams carry a comment line every 15 seconds. At most four streams are open at once (a fifth gets `503 busy`), and each ends after 30 minutes, when the API is switched off, or when its reader falls too far behind, with a last `end` frame whose `data.reason` says which (`max_duration`, `stopped`, `slow_consumer`, `session_gone`, `error`): reconnect to continue;
 - `GET /v1/inputs` (`state`, `limit`): the message outbox;
 - `GET /v1/agents`: the multi-agent run;
-- `GET /v1/log` (`limit`, `level`, `since`, inclusive): the in-memory Activity log.
+- `GET /v1/log` (`limit`, `level`, `since`, inclusive): the in-memory Activity log;
+- `GET /v1/models`: the models and thinking levels your ChatGPT account offers, as the app last read them from ChatGPT's model picker. Reading it never opens the picker; refresh the list in the app.
 
 With a second switch, **Allow actions: let local agents send messages, start new chats and cancel messages** (off by default,
 off whenever the API is off, and left off when you turn the API back on), it also serves:
 
-- `POST /v1/inputs` with `{ "id": "<new lowercase UUID>", "sessionId": "...", "text": "..." }` (up to 64,000 characters) sends a message to an existing chat through the same outbox as the composer. Without `sessionId` it starts a **new chat** with that message, like the composer's New chat; the new chat's id is the message `id` (also `input.sessionId` in the answer), so it can be followed right away with `GET /v1/sessions/{id}/events`. A new chat may name a `projectId` to start in that project (404 `project_not_found` for an unknown one); a project together with a `sessionId` is refused. Like the composer it connects CoS and opens the chat in your browser. It answers 202 once the message is stored; whether ChatGPT received it is read later from `GET /v1/inputs` (`delivery`: `sent`, `not_sent`, `unconfirmed` or `pending`). Repeating an id returns the same message and does not send it again, but the outbox keeps only the last 50 finished messages (fewer when they are very large), so use a new UUID for each message. After a timeout, read `GET /v1/inputs` before sending again. A chat takes one message at a time, and if ChatGPT is writing an answer that the send would stop, the request is refused unless it also says `"interrupt": true`. Worker and helper chats cannot be sent to;
+- `POST /v1/inputs` with `{ "id": "<new lowercase UUID>", "sessionId": "...", "text": "..." }` (up to 64,000 characters) sends a message to an existing chat through the same outbox as the composer. Without `sessionId` it starts a **new chat** with that message, like the composer's New chat; the new chat's id is the message `id` (also `input.sessionId` in the answer), so it can be followed right away with `GET /v1/sessions/{id}/events`. A new chat may name a `projectId` to start in that project (404 `project_not_found` for an unknown one); a project together with a `sessionId` is refused. Like the composer it connects CoS and opens the chat in your browser. To choose the model, add `"model"` and `"reasoningEffort"` together, an `id` and one of its `efforts` from `GET /v1/models`; a model or level your account does not offer is refused (409 `model_unknown` or `effort_unavailable`, or `models_unknown` before the app has read the list). Without them ChatGPT keeps its current selection. It answers 202 once the message is stored; whether ChatGPT received it is read later from `GET /v1/inputs` (`delivery`: `sent`, `not_sent`, `unconfirmed` or `pending`). Repeating an id returns the same message and does not send it again, but the outbox keeps only the last 50 finished messages (fewer when they are very large), so use a new UUID for each message. After a timeout, read `GET /v1/inputs` before sending again. A chat takes one message at a time, and if ChatGPT is writing an answer that the send would stop, the request is refused unless it also says `"interrupt": true`. Worker and helper chats cannot be sent to;
+- `POST /v1/sessions/{id}/stop` with `{ "turnId": "..." }` (the `activeTurnId` from `GET /v1/sessions/{id}?live=1`) stops the answer the chat is writing, exactly like the app's Stop button, which also switches Goal or Loop off for that chat. It answers `202` with the chat's `live` state; the answer has ended once its `turn_end` event is recorded. It answers `409 turn_not_running` when that answer is no longer running, so a late request never stops a newer one, and it refuses a worker or helper chat.
 - `POST /v1/inputs/{id}/cancel` withdraws a message that has not been handed to ChatGPT. It refuses a message that was delivered, one whose Send was already authorized (it may be in ChatGPT), the first message of a new chat, a message paired with another, and a message of a worker or helper chat.
 
 **Anyone who can read your user data folder and has this switch on can write into your chats, and
 a model that reads those messages can act under the permissions you have granted.**
 With the switch off, these routes all answer 403 and nothing changes.
 
+Local agents can control broker workers when Allow actions and workers are both on.
+Save a lowercase UUID as `ownerId` and reuse it across calls and app restarts.
+`GET /v1/workers/{ownerId}` lists that caller's workers.
+`GET /v1/workers/{ownerId}/reports` returns unread reports.
+Send POST requests to `/v1/workers/{ownerId}/spawn` to start workers,
+`/v1/workers/{ownerId}/message` to send them messages, and
+`/v1/workers/{ownerId}/ack` to acknowledge report IDs.
+Reports repeat until the caller acknowledges them. All five worker routes return 403
+when either switch is off. The other read routes remain available.
+The [worker API contract](../AGENTS.md#18-desktop-workspace-plugins-connection-and-native-control)
+lists the request fields and limits.
+For a CLI and agent skill, see [cos-bridge](https://github.com/abdulsalamgs/cos-bridge).
+
 Requests need `Authorization: Bearer <token>`. Any request with a browser `Origin` is refused.
 A read that waits on something the app cannot answer within 15 seconds gets `504 timeout`, and `/v1/health` keeps answering (within the same rate limit), so a caller can tell an app that is waiting from one that is not running. An app frozen outright answers nothing.
 Turning the switch off, or quitting, stops the listener and removes both files. A crash can leave
 them behind, so a caller should treat a refused connection as "not running".
+
+## Projects on a server (SSH)
+
+A project can be a folder on another computer that you reach with SSH. Click **+** next to
+**Projects** in the sidebar, choose **Folder on a server (SSH)…**, then enter:
+
+- **SSH address**: `me@server`, `me@server:2222`, or a `Host` name from your `~/.ssh/config`.
+- **Folder on the server**: an absolute path such as `/srv/app`, or one in your home folder such as `~/app`.
+
+**Test and add** connects once and checks that the folder exists. Chat On Steroids uses your own
+SSH setup (`~/.ssh/config`, your agent, keys and known hosts) and installs nothing on the server.
+The server needs SSH with SFTP and a POSIX shell (Linux, macOS, BSD).
+
+- **Sign-in with a key only.** The app can't answer password prompts. If `ssh <address>` in a
+  terminal asks for a password, add your key to the server or your agent first.
+- **New servers:** connect once in a terminal and confirm the host key; until then the app says
+  "This server is not trusted yet".
+- **What works there:** reading and searching files, images, `apply_patch`, commands (each command
+  is its own SSH connection) and the workspace terminal. Files in the app lists and previews text.
+- **Not yet:** editing files from the app's Files panel, the Git panel, and separate worktrees for
+  sub-agents (they work in the server folder itself). ChatGPT can still change files and run Git
+  with its tools.
 
 ## Permissions and plugins
 

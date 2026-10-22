@@ -1,4 +1,4 @@
-import { ui, t } from './i18n.js';
+import { ui, t, tn } from './i18n.js';
 import type { AppState } from '../shared/types.js';
 import type { SettingsPatch } from '../preload/index.js';
 import type { PluginSnapshot, PluginView, PluginCatalogEntry, PluginSource } from '../shared/plugins.js';
@@ -80,7 +80,7 @@ export function applyPluginsState(next: AppState): void {
   ui(status, 'title', () => t(surface?.detail ?? ''));
   const setupStatus = document.getElementById('pluginSetupStatus');
   if (setupStatus) ui(setupStatus, 'textContent', () => surface?.state === 'live'
-    ? t("{0} tools available · {1}", [surface.tools.length, surface.lastRequestAt ? t("Connected to ChatGPT") : t("Ready to add in ChatGPT")])
+    ? tn("{0} tool available · {1}", "{0} tools available · {1}", surface.tools.length, [surface.tools.length, surface.lastRequestAt ? t("Connected to ChatGPT") : t("Ready to add in ChatGPT")])
     : surface?.state === 'error' ? t(surface.detail) : t("Save your connection below to make enabled plugins available in ChatGPT."));
 }
 function showConnection(): void {
@@ -133,7 +133,7 @@ function showConnection(): void {
 }
 function renderInstalled(): void {
   const list = $('pluginsInstalled');
-  list.replaceChildren(); ui($('pluginsCount'), 'textContent', () => t("{0} installed", [snapshot.plugins.length]));
+  list.replaceChildren(); ui($('pluginsCount'), 'textContent', () => tn("{0} installed", "{0} installed", snapshot.plugins.length));
   const query = $<HTMLInputElement>('pluginsSearch').value.trim().toLowerCase();
   const matches = (name: string, description = '') => `${name} ${description}`.toLowerCase().includes(query);
   if (!snapshot.plugins.length) {
@@ -152,7 +152,7 @@ function renderInstalled(): void {
     const count = plugin.tools.filter(tool => tool.enabled).length;
     const foot = el('div', 'plugin-card-foot');
     foot.append(el('span', `pill${plugin.status === 'ready' && plugin.tools.length ? ' is-live' : plugin.status === 'error' ? ' is-error' : ''}`, status));
-    if (plugin.error) foot.append(el('span', 'plugin-card-error', plugin.error));
+    if (plugin.error) foot.append(el('span', 'plugin-card-error', () => t(plugin.error!)));
     foot.append(el('span', 'plugin-tool-count', () => t(count === 1 ? '{0} tool enabled' : '{0} tools enabled', [count])));
     title.append(foot); open.append(art(recipe?.icon ?? plugin.catalogId ?? 'custom'), title);
     const menu = document.createElement('details'); menu.className = 'plugin-menu';
@@ -192,7 +192,7 @@ function renderCatalog(parent: HTMLElement, query = ''): void {
 }
 function renderPluginTools(parent: HTMLElement, plugin: PluginView): void {
     const published = plugin.tools.filter(tool => tool.published).length;
-    const publication = plugin.tools.some(tool => tool.published !== undefined) ? t(" · {0} available in ChatGPT", [published]) : '';
+    const publication = plugin.tools.some(tool => tool.published !== undefined) ? tn(" · {0} available in ChatGPT", " · {0} available in ChatGPT", published) : '';
     parent.replaceChildren();
     if (plugin.status === 'needs-auth' || plugin.status === 'authenticating') {
       const auth = el('div', 'plugin-auth');
@@ -203,7 +203,7 @@ function renderPluginTools(parent: HTMLElement, plugin: PluginView): void {
       parent.append(auth);
     }
     parent.append(el('h3', '', () => t("Tools")), el('p', 'plugin-tools-summary', () => t("{0}/{1} enabled{2} · This plugin only · Refresh ChatGPT after changes", [plugin.tools.filter(tool => tool.enabled).length, plugin.tools.length, publication])));
-    if (plugin.error) parent.append(el('p', 'plugin-error', plugin.error));
+    if (plugin.error) parent.append(el('p', 'plugin-error', () => t(plugin.error!)));
     const tools = el('div', 'plugin-tools');
     for (const tool of plugin.tools) {
       const row = el('label', 'plugin-tool'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = tool.enabled; checkbox.disabled = !plugin.enabled;
@@ -230,7 +230,16 @@ function showPlugin(plugin: PluginView): void {
 }
 function showUninstall(plugin: PluginView): void {
   const { box, body } = dialog(() => t("Uninstall {0}?", [plugin.name]));
-  body.append(el('p', '', () => t("This stops its connection and deletes the installation, its CoS-managed local data and stored credentials. Back up any plugin data you need first. External application data is not removed.")), button(() => t("Uninstall plugin"), async () => { if (await mutate(window.api.pluginsUninstall(plugin.id))) box.close(); }, true));
+  // The same shape as removing a skill or a pet: Cancel first and focused, the destructive step last.
+  box.classList.add('pet-delete-dialog');
+  const actions = el('div', 'pet-delete-actions');
+  const cancel = el('button', 'btn btn-solid pet-delete-cancel', () => t('Cancel')) as HTMLButtonElement;
+  cancel.type = 'button'; cancel.addEventListener('click', () => box.close());
+  const uninstall = button(() => t("Uninstall plugin"), async () => { if (await mutate(window.api.pluginsUninstall(plugin.id))) box.close(); });
+  uninstall.classList.add('plugin-destructive', 'pet-delete-confirm');
+  actions.append(cancel, uninstall);
+  body.append(el('p', '', () => t("This stops its connection and deletes the installation, its CoS-managed local data and stored credentials. Back up any plugin data you need first. External application data is not removed.")), actions);
+  cancel.focus();
 }
 function showConfigure(plugin: PluginView): void {
   const { box, body } = dialog(() => t("Configure {0}", [plugin.name])); const config = new Map<string, HTMLInputElement>(); const secrets = new Map<string, HTMLInputElement>();
@@ -242,15 +251,27 @@ function showConfigure(plugin: PluginView): void {
   const source = field(body, () => t("Server configuration (JSON)"), JSON.stringify(plugin.source), false, () => t("Keep credentials in the secure fields, not in command arguments or URLs."));
   const extraConfig = field(body, () => t("Additional configuration (JSON object)"), '{}', false, () => t("Non-secret settings and environment variables only."));
   const extraKey = field(body, () => t("Additional credential name (optional)"), '', false, () => t("Environment variable for local servers; header name for remote servers.")); const extraValue = field(body, () => t("Additional credential value"), '', true);
-  body.append(button(() => t("Save and reconnect"), async () => {
+  const longestCall = field(body, () => t("Longest call (seconds)"), String(plugin.longestCallSeconds ?? 120), false, () => t("1–1800 seconds per call; default 120. Changing only this limit does not restart the plugin."));
+  longestCall.type = 'number'; longestCall.min = '1'; longestCall.max = '1800'; longestCall.step = '1';
+  body.append(button(() => t("Save"), async () => {
+    const longestCallSeconds = Number(longestCall.value);
+    if (!longestCall.value.trim() || !Number.isInteger(longestCallSeconds) || longestCallSeconds < 1 || longestCallSeconds > 1800) {
+      longestCall.focus(); throw new Error(t("Enter a whole number from 1 to 1800 seconds."));
+    }
     const credentials = Object.fromEntries([...secrets].filter(([, input]) => input.value).map(([key, input]) => [key, input.value]));
     if (extraKey.value.trim() && extraValue.value) credentials[extraKey.value.trim()] = extraValue.value;
     const additions: unknown = JSON.parse(extraConfig.value);
     if (!additions || typeof additions !== 'object' || Array.isArray(additions) || !Object.values(additions).every((value) => typeof value === 'string')) throw new Error(t("Additional configuration must be an object of string values."));
     const configuredSource = JSON.parse(source.value) as PluginSource;
-    if (await mutate(window.api.pluginsConfigure(plugin.id, { name: name.value,
-      ...(JSON.stringify(configuredSource) !== JSON.stringify(plugin.source) ? { source: configuredSource } : {}),
-      config: { ...Object.fromEntries([...config].map(([key, input]) => [key, input.value])), ...additions as Record<string,string> }, credentials }))) box.close();
+    const configuredValues = { ...Object.fromEntries([...config].map(([key, input]) => [key, input.value])), ...additions as Record<string,string> };
+    const sourceChanged = JSON.stringify(configuredSource) !== JSON.stringify(plugin.source);
+    const otherChanges = name.value !== plugin.name || sourceChanged || Object.keys(credentials).length > 0 ||
+      Object.entries(configuredValues).some(([key, value]) => value !== (plugin.config[key] ?? '') ||
+        (Object.hasOwn(additions, key) && !Object.hasOwn(plugin.config, key)));
+    const limitOnly = longestCallSeconds !== (plugin.longestCallSeconds ?? 120) && !otherChanges;
+    if (await mutate(window.api.pluginsConfigure(plugin.id, limitOnly ? { longestCallSeconds } : { name: name.value,
+      ...(sourceChanged ? { source: configuredSource } : {}),
+      config: configuredValues, credentials, longestCallSeconds }), !limitOnly)) box.close();
   }, true));
 }
 function showCatalog(): void {

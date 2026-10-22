@@ -1,4 +1,6 @@
+import type { ChatGroup, ChatGroupsState } from '../shared/chat-groups.js';
 import type { WorkspaceTerminalEvent, WorkspaceTerminalInfo } from '../shared/workspace-terminal.js';
+import type { ApprovalCardView } from '../shared/approval-wait.js';
 import type { DictationEvent } from '../shared/dictation.js';
 import type { ChatModelCatalog } from '../shared/chat-models.js';
 import type { GoalModel } from '../shared/goal-reasoning.js';
@@ -7,13 +9,14 @@ import type { BrowserPreferences } from '../shared/browser-preferences.js';
 import type { SessionControlsView } from '../main/bridge.js';
 import type { InputAttachment } from '../shared/input.js';
 import type { UsageOverview } from '../shared/usage.js';
+import type { ProviderUsage } from '../shared/provider-usage.js';
 import type { InputArgs, InputEntry } from '../main/session/input.js';
 import type { LocalProject, ProjectColor } from '../shared/projects.js';
 import type { ProjectDirectoryListing, ProjectFileMutationResult, ProjectFilePreview, ProjectFileSaveResult, ProjectFilesChanged } from '../shared/project-files.js';
 import type { ProjectGitChanged, ProjectGitDiff, ProjectGitSnapshot } from '../shared/project-git.js';
 import type { PetLibraryState, PetOverlayControlState, PetRuntimeAsset } from '../shared/pets.js';
 import type { SkillSummary, ManagedSkill, GitHubSkillUpdateCheck, SkillLibrary, SkillsDraftScope } from '../shared/skills.js';
-import type { RunningToolActivity, SessionChange, SessionSearchReply, SessionSearchLocation, ToolEditReview } from '../shared/session.js';
+import type { RunningToolActivity, SessionChange, SessionSearchReply, SessionSearchLocation, SessionBookmark, ToolEditReview } from '../shared/session.js';
 import type { TurnTrace } from '../shared/turn-trace.js';
 import type { RunningExecProcess } from '../shared/background-exec.js';
 import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '../shared/plugins.js';
@@ -75,6 +78,14 @@ export interface SessionList {
   activeId: string | null;
   /** ChatGPT conversation ids the user has blocked from using local tools. */
   blocked: string[];
+  /** ChatGPT conversation ids whose page shows ChatGPT's tool approval card, waiting for the user. */
+  approval: string[];
+  /**
+   * ChatGPT conversation ids whose recovery stopped after its last pickup reload while the input,
+   * Continue or Goal/Loop step it was collecting is still owed: the user has to act. The same chats
+   * whose `SessionControlsView.recovery` holds a `pickup-stopped` countdown.
+   */
+  recoveryStopped: string[];
   /** ChatGPT conversation ids explicitly trusted for strict allowlisting. */
   trusted?: string[];
   pressure: Array<TokenPressure & { id: string }>;
@@ -135,6 +146,11 @@ const api = {
     return () => ipcRenderer.removeListener('plugins:changed', wrapped);
   },
   chooseFiles: () => call<InputAttachment[]>('sessions:files'),
+  chatGroups: () => call<ChatGroupsState>('chatGroups:get'),
+  createChatGroup: (projectId: string, name: string) => call<{ group: ChatGroup; state: ChatGroupsState }>('chatGroups:create', { projectId, name }),
+  renameChatGroup: (id: string, name: string) => call<ChatGroupsState>('chatGroups:rename', { id, name }),
+  deleteChatGroup: (id: string) => call<ChatGroupsState>('chatGroups:delete', { id }),
+  assignChatGroup: (sessionId: string, groupId: string | null) => call<ChatGroupsState>('chatGroups:assign', { sessionId, groupId }),
   petsList: () => call<PetLibraryState>('pets:list'),
   petsOverlayState: () => call<PetOverlayControlState>('pets:overlayState'),
   petsSetOverlayVisible: (visible: boolean) => call<PetOverlayControlState>('pets:overlayVisible', { visible }),
@@ -213,6 +229,10 @@ const api = {
   },
   attachText: (text: string) => call<InputAttachment>('sessions:attachText', { text }),
   getUsage: () => call<UsageOverview>('usage:get'),
+  /** Codex's and Claude Code's usage from their logs here; `fresh` skips the 30-second cache. */
+  getProviderUsage: (fresh = false) => call<ProviderUsage>('usage:providers', { fresh }),
+  /** Saves the Usage page as CSV through a save dialog; `divisor` is the page's token divisor. */
+  exportUsage: (divisor: number) => call<{ saved: false } | { saved: true; name: string }>('usage:export', { divisor }),
   getState: () => call<AppState>('state:get'),
   resetPluginRefresh: () => call<AppState>('plugin-refresh:reset'),
   /** Sets an unreadable credentials file aside (kept as a backup) so keys can be saved again. */
@@ -238,22 +258,27 @@ const api = {
   runDiagnostics: () => call<Diagnosis>('diagnostics:run'),
   saveDiagnosticsReport: () => call<{ saved: false } | { saved: true; name: string }>('diagnostics:saveReport'),
   requestDesktopAccessibility: () => call<AppState>('desktop:requestAccessibility'),
+  repairDesktopAccess: () => call<AppState>('desktop:repairPermissions'),
   getLog: () => call<LogEntry[]>('log:get'),
   getLogText: () => call<string>('log:text'),
   getLogJson: () => call<string>('log:json'),
   writeClipboard: (text: string) => call<boolean>('clipboard:write', { text }),
-  exportMarkdown: (request: { id: string; scope: 'answer' | 'session'; turnId?: string; target: 'clipboard' | 'file' }) =>
+  // A code block's Save: main asks where, in a native dialog, and `name` is only its suggestion.
+  saveCode: (request: { text: string; name: string }) => call<{ done: 'saved'; name: string } | { done: 'cancelled' }>('code:save', request),
+  exportMarkdown: (request: { id: string; scope: 'answer' | 'latest' | 'session'; turnId?: string; messageId?: string; target: 'clipboard' | 'file' }) =>
     call<{ done: 'copied' } | { done: 'saved'; name: string } | { done: 'cancelled' }>('sessions:exportMarkdown', request),
   // `external`: the system's own browser even for a page the CoS browser would open.
   openLink: (url: string, options: { external?: boolean } = {}) => call<boolean>('link:open', { url, ...(options.external ? { external: true } : {}) }),
   showCosBrowser: () => call<boolean>('cosBrowser:show'),
   openChatGpt: () => call<boolean>('chatgpt:open'),
   signOutChatGpt: () => call<boolean>('chatgpt:signOut'),
-  openSetupBrowser: (browser: 'chrome' | 'edge' | 'brave', page: 'extensions' | 'chatgpt') => call<boolean>('browser:setupOpen', { browser, page }),
+  openSetupBrowser: (browser: 'chrome' | 'edge' | 'brave' | 'firefox', page: 'extensions' | 'chatgpt') => call<boolean>('browser:setupOpen', { browser, page }),
   // Applies the update this app has already downloaded and verified: the app quits, the
   // installer runs, and the app comes back as the new version. It takes no argument because
   // there is nothing here to choose - the main process knows what is staged.
   installUpdate: () => call<boolean>('update:install'),
+  /** Check/stage/apply supported updates and request one connector refresh round. May restart. */
+  updateAll: (restartVersion?: string) => call<import('../shared/types.js').UpdateAllResult>('update:all', restartVersion),
   downloadUpdate: () => call<boolean>('update:download'),
   /** Settings opened: re-check for an update if the last answer is older than ten minutes. */
   refreshUpdate: () => call<boolean>('update:refresh'),
@@ -264,6 +289,7 @@ const api = {
     call<SessionList>('sessions:list', options ?? {}),
   listProjects: () => call<LocalProject[]>('projects:list'),
   addProject: () => call<LocalProject | null>('projects:add'),
+  addRemoteProject: (address: string, folder: string) => call<LocalProject>('projects:addRemote', { address, folder }),
   retryChatgptProject: (id: string) => call<LocalProject | null>('projects:chatgpt-retry', { id }),
   removeProject: (id: string) => call<LocalProject>('projects:remove', { id }),
   setProjectColor: (id: string, color: ProjectColor | null) => call<LocalProject>('projects:color', { id, color }),
@@ -297,7 +323,7 @@ const api = {
   getSessionImage: (id: string, assetId: string) => call<string | null>('sessions:image', { id, assetId }),
   getImageStorage: () => call<ImageStorageInfo>('sessions:imageStorage'),
   clearImageStorage: (mode: ImageStorageClearMode) => call<ImageStorageClearResult>('sessions:clearImageStorage', { mode }),
-    getSession: (id: string, options?: { from?: number; before?: number; after?: number; limit?: number }) =>
+    getSession: (id: string, options?: { from?: number; before?: number; after?: number; limit?: number; actions?: boolean }) =>
     call<SessionDetail>('sessions:events', { id, ...options }),
   stopSessionTurn: (id: string, expectedTurnId: string) => call<SessionControlsView>('sessions:stopTurn', { id, expectedTurnId }),
   releaseSessionFinish: (id: string, expectedTurnId: string) => call<SessionControlsView>('sessions:releaseFinish', { id, expectedTurnId }),
@@ -347,6 +373,11 @@ const api = {
   setZoom: (factor: number) => call<number>('window:zoom', { factor }),
   getZoom: () => call<number>('window:getZoom'),
   openSessionChat: (id: string) => call<boolean>('sessions:openChat', { id }),
+  /** ChatGPT's tool approval card in this chat's page, as the app may show it (2.1.38). */
+  approvalCard: (id: string) => call<ApprovalCardView | null>('sessions:approvalCard', { id }),
+  /** The person's answer to that exact card; the page presses it only if the card still stands. */
+  answerApproval: (id: string, cardId: string, choice: 'allow' | 'deny') =>
+    call<{ ok: true } | { ok: false; error: string }>('sessions:answerApproval', { id, cardId, choice }),
   followSessionTab: (id: string) => call<boolean>('sessions:followTab', { id }),
   // Stops a chat this app cannot stop in the page: every tool call it has already been proved
   // to own is refused until it is released. Returns the whole blocked set, so one press
@@ -358,6 +389,11 @@ const api = {
   /** Chats matching every word of `query`, by title first, then by what was said in them. */
   searchSessions: (query: string) => call<SessionSearchReply>('sessions:search', { query }),
   locateSearchMatch: (id: string, query: string) => call<SessionSearchLocation | null>('sessions:locate-match', { id, query }),
+  locateMessage: (id: string, messageId: string) => call<SessionSearchLocation | null>('sessions:locate-message', { id, messageId }),
+  listBookmarks: (id: string) => call<SessionBookmark[]>('sessions:bookmarks', { id }),
+  setBookmark: (id: string, messageId: string, excerpt: string, messageTime: number, on: boolean) =>
+    call<SessionBookmark[]>('sessions:bookmark', { id, messageId, excerpt, messageTime, on }),
+  findInChat: (id: string, query: string) => call<SessionSearchLocation[]>('sessions:find', { id, query }),
   /** The chat's own name in the app; null clears it and ChatGPT's title shows again. */
   renameSession: (id: string, title: string | null) => call<boolean>('sessions:rename', { id, title }),
   getHandoff: (id: string, handoffId?: string) => call<Handoff | null>('handoff:get', { id, handoffId }),

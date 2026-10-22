@@ -137,14 +137,19 @@ describe('passive usage limits and canonical token totals', () => {
     // Four context tokens, two real exchanges. Children add neither text nor billing calls.
     expect((await usage.usageOverview()).tokens).toBe(4);
   });
-  it('keeps shared windows distinct and does not manufacture model-specific counts', async () => {
-    usage.observeUsage([limit(), limit({ windowSeconds: 604800, remainingPercent: 70 }), limit({ model: 'gpt-example', scope: 'model', remaining: 3, remainingPercent: null })]);
+  it('keeps Codex windows distinct and does not manufacture model-specific counts', async () => {
+    usage.observeUsage([limit({ scope: 'codex' }), limit({ windowSeconds: 604800, remainingPercent: 70, scope: 'codex' }), limit({ model: 'gpt-example', scope: 'model', remaining: 3, remainingPercent: null })]);
     const result = await usage.usageOverview();
     expect(result.limits).toHaveLength(3);
-    expect(result.limits.filter(row => row.scope === 'shared').map(row => row.remaining)).toEqual([null, null]);
+    expect(result.limits.filter(row => row.scope === 'codex').map(row => row.remaining)).toEqual([null, null]);
     expect(result.limits.filter(row => row.scope === 'model')).toEqual([expect.objectContaining({ model: 'gpt-example', remaining: 3, remainingPercent: null })]);
     result.limits[0]!.remainingPercent = 99;
     expect((await usage.usageOverview()).limits[0]?.remainingPercent).toBe(40);
+  });
+  // An extension from before 2.1.40 still sends wham/usage windows as "shared"; they were Codex's.
+  it('reads the old "shared" rows as Codex', () => {
+    usage.observeUsage([limit({ model: 'Shared usage', scope: 'shared' })]);
+    expect(usage.reportedUsageLimits()).toEqual([expect.objectContaining({ model: 'Codex', scope: 'codex', remainingPercent: 40 })]);
   });
   it.each([{ remaining: -1 }, { remaining: Infinity }, { remainingPercent: 101 }, { remainingPercent: NaN }, { resetAt: -1 }, { windowSeconds: 0 }, { scope: 'guessed' }])('rejects malformed batch atomically (%j)', async (bad) => {
     usage.observeUsage([limit()]);
@@ -491,4 +496,37 @@ it('prices ChatGPT 5.5 IDs as GPT-5.5 and knows the GPT-6 Sol and Luna rates, wi
   expect(usageRate('gpt-6-luna', formula)).toBe(0.01);
   // Which API model ChatGPT's plain GPT-6 corresponds to is not established; it stays user-priced.
   expect(usageRate('gpt-6', formula)).toBeUndefined();
+});
+describe('usage by project', () => {
+  const time = new Date(2026, 8, 5, 12).getTime();
+  const call = (id: string, model?: string) => ({ kind: 'tool_call', time, call: { callId: id, conversationId: 'chat', args: { text: 'aaaa' }, result: { text: '' }, summary: { title: '' }, ...(model ? { model } : {}) } });
+  const session = (id: string, projectId?: string) => ({ id, updatedAt: 1, events: 2, estimatedTokens: 2, ...(projectId ? { projectId } : {}) });
+  const recordings: Record<string, unknown[]> = {
+    one: [call('a', 'gpt-6-pro')],
+    two: [call('a', 'model-b'), call('b', 'model-b')],
+    three: [call('a')],
+    loose: [call('a'), call('b')],
+    quiet: [{ kind: 'user_message', time, messageId: 'native', message: { text: 'aaaa' } }]
+  };
+  it('groups the cached per-chat totals by each chat\'s current project and regroups a moved chat without rereading it', async () => {
+    store.readEvents.mockImplementation(async (id: string) => recordings[id] ?? []);
+    store.listUsageSessions.mockResolvedValue([session('one', 'alpha'), session('two', 'alpha'), session('three', 'beta'), session('loose'), session('quiet', 'gamma')]);
+    const first = await usage.usageOverview();
+    // A chat outside every project is its own row; a project without tool calls has none.
+    expect(first.projects).toEqual([
+      { projectId: 'alpha', tokens: 2.5, models: [
+        { model: 'gpt-6-pro', reasoningEffort: null, assumed: false, tokens: 0.5 },
+        { model: 'model-b', reasoningEffort: null, assumed: false, tokens: 2 }
+      ] },
+      { projectId: null, tokens: 2, models: [{ model: 'gpt-5.6', reasoningEffort: 'high', assumed: true, tokens: 2 }] },
+      { projectId: 'beta', tokens: 0.5, models: [{ model: 'gpt-5.6', reasoningEffort: 'high', assumed: true, tokens: 0.5 }] }
+    ]);
+    expect(first.projects.reduce((sum, project) => sum + project.tokens, 0)).toBe(first.tokens);
+    expect(store.readEvents).toHaveBeenCalledTimes(5);
+    // Moving a chat keeps its recording revision: its whole history moves with it, from the cache.
+    store.listUsageSessions.mockResolvedValue([session('one', 'alpha'), session('two', 'beta'), session('three', 'beta'), session('loose'), session('quiet', 'gamma')]);
+    const moved = await usage.usageOverview();
+    expect(moved.projects.map(project => [project.projectId, project.tokens])).toEqual([['beta', 2.5], [null, 2], ['alpha', 0.5]]);
+    expect(store.readEvents).toHaveBeenCalledTimes(5);
+  });
 });

@@ -96,6 +96,19 @@ describe('settings migration', () => {
     expect(loaded.readOnly).toBe(true); expect(loaded.capabilities.command).toBe(false);
     expect(loaded.ui.appearance).toBeUndefined();
   });
+  it('loads a sidebar layout saved before the setting existed, or no longer offered, as Projects', async () => {
+    const { defaultAppearance } = await import('../src/shared/appearance.js');
+    const config = defaultConfig();
+    const appearance = { ...defaultAppearance(), sidebarLayout: 'inbox' as const }; appearance.dark.sidebar = '#e53aa0';
+    await saveConfig({ ...config, ui: { ...config.ui, appearance } });
+    expect((await loadConfig()).ui.appearance?.sidebarLayout).toBe('inbox');
+    const { sidebarLayout: _, ...old } = appearance;
+    for (const saved of [old, { ...old, sidebarLayout: 'status' }]) {
+      await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...config, ui: { ...config.ui, appearance: saved } }), 'utf8');
+      // The layout alone falls back; the colors around it are kept.
+      expect((await loadConfig()).ui.appearance).toEqual({ ...appearance, sidebarLayout: 'projects' });
+    }
+  });
   it('drops removed file-saving settings without changing other saved choices', async () => {
     const config = defaultConfig();
     config.readOnly = true;
@@ -150,6 +163,34 @@ describe('settings migration', () => {
     expect((await loadConfig()).ui).toMatchObject({ startAtLogin: false, autoConnect: true });
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, startAtLogin: true, autoConnect: false } });
     expect((await loadConfig()).ui).toMatchObject({ startAtLogin: true, autoConnect: false });
+  });
+  it('rotates long turns after 30 minutes for fresh, legacy and malformed settings, keeping saved choices', async () => {
+    expect(defaultConfig().ui.rotateTurnMinutes).toBe(30);
+    const legacy = defaultConfig(); delete legacy.ui.rotateTurnMinutes;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+    expect((await loadConfig()).ui.rotateTurnMinutes).toBe(30);
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...legacy, ui: { ...legacy.ui, rotateTurnMinutes: 'soon', startAtLogin: true } }), 'utf8');
+    expect((await loadConfig()).ui).toMatchObject({ rotateTurnMinutes: 30, startAtLogin: true });
+    await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, rotateTurnMinutes: 0 } });
+    expect((await loadConfig()).ui.rotateTurnMinutes).toBe(0);
+  });
+  it('keeps the stop fallback for fresh turns off unless chosen, also for legacy and malformed settings', async () => {
+    expect(defaultConfig().ui.rotateStopFallback).toBe(false);
+    const legacy = defaultConfig(); delete legacy.ui.rotateStopFallback;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+    expect((await loadConfig()).ui.rotateStopFallback).toBe(false);
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...legacy, ui: { ...legacy.ui, rotateStopFallback: 'yes', startAtLogin: true } }), 'utf8');
+    expect((await loadConfig()).ui).toMatchObject({ rotateStopFallback: false, startAtLogin: true });
+    await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, rotateStopFallback: true } });
+    expect((await loadConfig()).ui.rotateStopFallback).toBe(true);
+  });
+  it('reads other apps’ usage for fresh and legacy settings and keeps it off once switched off', async () => {
+    expect(defaultConfig().ui.localAppUsage).toBe(true);
+    const legacy = defaultConfig(); delete legacy.ui.localAppUsage;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+    expect((await loadConfig()).ui.localAppUsage).toBe(true);
+    await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, localAppUsage: false } });
+    expect((await loadConfig()).ui.localAppUsage).toBe(false);
   });
   it('keeps the local control API off for fresh, legacy and malformed configs while preserving explicit opt-in', async () => {
     expect(defaultConfig().controlApi).toEqual({ enabled: false, allowActions: false });
@@ -402,6 +443,22 @@ describe('settings migration', () => {
     expect((await loadConfig()).sessions.storageLimitGiB).toBe(20);
   });
 
+  it('joins the running turn by default, and loads a broken follow-up behavior as that default', async () => {
+    const config = defaultConfig();
+    expect(config.ui.followUp).toBe('steer');
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...config, ui: { ...config.ui, followUp: 'later' } }), 'utf8');
+    expect((await loadConfig()).ui.followUp).toBe('steer');
+    await saveConfig({ ...config, ui: { ...config.ui, followUp: 'queue' } });
+    expect((await loadConfig()).ui.followUp).toBe('queue');
+  });
+
+  it('sends with Enter by default and saves Cmd/Ctrl+Enter', async () => {
+    const config = defaultConfig();
+    expect(config.ui.enterSends).toBe(true);
+    await saveConfig({ ...config, ui: { ...config.ui, enterSends: false } });
+    expect((await loadConfig()).ui.enterSends).toBe(false);
+  });
+
   it('keeps the thorough handoff length for older and broken configs, and saves a choice', async () => {
     const config = defaultConfig();
     expect(config.compaction.handoffLength).toBe('thorough');
@@ -587,6 +644,7 @@ describe('shipped defaults', () => {
     expect(loaded.multiAgent.waitForSubAgents).toBe(false);
     expect(loaded.multiAgent.autoWorktrees).toBe(false);
     expect(loaded.multiAgent.endSleepingWorkerProcesses).toBe(false);
+    expect(loaded.multiAgent.archiveWorkerChats).toBe(false);
   });
 
   it.each(['win32', 'darwin', 'linux'] as const)(
@@ -606,6 +664,7 @@ describe('shipped defaults', () => {
       expect(config.multiAgent.waitForSubAgents).toBe(false);
       expect(config.multiAgent.autoWorktrees).toBe(false);
       expect(config.multiAgent.endSleepingWorkerProcesses).toBe(false);
+      expect(config.multiAgent.archiveWorkerChats).toBe(false);
     }
   );
 
@@ -629,7 +688,14 @@ describe('shipped defaults', () => {
     expect(loaded.multiAgent.waitForSubAgents).toBe(false);
     expect(loaded.multiAgent.autoWorktrees).toBe(false);
     expect(loaded.multiAgent.endSleepingWorkerProcesses).toBe(false);
+    expect(loaded.multiAgent.archiveWorkerChats).toBe(false);
     expect(loaded.readOnly).toBe(true);
+  });
+
+  it('keeps a saved choice to archive retired worker chats (#1460)', async () => {
+    const config = defaultConfig();
+    await saveConfig({ ...config, multiAgent: { ...config.multiAgent, archiveWorkerChats: true } });
+    expect((await loadConfig()).multiAgent.archiveWorkerChats).toBe(true);
   });
 
   it('does not turn config corruption into permission consent', async () => {
@@ -1048,6 +1114,15 @@ it('persists optional ordinary new-chat model defaults without inventing them fo
   expect(loaded.ui.defaultChatReasoning).toBe('xhigh');
 });
 
+it('keeps a Continue prompt, and reads an empty or overlong one as the built-in phrases', async () => {
+  const config = defaultConfig();
+  expect(config.ui.customContinue).toBeUndefined();
+  for (const [stored, read] of [['Keep going.', 'Keep going.'], ['   ', undefined], ['x'.repeat(501), undefined], [42, undefined]] as const) {
+    await saveConfig({ ...config, ui: { ...config.ui, customContinue: stored as string } });
+    expect((await loadConfig()).ui.customContinue, String(stored).slice(0, 20)).toBe(read);
+  }
+});
+
 describe('a settings file the app cannot read as is', () => {
   // VM test, 2026-10-06: Windows PowerShell 5.1 wrote config.json with a byte-order mark. The app
   // fell back to recovery defaults and the next settings save overwrote the user's folders and tunnel.
@@ -1062,6 +1137,27 @@ describe('a settings file the app cannot read as is', () => {
     const loaded = await loadConfig();
     expect(loaded.roots.map(root => root.name)).toEqual(['project']);
     expect(await backups()).toEqual([]);
+  });
+
+  it('keeps every other setting when a preference holds a value this version does not know', async () => {
+    // VM, 2026-10-15: 2.1.37 read settings 2.1.38 had saved with Firefox as the ChatGPT browser.
+    // The one unknown value made the whole file unusable, and the app started without its folders
+    // and tunnel. A preference this version cannot read now falls back to its default alone.
+    await clearBackups();
+    const config = { ...defaultConfig(), roots: [{ name: 'project', path: dir }],
+      ui: { ...defaultConfig().ui, chatBrowser: 'netscape', theme: 'light', backgroundPlacement: 'shelf' } };
+    const content = JSON.stringify(config);
+    await fs.writeFile(file(), content, 'utf8');
+    const loaded = await loadConfig();
+    expect(loaded.roots.map(root => root.name)).toEqual(['project']);
+    expect(loaded.readOnly).toBe(config.readOnly);
+    expect(loaded.ui.theme).toBe('light');
+    expect(loaded.ui.chatBrowser).toBe('chrome');
+    expect(loaded.ui.backgroundPlacement).toBe('window');
+    // The original stays beside it, as for any file the app could not take as is.
+    const saved = await backups();
+    expect(saved).toHaveLength(1);
+    expect(await fs.readFile(path.join(dir, saved[0]!), 'utf8')).toBe(content);
   });
 
   it.each([

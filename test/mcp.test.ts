@@ -28,6 +28,7 @@ import { EXEC_COMMAND_CMD_DESCRIPTION, LAUNCHES_WINDOWS_POWERSHELL_5, WINDOWS_SH
 import { skillCatalogInstructions } from '../src/main/skills.js';
 import { lastRequestAt, selfTestHeaders, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from '../src/main/mcp/server.js';
 import { lastToolCallAt, type ToolContext } from '../src/main/mcp/tools.js';
+import { publishPluginSurface, pluginRefreshStatuses, resetPluginRefreshForTests } from '../src/main/plugin-refresh.js';
 import { friendlyError } from '../src/main/mcp/kernel.js';
 import { serverInstructions } from '../src/main/mcp/instructions.js';
 import { SURFACE_LIST, surfaceDefinition, type SurfaceId } from '../src/main/mcp/surfaces.js';
@@ -438,6 +439,19 @@ describe('endpoint hardening', () => {
     expect(lastToolCallAt()).not.toBeNull();
   });
 
+  it('counts only successful provider calls as current-publication working evidence', async () => {
+    resetPluginRefreshForTests();
+    publishPluginSurface('core', 'Chat On Steroids Core', 'test', '', [{ name: 'read', description: 'Read', inputSchema: { type: 'object' } }]);
+    try {
+      await rawPost(endpoint.urls.core, JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } } }), selfTestHeaders());
+      expect((await pluginRefreshStatuses()).core?.responding).toBeUndefined();
+      await core('tools/call', { name: 'read', arguments: { paths: ['/workspace/missing-file'] } });
+      expect((await pluginRefreshStatuses()).core?.responding).toBeUndefined();
+      await core('tools/call', { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } });
+      expect((await pluginRefreshStatuses()).core).toMatchObject({ responding: true });
+    } finally { resetPluginRefreshForTests(); }
+  });
+
   it('counts a request to either surface as ChatGPT reaching this PC', async () => {
     expect(lastRequestAt()).toBeNull();
     await desktop('tools/list');
@@ -633,7 +647,7 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await core('tools/list'));
     // find is absent because exec_command is present — they are mutually exclusive.
-    expect(names).toEqual(['agents', 'apply_patch', 'exec', 'exec_command', 'read', 'save_image', 'update_plan', 'view_image', 'write_stdin']);
+    expect(names).toEqual(['agents', 'apply_patch', 'exec', 'exec_command', 'read', 'save_image', 'update_plan', 'usage', 'view_image', 'write_stdin']);
     for (const name of surfaceDefinition('desktop').tools.filter(name => name !== 'exec')) expect(names, name).not.toContain(name);
   });
 
@@ -712,13 +726,16 @@ describe('surface boundaries', () => {
     }
   });
 
+  // #1417 again (2.1.41, VM): ChatGPT's approval classifier flagged the earlier imperative wording
+  // ("Use status once … before finalizing", "Never poll repeatedly") as "behaviour and completion
+  // rules for the classifier". The same guidance is now stated as facts about the tool.
   it('preserves the existing agents guidance while adding only the cross-prime address parameter', async () => {
     everything();
     const agentsTool = toolList(await core('tools/list')).find((tool) => tool.name === 'agents')!;
     expect(agentsTool.description).toBe(
-      'Run ChatGPT workers. Omit model and reasoning_effort unless the user explicitly requests an override; saved app defaults apply. Do not ask the user to choose them. Reuse a suitable sleeping worker with message before spawn. ' +
-      'message: prime↔worker. Reports ride tool results, never restart primes. Use status once to collect pending reports before finalizing; otherwise state that review is pending. Never poll repeatedly. ' +
-      'status: your active, sleeping/revivable and terminal workers, including parked families. finish: record the report, then normally sleep.'
+      'Runs ChatGPT workers. Without model/reasoning_effort, saved app defaults apply; they are set only for a user’s explicit request. A suitable sleeping worker is reused with message, not respawned. ' +
+      'message: prime↔worker. Reports arrive with tool results, not by restarting an idle prime. ' +
+      'status: your active, sleeping/revivable and terminal workers, incl. parked families, and pending reports; one call before a final answer collects them. Repeated polling adds nothing. finish: records the report, then normally sleeps.'
     );
     expect(agentsTool.inputSchema.properties.run_id.description).toBe(
       'Select your returned worker family when status lists several; never grants another caller’s workers.'
@@ -727,10 +744,10 @@ describe('surface boundaries', () => {
       'spawn: shared instructions prepended to every task, e.g. repo, conventions, edit limits and validation.'
     );
     expect(agentsTool.inputSchema.properties.workers.description).toBe(
-      'spawn: fresh workers to create only after checking status for a suitable sleeping worker; revive one explicitly with message.'
+      'spawn: fresh workers; status lists sleeping workers that message can revive instead.'
     );
     expect(agentsTool.inputSchema.properties.messages.description).toBe(
-      'message: atomic batch; prefer this to one call per recipient.'
+      'message: atomic batch for several recipients in one call.'
     );
     expect(agentsTool.inputSchema.properties.to.description).toBe(
       'message: one recipient; messaging a sleeping worker wakes it.'
@@ -750,10 +767,10 @@ describe('surface boundaries', () => {
       'This worker\'s job: objective, relevant files, constraints and expected handoff.'
     );
     expect(worker.properties.model.description).toBe(
-      'Omit unless explicitly requested by the user; app settings supply defaults. Use an exact account-observed model id or provider alias. Invalid overrides return observed ids before opening; the browser confirms availability before Send.'
+      'Only for a model the user asked for; app settings supply the default. An exact account-observed model id or provider alias. Invalid overrides return observed ids before opening; the browser checks availability before Send.'
     );
     expect(worker.properties.reasoning_effort.description).toBe(
-      'Omit unless explicitly requested by the user; app settings supply defaults. Do not ask just to spawn a worker. This selects reasoning only, never a model.'
+      'Only for an effort the user asked for; app settings supply the default. Selects reasoning only, never a model.'
     );
     const targetRunOverhead = Buffer.byteLength(
       `,"target_run_id":${JSON.stringify(agentsTool.inputSchema.properties.target_run_id)}`,
@@ -919,6 +936,27 @@ describe('surface boundaries', () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it('answers usage without the identity notice, which only matters for chat-bound work', async () => {
+    everything();
+    // usage reads nothing that belongs to a chat. It answers before the page's evidence for its
+    // request arrives, so it always looked unattributed, and the notice reached the model each time.
+    const usage = JSON.stringify((await core('tools/call', { name: 'usage', arguments: {} })).body.result?.content);
+    expect(usage).toContain('ChatGPT limits');
+    expect(usage).not.toContain('Identity notice');
+    // The same harness still marks chat-bound tools, so the call above really was unattributed.
+    const read = JSON.stringify((await core('tools/call', { name: 'read', arguments: { paths: ['/workspace'] } })).body.result?.content);
+    expect(read).toContain('Identity notice');
+  });
+
+  it('describes write_stdin by what it does, never by how its output should be treated', async () => {
+    everything();
+    // ChatGPT's safety check flagged "including automatic delivery; never reruns work" as a
+    // "Suspicious Instruction" and held a long run on an approval card (VM, 2026-10-15).
+    const tool = toolList(await core('tools/list')).find((entry) => entry.name === 'write_stdin');
+    expect(tool?.description).toBeTruthy();
+    expect(tool!.description).not.toMatch(/automatic(ally)? deliver|never reruns|delivered automatically/i);
+  });
+
   it('saves a generated image only for a call it can tie to its chat (#889)', async () => {
     everything();
     const tool = toolList(await core('tools/list')).find((entry) => entry.name === 'save_image');
@@ -942,7 +980,7 @@ describe('surface boundaries', () => {
     const desktopTools = toolList(await desktop('tools/list'));
 
     // Each populated surface includes code mode; find and the shell exec pair remain exclusive.
-    expect(coreTools).toHaveLength(9);
+    expect(coreTools).toHaveLength(10);
     expect(desktopTools).toHaveLength(BROWSER_TOOLS.length + (IS_WINDOWS ? 16 : process.platform === 'darwin' ? 3 : 1));
 
     // And the size, which is what a discovery pull actually costs the model on every
@@ -1216,7 +1254,7 @@ describe('capability gating', () => {
     ctx.caps = effectiveCapabilities(config);
     ctx.readOnly = true;
 
-    expect(toolNames(await core('tools/list'))).toEqual(['exec', 'find', 'read', 'view_image']);
+    expect(toolNames(await core('tools/list'))).toEqual(['exec', 'find', 'read', 'usage', 'view_image']);
   });
 
   it('offers apply_patch only when a writing permission is on', async () => {
@@ -1325,9 +1363,40 @@ describe('capability gating', () => {
     const agentsDescription = (tools.body.result.tools as Array<{ name: string; description?: string }>).find(
       (tool) => tool.name === 'agents'
     )?.description;
-    expect(agentsDescription).toContain('Reuse a suitable sleeping worker with message before spawn');
-    expect(agentsDescription).toContain('status once to collect pending reports before finalizing');
-    expect(agentsDescription).toContain('state that review is pending');
+    expect(agentsDescription).toContain('A suitable sleeping worker is reused with message, not respawned');
+    expect(agentsDescription).toContain('one call before a final answer collects them');
+    // Facts about the tool, not orders to whoever reads the description.
+    expect(agentsDescription).not.toMatch(/\b(Never|Do not|Omit|Use status once)\b/);
+  });
+
+  // #1417, third time (2.1.41, Windows VM, 2 of 4 runs): ChatGPT's approval card said the tool
+  // documentation "tries to override or influence the risk assessment with its own rules". Orders
+  // were still left in the parameter texts, and the instructions told the model not to ask the user
+  // to confirm. Every text the classifier reads about agents is a fact, and none speaks of confirming.
+  it('words everything about agents as facts, with no orders and nothing about confirming', async () => {
+    ctx.agentTools = true;
+    const initialized = await core('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test-client', version: '1.0.0' } });
+    const instructions: string = initialized.body.result.instructions ?? '';
+    const workers = instructions.slice(instructions.indexOf('# Workers'));
+    expect(workers).toContain('# Workers');
+    expect(workers).not.toMatch(/confirm/i);
+    const agentsTool = toolList(await core('tools/list')).find((tool) => tool.name === 'agents')!;
+    const texts: string[] = [agentsTool.description];
+    const collect = (node: unknown): void => {
+      if (!node || typeof node !== 'object') return;
+      for (const [key, value] of Object.entries(node)) {
+        if (key === 'description' && typeof value === 'string') texts.push(value);
+        else collect(value);
+      }
+    };
+    collect(agentsTool.inputSchema);
+    expect(texts.length).toBeGreaterThan(10);
+    for (const text of texts) {
+      // An order opens a sentence ("Never …", "Omit …"); "never grants …" mid-sentence is a fact.
+      expect(text, text).not.toMatch(/(^|[.;:]\s+)(Never|Do not|Don't|Omit|Prefer|Use)\b/);
+      expect(text, text).not.toMatch(/\bprefer this|only after checking|\bconfirm/i);
+      expect(text, text).not.toMatch(/the answer says/i);
+    }
   });
 
   it('rejects action-specific agent fields instead of silently ignoring them', async () => {
@@ -2322,6 +2391,27 @@ describe('apply_patch', () => {
     });
     expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
     expect(await fs.readFile(path.join(approved, 'fresh-sequential.ts'), 'utf8')).toBe('const fresh = 2;\n');
+  });
+
+  it('keeps a file\'s own line endings when it edits it', async () => {
+    // The upstream default split a CRLF file on LF only: lines outside the hunk kept their CR,
+    // and the hunk's context and new lines lost it, so one edit left a Windows file mixed.
+    await fs.writeFile(path.join(approved, 'run.bat'), '@echo off\r\necho one\r\necho two\r\necho three\r\n');
+    await fs.writeFile(path.join(approved, 'unix.txt'), 'alpha\nbeta\ngamma');
+    const edited = await core('tools/call', {
+      name: 'apply_patch',
+      arguments: {
+        patch: [
+          '*** Begin Patch',
+          '*** Update File: /workspace/run.bat', '@@', ' echo one', '-echo two', '+echo TWO', '+echo extra', ' echo three',
+          '*** Update File: /workspace/unix.txt', '@@', ' alpha', '-beta', '+BETA',
+          '*** End Patch'
+        ].join('\n')
+      }
+    });
+    expect(edited.body.result?.isError).toBeFalsy();
+    expect(await fs.readFile(path.join(approved, 'run.bat'), 'utf8')).toBe('@echo off\r\necho one\r\necho TWO\r\necho extra\r\necho three\r\n');
+    expect(await fs.readFile(path.join(approved, 'unix.txt'), 'utf8')).toBe('alpha\nBETA\ngamma\n');
   });
 
   it('adds, updates, moves and deletes through one tool', async () => {
@@ -3591,6 +3681,38 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(stale)).toContain('no local tool was run');
   });
 
+  it('tells a replaced chat where its work continues, also after a second Compact & Resume', async () => {
+    const chatA = 'f0f00011-1111-4111-8111-111111111111';
+    const chatB = 'f0f00012-1111-4111-8111-111111111111';
+    const chatC = 'f0f00013-1111-4111-8111-111111111111';
+    const summary = await createSession({ title: 'Portfolio site', conversationId: chatA });
+    expect(prove('wfr_where_a', chatA, summary.id)).toBe('stored');
+    expect(await rebindSession(summary.id, chatA, chatB)).toBe(true);
+
+    const once = await asChat('wfr_where_a', 'read', { paths: ['/workspace/src/app.ts'] });
+    expect(failed(once)).toBe(true);
+    expect(textOf(once)).toContain('CONVERSATION_SUPERSEDED');
+    expect(textOf(once)).toContain(`https://chatgpt.com/c/${chatB}`);
+    expect(textOf(once)).toContain('"Portfolio site"');
+    expect(textOf(once)).toContain('no local tool was run');
+
+    // A second move sends the oldest chat straight to the newest one, never to the middle one.
+    expect(await rebindSession(summary.id, chatB, chatC)).toBe(true);
+    const twice = await asChat('wfr_where_a', 'read', { paths: ['/workspace/src/app.ts'] });
+    expect(textOf(twice)).toContain(`https://chatgpt.com/c/${chatC}`);
+    expect(textOf(twice)).not.toContain(chatB);
+
+    // A chat not yet named (the store's placeholder title) is named by its link alone.
+    const chatD = 'f0f00014-1111-4111-8111-111111111111';
+    const chatE = 'f0f00015-1111-4111-8111-111111111111';
+    const untitled = await createSession({ title: '  ', conversationId: chatD });
+    expect(prove('wfr_where_d', chatD, untitled.id)).toBe('stored');
+    expect(await rebindSession(untitled.id, chatD, chatE)).toBe(true);
+    const bare = await asChat('wfr_where_d', 'read', { paths: ['/workspace/src/app.ts'] });
+    expect(textOf(bare)).toContain(`https://chatgpt.com/c/${chatE}. Tell the user to continue there`);
+    expect(textOf(bare)).not.toContain('shown in Chat On Steroids as');
+  });
+
   it('refuses every tool from a chat whose handoff brief has been asked for, until the move is over', async () => {
     resetContinuationsForTests();
     const chatA = 'f0f00007-1111-4111-8111-111111111111';
@@ -3643,10 +3765,10 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(prove(`wfr_execown_old_recycled_${run}`, `conv-execown-old-${run}`)).toBe('stored');
     expect(prove(`wfr_execown_new_recycled_${run}`, `conv-execown-new-${run}`)).toBe('stored');
 
-    const allocate = unifiedExecManager.allocateProcessId.bind(unifiedExecManager);
+    // The allocator draws from a CSPRNG, so the pick is forced here: reserved the way it reserves.
     const allocation = vi.spyOn(unifiedExecManager, 'allocateProcessId').mockImplementation(() => {
-      const random = vi.spyOn(Math, 'random').mockReturnValue(0);
-      try { return allocate(); } finally { random.mockRestore(); }
+      (unifiedExecManager as unknown as { reservedProcessIds: Set<number> }).reservedProcessIds.add(recycledId);
+      return recycledId;
     });
     // Hold only publication of the real process result, not process creation or ownership.
     // The process is alive and writable, but the MCP handler has not yet installed its new
@@ -3761,6 +3883,9 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(later)).toContain(`Exit code: ${exitCode}`);
     expect(textOf(later)).toContain('background-e2e-once');
     expect(textOf(later)).not.toContain(`write_stdin(session_id=${sessionId}`);
+    // ChatGPT's safety check read "Delivered automatically" as the tool steering how its output
+    // is treated, and stopped a long run on an approval card (VM, 2026-10-15).
+    expect(textOf(later)).not.toMatch(/delivered automatically/i);
 
     // Publication receipts require a strictly later timestamp; loopback calls can
     // otherwise share one millisecond even though this response was already read.
@@ -4191,6 +4316,22 @@ describe('blocked chats', () => {
     getConfig().multiAgent.strictChatAllowlist = false;
   });
 
+  // `ui.rotateStopFallback`: while the app stops a turn to continue it in a fresh one, a call of that
+  // chat is refused, not run, so a Stop landing mid-call cannot make the model run it twice.
+  it('refuses, without running it, a call of a chat whose turn is being continued in a fresh one', async () => {
+    const { armRotationFence, clearRotationFence } = await import('../src/main/rotation-fence.js');
+    armRotationFence(ROGUE, 'turn-being-stopped');
+    try {
+      const reply = await readAs(owned(ROGUE));
+      expect(failed(reply)).toBe(true);
+      expect(textOf(reply)).toContain('TURN_CONTINUING');
+      expect(textOf(reply)).toMatch(/was not run/i);
+      expect(textOf(reply)).not.toContain('/workspace/notes.txt');
+    } finally { clearRotationFence(ROGUE); }
+    // Lifted: the same call runs again.
+    expect(failed(await readAs(owned(ROGUE)))).toBe(false);
+  });
+
   it('refuses a blocked chat’s call and tells the model to stop instead of retrying', async () => {
     setChatBlocked(ROGUE, true);
     const reply = await readAs(owned(ROGUE));
@@ -4278,9 +4419,10 @@ describe('blocked chats', () => {
     const untrusted = await readAs(owned(BYSTANDER));
     expect(failed(untrusted)).toBe(true);
     expect(textOf(untrusted)).toContain('CHAT_NOT_TRUSTED');
-    expect(textOf(untrusted)).toMatch(/chat list/i);
-    expect(textOf(untrusted)).toMatch(/sidebar/i);
-    expect(textOf(untrusted)).toContain('Trust');
+    expect(textOf(untrusted)).toMatch(/⋯ menu in the app's sidebar/);
+    expect(textOf(untrusted)).toContain('Trust chat');
+    // VM, 2026-10-20: refused here, the model ran the same command through the other computer's app.
+    expect(textOf(untrusted)).toContain('Do not send it to another app or connector instead');
     expect(textOf(untrusted)).not.toContain('Sessions');
     expect(textOf(untrusted)).not.toContain('/workspace/notes.txt');
 
@@ -4333,7 +4475,7 @@ describe('blocked chats', () => {
     expect(textOf(parentBlocked)).toContain('CHAT_NOT_TRUSTED');
   });
 
-  it('tells a refused worker to use the owning prime row in the sidebar', async () => {
+  it('tells a refused worker to use its main chat\'s menu in the sidebar', async () => {
     const prime = 'strict-worker-notice-prime';
     const worker = 'strict-worker-notice-child';
     const primeSession = await createSession({ title: 'strict worker notice prime', conversationId: prime });
@@ -4348,13 +4490,12 @@ describe('blocked chats', () => {
     const refused = await readAs(ownedSession(worker, workerSession.id));
     expect(failed(refused)).toBe(true);
     const notices = (await readRecentEvents(workerSession.id, 20))
-      .filter(event => event.kind === 'progress' && /owning prime/i.test(event.message.text));
+      .filter(event => event.kind === 'progress' && /worker whose main chat/i.test(event.message.text));
     expect(notices).toHaveLength(1);
     const copy = notices[0]?.kind === 'progress' ? notices[0].message.text : '';
-    expect(copy).toMatch(/owning prime row/i);
-    expect(copy).toMatch(/sidebar/i);
-    expect(copy).toContain('Trust');
-    expect(copy).toContain('Release');
+    expect(copy).toMatch(/main chat's ⋯ menu in the sidebar/);
+    expect(copy).toContain('Trust chat');
+    expect(copy).toContain('Release chat');
     expect(copy).not.toContain('Sessions');
   });
 
@@ -4376,7 +4517,7 @@ describe('blocked chats', () => {
     const notices = (await readRecentEvents(session.id, 20))
       .filter(event => event.kind === 'progress' && /app-created worker/.test(event.message.text));
     expect(notices).toHaveLength(1);
-    expect(notices[0]?.kind === 'progress' && notices[0].message.text).toContain('no unique owning prime');
+    expect(notices[0]?.kind === 'progress' && notices[0].message.text).toContain('the main chat that started it is not proven yet');
   });
 
   it('keeps a trusted chat authorized only after its Compact & Resume successor commits', async () => {
@@ -4440,9 +4581,10 @@ describe('blocked chats', () => {
       .filter(event => event.kind === 'progress' && /untrusted chat was refused/.test(event.message.text));
     expect(notes).toHaveLength(1);
     const copy = notes[0]?.kind === 'progress' ? notes[0].message.text : '';
-    expect(copy).toMatch(/chat list/i);
-    expect(copy).toMatch(/hover.*sidebar/i);
-    expect(copy).toContain('Trust (✓)');
+    // The sidebar has one ⋯ menu per row since 7a023be7; there is no ✓ to hover for.
+    expect(copy).toMatch(/⋯ menu in the sidebar/);
+    expect(copy).toContain('Trust chat');
+    expect(copy).not.toContain('Trust (✓)');
     expect(copy).not.toContain('Sessions');
 
     await setChatTrusted(conversationId, true);

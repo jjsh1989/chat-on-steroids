@@ -1,7 +1,13 @@
-import { currentLanguage, ui, t } from './i18n.js';
-import { $, el, run } from './dom.js';
+import { currentLanguage, ui, t, tn } from './i18n.js';
+import { $, el, run, toast } from './dom.js';
 import { DEFAULT_USAGE_FORMULA, usageDateKey as dateKey, usageEstimate, usageMessageTotals, usageModelGroups, usageRate, usageWeekStart, type UsageFormula, type UsageOverview } from '../shared/usage.js';
+import type { ProviderUsage } from '../shared/provider-usage.js';
 let snapshot: UsageOverview | null = null;
+let projectNames = new Map<string, string>();
+// The By project name cells, so names that arrive late are written in place: repainting the section
+// would close an open Daily breakdown and drop the focus inside it.
+let projectNameCells: Array<[HTMLElement, () => string]> = [];
+let otherAppsGeneration = 0;
 let loadGeneration = 0;
 const FORMULA_KEY = 'usage-formula-v1';
 const WEEK_START_KEY = 'cos.usage.weekStart';
@@ -18,6 +24,13 @@ function saveFormula(): void {
 const count = { format: (value: number) => new Intl.NumberFormat(currentLanguage(), { notation: 'compact', maximumFractionDigits: 1 }).format(Math.round(value)) };
 const money = { format: (value: number) => new Intl.NumberFormat(currentLanguage(), { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value) };
 const featureLabels: Record<string, string> = { deep_research: "Deep research", file_upload: "File uploads", paste_text_to_file: "Pasted text files", image_gen: "Image generation" };
+// Names only label the By project rows: an unreadable list must not keep the page from loading.
+async function readProjectNames(): Promise<Map<string, string> | null> {
+  try {
+    const reply = await window.api.listProjects();
+    return reply.ok ? new Map(reply.data.map(project => [project.id, project.name])) : null;
+  } catch { return null; }
+}
 function usageHint(node: HTMLElement, text: string | (() => string)): void {
   ui(node, 'data-usage-hint', typeof text === 'function' ? text : () => text);
   node.setAttribute('tabindex', '0');
@@ -54,14 +67,16 @@ function paintMessages(): void {
   ui($('usageMessagePeriod'), 'textContent', period);
   ui(select, 'title', () => `${t('Change start day')}\n${period()}`);
 }
-export async function refreshUsage(): Promise<void> {
+export async function refreshUsage(fresh = false): Promise<void> {
   document.getElementById('usageTooltip')?.remove();
   const generation = ++loadGeneration;
+  void refreshOtherApps(fresh);
   $('refreshUsage').setAttribute('disabled', '');
   const status = $('usageStatus');
   ui(status, 'textContent', () => t("Updating usage in the background. After an update, this can take a few minutes. You can keep using the app."));
   status.setAttribute('role', 'status');
   try {
+    const names = readProjectNames();
     const value = await run(window.api.getUsage());
     if (generation !== loadGeneration) return;
     if (!value) { ui(status, 'textContent', () => t("Usage could not be loaded. Try Refresh.")); return; }
@@ -72,19 +87,20 @@ export async function refreshUsage(): Promise<void> {
       const item = el('div'); item.dataset.usageMetric = label; usageHint(item, () => `${Math.round(number).toLocaleString(currentLanguage())} ${t(label).toLowerCase()}`); item.append(el('strong', '', () => count.format(number)), el('span', '', () => t(label))); summary.append(item);
     }
     const limits = $('usageLimits'); limits.replaceChildren();
-    const modelRows = value.limits.filter((row) => row.scope === 'model');
-    for (const entry of [...modelRows, ...value.limits.filter((row) => row.scope !== 'model')]) {
+    // Chat model limits first, then feature quotas, then Codex's windows.
+    const order = { model: 0, feature: 1, codex: 2 } as const;
+    for (const entry of [...value.limits].sort((a, b) => order[a.scope] - order[b.scope])) {
       const stale = Date.now() - entry.observedAt > 10 * 60000 || (entry.resetAt !== null && entry.resetAt <= Date.now());
       const row = el('div', 'usage-limit');
       const featureLabel = featureLabels[entry.model];
-      // Shared pools are told apart by their window; "Shared usage" twice said nothing.
-      const sharedName = () => entry.windowSeconds === 604800 ? t("Weekly limit") : entry.windowSeconds ? t("{0}-hour limit", [Math.round(entry.windowSeconds / 3600)]) : entry.model;
-      const displayName = () => entry.scope === 'feature' && featureLabel ? t(featureLabel) : entry.scope === 'shared' ? sharedName() : entry.model;
+      // Codex's windows are told apart by their window; the pool's own name comes first.
+      const codexName = () => `${entry.model} · ${entry.windowSeconds === 604800 ? t("Weekly limit") : entry.windowSeconds ? t("{0}-hour limit", [Math.round(entry.windowSeconds / 3600)]) : t("Limit")}`;
+      const displayName = () => entry.scope === 'feature' && featureLabel ? t(featureLabel) : entry.scope === 'codex' ? codexName() : entry.model;
       const name = el('div'); name.append(el('strong', '', displayName));
-      if (entry.scope !== 'model') name.append(el('small', 'muted', () => entry.scope === 'shared' ? t("Shared across all models") : t("Feature quota")));
+      if (entry.scope !== 'model') name.append(el('small', 'muted', () => entry.scope === 'codex' ? t("Codex usage, not your ChatGPT chats") : t("Feature quota")));
       const detail = el('div');
       detail.append(el('b', '', () => stale ? t("Refresh needed") : entry.remaining !== null ? t("{0} remaining", [entry.remaining.toLocaleString(currentLanguage())]) : entry.remainingPercent !== null ? t("{0}% remaining", [Math.round(entry.remainingPercent)]) : t("Not reported")));
-      const window = () => entry.scope === 'shared' ? '' : entry.windowSeconds === 604800 ? t("Weekly · ") : entry.windowSeconds ? t("{0}h window · ", [Math.round(entry.windowSeconds / 3600)]) : '';
+      const window = () => entry.scope === 'codex' ? '' : entry.windowSeconds === 604800 ? t("Weekly · ") : entry.windowSeconds ? t("{0}h window · ", [Math.round(entry.windowSeconds / 3600)]) : '';
       detail.append(el('small', 'muted', () => window() + (entry.resetAt ? t("Resets {0}", [new Date(entry.resetAt).toLocaleString(currentLanguage())]) : t("Reset not reported"))));
       if (entry.remainingPercent !== null && !stale) { const progress = document.createElement('progress'); progress.max = 100; progress.value = entry.remainingPercent; ui(progress, 'aria-label', () => t("{0}: {1}% remaining", [displayName(), entry.remainingPercent])); detail.append(progress); }
       row.append(name, detail); limits.append(row);
@@ -93,6 +109,12 @@ export async function refreshUsage(): Promise<void> {
     paintRates();
     paintCost();
     ui(status, 'textContent', () => '');
+    // The rows wait for names, never the page. They keep the last names until a list answers.
+    void names.then(found => {
+      if (!found || generation !== loadGeneration || (found.size === projectNames.size && [...found].every(([id, name]) => projectNames.get(id) === name))) return;
+      projectNames = found;
+      for (const [cell, name] of projectNameCells) ui(cell, 'textContent', name);
+    });
   } catch {
     if (generation === loadGeneration) ui(status, 'textContent', () => t("Usage could not be loaded. Try Refresh."));
   } finally { if (generation === loadGeneration) $('refreshUsage').removeAttribute('disabled'); }
@@ -121,6 +143,7 @@ function dayLabel(key: string): string {
 }
 function paintCost(): void {
   if (!snapshot) return;
+  projectNameCells = [];
   const total = usageEstimate(snapshot.models, formula);
   // Tokens without a rate make the priced sum a lower bound: "≥ $0.29", which fits the card on one
   // line and reads in every language; the hint and the sentence below name the unpriced tokens.
@@ -200,7 +223,7 @@ function paintCost(): void {
   // The last 30 days as bars, one glance instead of a long table; the table stays one click away.
   const recent = daily.slice(-30);
   const chart = el('div', 'usage-bars'); chart.setAttribute('role', 'img');
-  ui(chart, 'aria-label', () => t("Estimated cost per day, last {0} days", [recent.length]));
+  ui(chart, 'aria-label', () => tn("Estimated cost per day, last {0} day", "Estimated cost per day, last {0} days", recent.length));
   const top = Math.max(0, ...recent.map(day => day.cost));
   for (const day of recent) {
     const bar = el('span', 'usage-bar');
@@ -222,12 +245,98 @@ function paintCost(): void {
   breakdown.append(table);
   const modelSection = el('section', 'usage-days-model');
   modelSection.append(el('h3', 'usage-cost-subhead', () => t('By model')), modelTable);
+  const sections = [modelSection];
+  // Someone who never uses projects would get one "No project" row; that is not a breakdown.
+  if (snapshot.projects.some(entry => entry.projectId !== null)) {
+    const projectTable = el('table', 'usage-table'); const projectHead = el('tr');
+    for (const title of ['Project', 'Estimated tokens', 'Estimated equivalent']) projectHead.append(el('th', '', () => t(title)));
+    projectTable.append(projectHead);
+    for (const entry of snapshot.projects) {
+      const estimate = usageEstimate(entry.models, formula); const row = el('tr');
+      const name = () => entry.projectId === null ? t("No project") : projectNames.get(entry.projectId) ?? t("Unknown project");
+      const nameCell = el('td', '', name); projectNameCells.push([nameCell, name]);
+      row.append(nameCell, el('td', '', () => Math.round(estimate.tokens).toLocaleString(currentLanguage())), el('td', '', () => estimate.unpricedTokens > 0 && estimate.unpricedTokens === estimate.tokens ? t("Rate unknown") : costText(estimate)));
+      projectTable.append(row);
+    }
+    const projectSection = el('section', 'usage-days-model usage-days-project');
+    projectSection.append(el('h3', 'usage-cost-subhead', () => t('By project')), projectTable);
+    sections.push(projectSection);
+  }
   const daySection = el('section', 'usage-days-daily');
   daySection.append(el('h3', 'usage-cost-subhead', () => t('By day')));
   if (recent.length) daySection.append(scale, chart, axis);
   daySection.append(breakdown);
-  $('usageDays').replaceChildren(modelSection, daySection);
+  $('usageDays').replaceChildren(...sections, daySection);
 }
+/** A limit row in the page's own shape: a name with a note, then the value, its reset and a bar. */
+function limitRow(name: () => string, note: (() => string) | null, value: () => string, small: () => string, remainingPercent: number | null): HTMLElement {
+  const row = el('div', 'usage-limit');
+  const title = el('div'); title.append(el('strong', '', name));
+  if (note) title.append(el('small', 'muted', note));
+  const detail = el('div'); detail.append(el('b', '', value), el('small', 'muted', small));
+  if (remainingPercent !== null) {
+    const progress = document.createElement('progress'); progress.max = 100; progress.value = remainingPercent;
+    ui(progress, 'aria-label', () => t("{0}: {1}% remaining", [name(), Math.round(remainingPercent)]));
+    detail.append(progress);
+  }
+  row.append(title, detail);
+  return row;
+}
+
+const codexWindowName = (minutes: number) => minutes === 10080 ? t("Weekly limit") : minutes % 60 === 0 ? t("{0}-hour limit", [minutes / 60]) : t("{0}-minute limit", [minutes]);
+/** Codex's reason codes for a reached limit, as a sentence; an unknown code stays readable as it is. */
+const codexReason = (code: string): string =>
+  code === 'workspace_owner_credits_depleted' ? t("The workspace's Codex credits are used up") : code.replace(/_/g, ' ');
+const when = (time: number) => new Date(time).toLocaleString(currentLanguage(), { dateStyle: 'short', timeStyle: 'short' });
+
+/**
+ * Codex's and Claude Code's usage (#482). What an app's provider reported is kept apart from what
+ * was counted from the logs here, and a window that has reset since its reading says so instead of
+ * showing an old percentage as current.
+ */
+export async function refreshOtherApps(fresh = false): Promise<void> {
+  const generation = ++otherAppsGeneration;
+  const host = $('otherAppsUsage');
+  let value: ProviderUsage | null | undefined;
+  try { value = await run(window.api.getProviderUsage(fresh)); } catch { value = null; }
+  if (generation !== otherAppsGeneration) return;
+  host.replaceChildren();
+  if (!value) { host.append(el('p', 'muted', () => t("Usage of other apps could not be read. Try Refresh."))); return; }
+  if (!value.enabled) { host.append(el('p', 'muted', () => t("Off. Nothing is read from other apps."))); return; }
+  const now = Date.now();
+  const lastWeek = (tokens: number[]) => tokens.reduce((sum, value) => sum + value, 0);
+  if (!value.codex) host.append(el('p', 'muted', () => t("No Codex logs on this computer.")));
+  else {
+    for (const limit of value.codex.limits) {
+      const as = () => t("Reported by Codex {0}", [when(limit.observedAt)]);
+      for (const window of limit.windows) {
+        const reset = window.resetsAt !== null && window.resetsAt <= now;
+        const remaining = Math.max(0, 100 - window.usedPercent);
+        host.append(limitRow(() => `Codex · ${codexWindowName(window.windowMinutes)}`, as,
+          () => reset ? t("Reset since this reading") : t("{0}% remaining", [Math.round(remaining)]),
+          () => window.resetsAt === null ? t("Reset not reported") : reset ? t("Codex reports again with its next answer") : t("Resets {0}", [when(window.resetsAt)]),
+          reset ? null : remaining));
+      }
+      if (limit.reached && !limit.windows.length) host.append(limitRow(() => `Codex · ${limit.id}`, as, () => t("Limit reached"), () => codexReason(limit.reached!), null));
+    }
+    const days = value.codex.days;
+    const today = days.at(-1);
+    host.append(limitRow(() => t("Codex · tokens"), () => t("Counted from Codex's logs on this computer"),
+      () => t("{0} today", [count.format(today ? today.input + today.output : 0)]),
+      () => t("{0} in 7 days", [count.format(lastWeek(days.map(day => day.input + day.output)))]), null));
+  }
+  if (!value.claude) host.append(el('p', 'muted', () => t("No Claude Code logs on this computer.")));
+  else {
+    const total = (day: NonNullable<ProviderUsage['claude']>['days'][number]) =>
+      day.models.reduce((sum, model) => sum + model.input + model.cacheWrite + model.cacheRead + model.output, 0);
+    const days = value.claude.days;
+    const today = days.at(-1);
+    host.append(limitRow(() => t("Claude Code · tokens"), () => t("Plan limits not reported: Claude Code shows them in its own /usage"),
+      () => t("{0} today", [count.format(today ? total(today) : 0)]),
+      () => t("{0} in 7 days", [count.format(lastWeek(days.map(total)))]), null));
+  }
+}
+
 export function initUsage(): void {
   try {
     const saved = localStorage.getItem(WEEK_START_KEY);
@@ -261,5 +370,21 @@ export function initUsage(): void {
     const input = $<HTMLInputElement>(id); input.value = String(formula[key]);
     input.addEventListener('input', () => { if (input.value !== '' && input.validity.valid && Number.isFinite(input.valueAsNumber)) { formula[key] = input.valueAsNumber; saveFormula(); paintCost(); } });
   }
-  $('refreshUsage').addEventListener('click', () => void refreshUsage());
+  $('refreshUsage').addEventListener('click', () => void refreshUsage(true));
+  const exportButton = $<HTMLButtonElement>('exportUsage');
+  exportButton.addEventListener('click', async () => {
+    if (exportButton.disabled) return;
+    const restoreFocus = document.activeElement === exportButton;
+    exportButton.disabled = true;
+    // Not run(): main's error names the chosen file's full path, which the page never shows.
+    try {
+      const reply = await window.api.exportUsage(formula.divisor);
+      if (!reply.ok) toast(t('Usage could not be exported.'));
+      else if (reply.data.saved) toast(t('Saved {0}', [reply.data.name]));
+    } catch { toast(t('Usage could not be exported.')); } finally {
+      exportButton.disabled = false;
+      // Disabling the button dropped keyboard focus to the page; give it back unless the person moved it.
+      if (restoreFocus && (document.activeElement === exportButton || document.activeElement === document.body || !document.activeElement)) exportButton.focus();
+    }
+  });
 }

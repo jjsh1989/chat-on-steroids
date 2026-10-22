@@ -41,8 +41,8 @@ import type {
   ToolEditReview
 } from '../../shared/session.js';
 import type { WorkerAssignmentSummary } from '../../shared/session.js';
-import { continuationMarkerOf, DEFAULT_RECORDING_STORAGE_GIB, eventTokens, MAX_TOOL_RESULT_TOKENS, normalizedToolOutcome, RECORDING_STORAGE_LIMITS_GIB, storedTextTokens, workSequence } from '../../shared/session.js';
-import { applyTurnIdentity, authoredTimeOf, chronological, injectedUserMessage, positionOf, projectTimeline,
+import { continuationMarkerOf, DEFAULT_RECORDING_STORAGE_GIB, eventTokens, MAX_TOOL_RESULT_TOKENS, normalizedToolOutcome, RECORDING_STORAGE_LIMITS_GIB, storedTextTokens, workSequence, UNATTRIBUTED_SESSION_TITLE } from '../../shared/session.js';
+import { applyTurnIdentity, authoredTimeOf, chronological, injectedUserMessage, positionOf, projectTimeline, residenceOf,
   recordedRequestTurn, responseTurnId, type Chronological, type TimelineTurns } from '../../shared/chronology.js';
 import { automaticTitle, firstTitleMessage, legacyContextTitle, legacyLabelPending, projectPageTitle, providerTitleIgnored, refreshUserTitle, userTitle } from './title.js';
 import { agentPlanSchema, agentPlanUpdateSchema, MAX_AGENT_PLAN_BYTES, type AgentPlan, type AgentPlanUpdate } from '../../shared/agent-plan.js';
@@ -194,6 +194,12 @@ function assertReady(): void {
 export function sessionSearchIndexPath(id: string): string {
   assertSessionId(id);
   return path.join(sessionDir(id), 'search.txt');
+}
+
+/** The chat's bookmarked answers (bookmarks.ts); they live and are deleted with the session. */
+export function sessionBookmarksPath(id: string): string {
+  assertSessionId(id);
+  return path.join(sessionDir(id), 'bookmarks.json');
 }
 
 function sessionDir(id: string): string {
@@ -938,7 +944,6 @@ async function rebuildSummaryFromHistory(
         agents: [...new Set([...checkpoint.agents, ...rebuilt.agents])]
       }
     : rebuilt;
-  logWarn(`session ${id}: rebuilt metadata from durable event/message history`);
   await writeSummary(summary, historySeq);
   return summary;
 }
@@ -1004,6 +1009,15 @@ async function readDurableSnapshot(id: string): Promise<DurableSessionSnapshot |
     if (!checkpoint && historySeq === 0) return null;
 
     const summary = await rebuildSummaryFromHistory(id, messages, checkpoint?.summary ?? null, historySeq, checkpoint?.historySeq === historySeq, !!checkpoint && !checkpoint.tokenEstimateCurrent);
+    // New derived fields and estimate versions deliberately replay old history after an
+    // update. That is a migration, not evidence of damaged history. A known stale watermark
+    // or missing checkpoint still needs a recovery warning, even during an upgrade.
+    // Report success only after the rebuilt checkpoint has actually reached disk.
+    if (checkpoint && (checkpoint.historySeq === null || checkpoint.historySeq === historySeq)) {
+      logInfo(`session ${id}: upgraded metadata from durable history (normal version migration)`);
+    } else {
+      logWarn(`session ${id}: rebuilt metadata from durable event/message history (${checkpoint ? 'history checkpoint out of date' : 'metadata checkpoint unavailable'})`);
+    }
     return { summary, messages, historySeq, reconciled: true };
   })();
   reconciling.set(id, work);
@@ -1391,6 +1405,10 @@ export function upsertMessageEvent(
                 authoredText: event.authoredText ?? previous.authoredText,
                 wireTokenEstimate: event.wireTokenEstimate ?? previous.wireTokenEstimate,
                 reaction: event.reaction === undefined ? previous.reaction : event.reaction,
+                // Where it sits in ChatGPT's tree, and which version it replaced, do not change once known.
+                parentId: previous.parentId ?? event.parentId,
+                replaces: previous.replaces ?? event.replaces,
+                automatic: previous.automatic ?? event.automatic,
                 // App-owned originals/previews retain their outbox identity when the
                 // provider later observes different native attachment ids for that send.
                 attachments: previous.inputId ? previous.attachments ?? event.attachments : event.attachments ?? previous.attachments,
@@ -1445,7 +1463,7 @@ export function upsertMessageEvent(
             previous.resolvedModel === nextEvent.resolvedModel &&
             JSON.stringify(previous.references) === JSON.stringify(nextEvent.references))) &&
         (nextEvent.kind !== 'user_message' || previous.kind !== 'user_message' ||
-          (nextEvent.reaction === previous.reaction && nextEvent.inputId === previous.inputId && nextEvent.authoredText === previous.authoredText && nextEvent.wireTokenEstimate === previous.wireTokenEstimate && nextEvent.inputDelivery === previous.inputDelivery && JSON.stringify(nextEvent.assets) === JSON.stringify(previous.assets) && JSON.stringify(nextEvent.retiredImageAssetIds) === JSON.stringify(previous.retiredImageAssetIds) && JSON.stringify(nextEvent.attachments) === JSON.stringify(previous.attachments))) &&
+          (nextEvent.reaction === previous.reaction && nextEvent.parentId === previous.parentId && nextEvent.replaces === previous.replaces && nextEvent.automatic === previous.automatic && nextEvent.inputId === previous.inputId && nextEvent.authoredText === previous.authoredText && nextEvent.wireTokenEstimate === previous.wireTokenEstimate && nextEvent.inputDelivery === previous.inputDelivery && JSON.stringify(nextEvent.assets) === JSON.stringify(previous.assets) && JSON.stringify(nextEvent.retiredImageAssetIds) === JSON.stringify(previous.retiredImageAssetIds) && JSON.stringify(nextEvent.attachments) === JSON.stringify(previous.attachments))) &&
         (previous.turnId ?? undefined) === settledTurnId &&
         (nextEvent.agent === undefined || previous.agent === nextEvent.agent) &&
         (!preferTime || previous.time === nextEvent.time)
@@ -1503,7 +1521,11 @@ export function upsertMessageEvent(
         entry.summary.contextTokens = Math.max(0, entry.summary.contextTokens + delta);
         entry.summary.updatedAt = Math.max(entry.summary.updatedAt, nextEvent.time);
         noteFinishWork(entry.summary, full);
-        if (full.kind === 'assistant_message' && (full.final === true || full.state === 'final')) {
+        // Only a new final is new work. The same finished answer re-reported after a reload or a
+        // branch keeps its boundary, or the sidebar would call a read chat "New response".
+        const finalBefore = sameMessage && previous.kind === 'assistant_message' &&
+          (previous.final === true || previous.state === 'final');
+        if (!finalBefore && full.kind === 'assistant_message' && (full.final === true || full.state === 'final')) {
           entry.summary.lastAssistantFinalAt = Math.max(
             entry.summary.lastAssistantFinalAt ?? 0,
             nextEvent.time
@@ -1833,7 +1855,11 @@ async function scanJournalLines(sessionId: string, accept: (line: string) => voi
 export async function readRecentEvents(
   sessionId: string,
   limit: number,
-  options: Pick<ReadOptions, 'kinds' | 'agent'> & { maxBytes?: number; before?: number; after?: number; orderByOrigin?: boolean } = {}
+  options: Pick<ReadOptions, 'kinds' | 'agent'> & {
+    maxBytes?: number; before?: number; after?: number; orderByOrigin?: boolean;
+    /** History pages for reading: a turn's final answer sits beside its end (`residenceOf`). */
+    byResidence?: boolean;
+  } = {}
 ): Promise<SessionEvent[]> {
   assertSessionId(sessionId);
   await flushSession(sessionId);
@@ -1894,6 +1920,20 @@ export async function readCompletedFinal(sessionId: string, conversationId: stri
   if (entry.nextSeq !== revision || entry.summary.conversationId !== conversationId) return null;
   const sameTurn = (left: string | null | undefined, right: string | null | undefined) => !!left && !!right &&
     responseTurnId(entry.summary.timelineTurns, left) === responseTurnId(entry.summary.timelineTurns, right);
+  // A reload after the page's ten-minute check (`stalled`) opens a second document-local turn for
+  // the same unanswered question; ChatGPT's final can then arrive for the first one while the
+  // second completes (2026-10-14). That reopen is the same response. A new question gives the
+  // reopened turn a different `questionId`, and a second answer after a real end (Regenerate)
+  // follows a completed end, so neither is joined.
+  const reopenedAfterStall = (left: string | null | undefined, right: string | null | undefined): boolean => {
+    const turns = entry.summary.timelineTurns;
+    if (!left || !right || !turns) return false;
+    const a = turns[responseTurnId(turns, left)], b = turns[responseTurnId(turns, right)];
+    if (!a || !b || a === b || !a.questionId || a.questionId !== b.questionId) return false;
+    const [earlierId, earlier, later] = a.origin <= b.origin ? [left, a, b] : [right, b, a];
+    return earlier.endOrigin !== undefined && later.origin > earlier.endOrigin &&
+      recent.some(event => event.kind === 'turn_end' && event.outcome === 'stalled' && sameTurn(event.turnId, earlierId));
+  };
   // Pixels/media alone are not completion. Require the provider's exact terminal
   // message on a completed lifecycle boundary and its matching recorded image.
   // These facts may arrive in either batch; never manufacture assistant prose.
@@ -1903,7 +1943,7 @@ export async function readCompletedFinal(sessionId: string, conversationId: stri
       image.providerStatus === 'finished_successfully' && sameTurn(image.turnId, event.turnId));
   const final = recent.findLast(event => imageEnd(event) || (event.kind === 'assistant_message' && event.final === true &&
     (!!event.message.text.trim() || !!event.providerMessageId) && !!event.messageId && (!turnId || event.turnId === turnId ||
-      (!!event.providerMessageId && sameTurn(event.turnId, turnId)) ||
+      (!!event.providerMessageId && (sameTurn(event.turnId, turnId) || reopenedAfterStall(event.turnId, turnId))) ||
       (turnId.startsWith('reply:') && event.messageId === turnId.slice(6)))));
   if (!final || (final.kind !== 'assistant_message' && final.kind !== 'turn_end')) return null;
   const messageId = final.kind === 'turn_end' ? final.providerMessageId : final.messageId;
@@ -1917,7 +1957,11 @@ export async function readCompletedFinal(sessionId: string, conversationId: stri
   // ChatGPT's redraw, when the turn has already ended. A genuinely new question has a new id.
   const ownQuestion = final.turnId ? entry.summary.timelineTurns?.[final.turnId]?.questionId : undefined;
   const nativeFinal = final.kind === 'turn_end' || (final.final === true && !!final.providerMessageId);
-  if (question && positionOf(question) >= positionOf(final) && !correction(question)) return null;
+  // Nor is the turn's own question recorded after its answer: ChatGPT stamps a fast answer with its
+  // server time, the page stamps the question with the local clock, and a clock running ahead put
+  // "worker ready" before the question it answered (#1086, Windows VM, 2.1.41).
+  if (question && positionOf(question) >= positionOf(final) && !correction(question) &&
+      !(ownQuestion && question.kind === 'user_message' && question.messageId === ownQuestion)) return null;
   // With no generation identity, require an actual preceding authored boundary.
   if (!final.turnId && (!question || question.time > final.time)) return null;
   if (entry.summary.activeTurnId && !sameTurn(entry.summary.activeTurnId, final.turnId)) return null;
@@ -1940,11 +1984,12 @@ export async function readCompletedFinal(sessionId: string, conversationId: stri
     }
     // The page's ten-minute check ends a turn as `stalled` when it never saw the end. After
     // ChatGPT's own final for that turn, the turn did end; nothing new happened (#1099).
-    if (event.kind === 'turn_end') return !sameTurn(event.turnId, final.turnId) ||
+    const sameResponse = sameTurn(event.turnId, final.turnId) || (nativeFinal && reopenedAfterStall(event.turnId, final.turnId));
+    if (event.kind === 'turn_end') return !sameResponse ||
       (event.outcome !== 'completed' && !(event.outcome === 'stalled' && nativeFinal));
     // The first start of the final's own turn, recorded after that final: ChatGPT reported a fast
     // answer's end before the page opened the turn from the Send receipt (#1099). Not new work.
-    if (event.kind === 'turn_start') return !(nativeReopen && event === last) &&
+    if (event.kind === 'turn_start') return !(nativeReopen && event === last) && !(sameResponse && event.turnId !== final.turnId) &&
       !(event.source !== 'app' && !!final.turnId && event.turnId === final.turnId &&
         entry.summary.timelineTurns?.[final.turnId]?.origin === positionOf(event));
     if (event.kind === 'user_message') return !correction(event) && !(ownQuestion && event.messageId === ownQuestion);
@@ -2121,7 +2166,7 @@ async function readRecentEventsFromDisk(
   sessionId: string,
   limit: number,
   options: Pick<ReadOptions, 'kinds' | 'agent'> & {
-    maxBytes?: number; before?: number; after?: number; acceptEvent?: (event: SessionEvent) => boolean; orderByOrigin?: boolean
+    maxBytes?: number; before?: number; after?: number; acceptEvent?: (event: SessionEvent) => boolean; orderByOrigin?: boolean; byResidence?: boolean
   } = {}
 ): Promise<SessionEvent[]> {
   const cap = Math.max(1, Math.min(MAX_EVENT_TAIL, Math.floor(limit)));
@@ -2138,7 +2183,7 @@ async function readRecentEventsFromDisk(
   // the row cap or a long old answer can hide every earlier user turn from Goal/history tails.
   const legacyMessageKeys = new Set<string>();
   const rawTail: SessionEvent[] = [];
-  const sequence = options.orderByOrigin ? positionOf : workSequence;
+  const sequence = options.byResidence ? residenceOf : options.orderByOrigin ? positionOf : workSequence;
   const forward = options.after !== undefined;
   let replaced = 0;
   let reachedStart = false;
@@ -2364,7 +2409,7 @@ export async function rewriteUnattributedToolCalls(
   assertSessionId(sessionId);
   const entry = await ensureOpen(sessionId);
   const rewrite = entry.queue.then(async () => {
-    if (entry.summary.conversationId !== null || entry.summary.title !== 'Unattributed activity') {
+    if (entry.summary.conversationId !== null || entry.summary.title !== UNATTRIBUTED_SESSION_TITLE) {
       throw new Error(`Session ${sessionId} is not an Unattributed activity bucket`);
     }
 
@@ -3106,6 +3151,34 @@ export async function conversationAttachment(
 }
 
 /**
+ * Where the work of a replaced ChatGPT conversation continues: the current chat and title of the
+ * session that left it. A chat left twice points at the newest chat, never the middle one, since
+ * a session holds one current conversation. The placeholder title of a chat not yet named is no
+ * name, so it comes back empty. Null when no retained session left this one.
+ */
+export async function replacementOf(
+  conversationId: string,
+  sessionId: string | null = null
+): Promise<{ conversationId: string; title: string } | null> {
+  if (!conversationId) return null;
+  const from = (summary: SessionSummary | null | undefined) =>
+    summary && summary.chatIds.includes(conversationId) && summary.conversationId && summary.conversationId !== conversationId
+      ? { conversationId: summary.conversationId, title: summary.title === 'ChatGPT session' ? '' : summary.title }
+      : null;
+  if (sessionId) return from(await getSession(sessionId));
+  const catalog = await ensureAttachmentCatalog();
+  const sessionIds = new Set(catalog.historical.get(conversationId) ?? []);
+  for (const [id, entry] of open) {
+    if (entry.summary.chatIds.includes(conversationId)) sessionIds.add(id);
+  }
+  for (const id of sessionIds) {
+    const found = from(open.get(id)?.summary ?? catalog.summaries.get(id));
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
  * Filesystem time of the newest durable mutation belonging to a session.
  *
  * Session event timestamps describe when an action happened, not when it finally reached
@@ -3349,7 +3422,7 @@ export async function renameSession(id: string, title: string, source: SessionSu
     }
     if (source !== 'manual') {
       if (conversationId && entry.summary.conversationId !== conversationId) return;
-      if (!automaticTitle(entry.summary, firstTitleMessage(entry.messages.values()))) return;
+      if (!automaticTitle(entry.summary, firstTitleMessage(entry.messages.values(), entry.summary.origin?.branchOf))) return;
       if (source === 'fallback' && entry.summary.titleSource === 'provider') return;
       if (source === 'provider' && (providerTitleIgnored(entry.summary) || projectPageTitle(title))) return;
     }
@@ -3369,7 +3442,7 @@ export async function clearSessionName(id: string): Promise<void> {
   await enqueueSessionOperation(entry, 'rename', async () => {
     if (entry.summary.titleSource !== 'manual') return;
     const auto = entry.summary.autoTitle;
-    const first = firstTitleMessage(entry.messages.values());
+    const first = firstTitleMessage(entry.messages.values(), entry.summary.origin?.branchOf);
     entry.summary.title = auto?.title || (first ? userTitle(first.message.text, first.authoredText) : '') || 'ChatGPT session';
     entry.summary.titleSource = auto?.source ?? 'fallback';
     delete entry.summary.autoTitle;

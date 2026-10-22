@@ -53,6 +53,8 @@ const {
   offerMessagesForConversation,
   onSpawnRequest,
   onSwarmEnd,
+  onWorkerChatsRetired,
+  onWorkerFinished,
   onSwarmPersist,
   onSwarmPersistNow,
   pendingCount,
@@ -70,6 +72,8 @@ const {
   failWorkerRevival,
   isWorkerConversation,
   WAKE_FAILURES_BEFORE_GIVING_UP,
+  TRANSIENT_WAKE_RETRIES,
+  TRANSIENT_WAKE_RETRY_MS,
   noteWorkerRevived,
   onReviveRequest,
   pendingWorkerRevivals,
@@ -2323,6 +2327,60 @@ describe('a worker that is sleeping', () => {
     expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('active');
   });
 
+  /**
+   * #1086, 2026-10-14 (Windows, 2.1.36): a prime woke three sleeping workers in one batch. One page
+   * never showed a message box again after choosing the model, another refused its own send as
+   * "draft-changed"; both had loaded the chat and sent nothing, yet each spent one of the two
+   * strikes a dead chat gets. A page that redeemed the wake and failed before Send is woken again
+   * by the app itself, twice, without troubling the prime; only then does it count as a strike.
+   */
+  it('wakes a worker again by itself after a page that was merely not ready, and only then counts a strike', () => {
+    vi.useFakeTimers();
+    try {
+      startSwarm(1);
+      const worker = startWorker('worker-1');
+      finishAgent(worker.caller, 'done');
+      const revivals: string[][] = [];
+      onReviveRequest(owed => { revivals.push(owed.map(entry => entry.id)); });
+      stageMessages(prime, [{ to: 'worker-1', text: 'more work' }]).commit();
+      expect(TRANSIENT_WAKE_RETRIES).toBe(2);
+      const before = pendingCount(PRIME_ID);
+      for (let attempt = 1; attempt <= TRANSIENT_WAKE_RETRIES; attempt++) {
+        expect(failWorkerRevival('worker-1', 'ChatGPT never re-exposed a usable composer after model selection', undefined, { transient: true })).toBeNull();
+        // Still waking: its slot stays reserved and the prime hears nothing.
+        expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('waking');
+        expect(pendingCount(PRIME_ID)).toBe(before);
+        const asked = revivals.length;
+        vi.advanceTimersByTime(TRANSIENT_WAKE_RETRY_MS);
+        expect(revivals.length).toBe(asked + 1);
+        expect(revivals.at(-1)).toEqual(['worker-1']);
+      }
+      // A third transient failure is a strike like any other: back to sleep, the prime is told.
+      const report = failWorkerRevival('worker-1', 'ChatGPT did not accept the bootstrap send (draft-changed)', undefined, { transient: true });
+      expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('sleeping');
+      expect(report?.text).toMatch(/could not be woken/);
+      // A failure that is not transient (the chat never loaded) still counts at once: second strike.
+      stageMessages(prime, [{ to: 'worker-1', text: 'still there?' }]).commit();
+      expect(failWorkerRevival('worker-1', 'its page never showed a usable message box')?.text).toMatch(/2 revivals in a row/);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('does not wake a worker again once its wake was withdrawn while it waited', () => {
+    vi.useFakeTimers();
+    try {
+      startSwarm(1);
+      const worker = startWorker('worker-1');
+      finishAgent(worker.caller, 'done');
+      const revivals: string[][] = [];
+      onReviveRequest(owed => { revivals.push(owed.map(entry => entry.id)); });
+      stageMessages(prime, [{ to: 'worker-1', text: 'more work' }]).commit();
+      failWorkerRevival('worker-1', 'ChatGPT never exposed a usable composer for bootstrap', undefined, { transient: true });
+      resetSwarm();
+      vi.advanceTimersByTime(TRANSIENT_WAKE_RETRY_MS);
+      expect(revivals).toEqual([]);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('forgives a single failed wake once the chat has been heard from since', () => {
     startSwarm(1);
     const worker = startWorker('worker-1');
@@ -3924,6 +3982,26 @@ describe('through the MCP endpoint', () => {
     expect(exact).toContain('WORKER_RETIRED');
   });
 
+  it('tells an unproven call to retry while a newly started worker has not reported in, instead of blaming the connection', async () => {
+    // VM, 2026-10-20: a new worker's page reported 138 s after its first command. Both commands were
+    // refused "restore the companion connection and retry"; the model tried once more and gave up,
+    // and both calls were proven to be that worker's a minute later.
+    // Another main chat's sleeping workers: the dormant history that fences unproven calls.
+    startSwarm(1, { conversationId: 'c-earlier-prime' });
+    const worker = startWorker('worker-1', 'c-earlier-worker');
+    finishAgent(worker.caller, 'parked history');
+    expect(releaseQuiescentRun()).toBe(true);
+    // This main chat starts a worker; its chat has not reported in yet.
+    spawn({ workers: [{ task: 'new task' }], caller: prime });
+    const refused = await callTool('read', { paths: ['/anything'] });
+    expect(refused).toContain('CALLER_IDENTITY_REQUIRED');
+    expect(refused).toMatch(/sub-agent.*just started/i);
+    expect(refused).toMatch(/call .* again in about 30 seconds/i);
+    expect(refused).toContain('with this same app');
+    expect(refused).not.toContain('restore the companion connection');
+    expect(refused).toContain('No local tool was run');
+  });
+
   it('explains scheduled-run permission with dormant history and never adopts that history', async () => {
     startSwarm(1);
     const worker = startWorker('worker-1');
@@ -4576,6 +4654,26 @@ describe('through the MCP endpoint', () => {
       message.text.includes('[worker-2 reported]')
     );
     expect(last?.text).toContain('3 of 3 worker slots are free');
+  });
+
+  it('tells the prime which workers wait for the user to answer a tool approval', async () => {
+    // VM, 2026-10-17: both workers stopped at ChatGPT's own "allow this app?" card for their
+    // report. The status table still said "active", so the prime decided the runtime was the
+    // bottleneck instead of telling the person a click was needed.
+    const { noteApprovalCard, resetApprovalWaits } = await import('../src/main/approval-wait.js');
+    resetApprovalWaits();
+    startSwarm(2);
+    bindConversation('worker-1', 'c-worker-1');
+    bindConversation('worker-2', 'c-worker-2');
+    const deps = { log: () => undefined, record: async () => null, notify: () => undefined } as never;
+    await noteApprovalCard('c-worker-1', true, null, deps);
+    const status = await asChat(PRIME_CHAT, 'status');
+    expect(status).toMatch(/worker-1 {2}worker {2}\S+.*needs the user to answer a tool approval in its chat/);
+    expect(status).not.toMatch(/worker-2 .*tool approval/);
+    expect(status).toContain('worker-1 waits for the user to allow or deny a tool call in its own chat');
+    await noteApprovalCard('c-worker-1', false, null, deps);
+    expect(await asChat(PRIME_CHAT, 'status')).not.toContain('tool approval');
+    resetApprovalWaits();
   });
 
   it('tells the prime a worker is gone for good only once its own chat is full', async () => {
@@ -5432,4 +5530,95 @@ it('archives accepted renamed assignments before broker expiry and restores save
     resetSessionStoreForTests();
     expect((await getSession(session.id))?.workerAssignment).toMatchObject({ label: 'Review', task: 'New task' });
   } finally { vi.useRealTimers(); }
+});
+
+/** A worker that reported its task done, for archiving its chat right away (#1701). */
+describe('finished worker chats', () => {
+  it('names a worker chat once when its worker finishes, and not for a repeated finish or the prime', () => {
+    const finished: string[] = [];
+    onWorkerFinished((id) => finished.push(id));
+    startSwarm(2);
+    const one = startWorker('worker-1');
+    startWorker('worker-2');
+    finishAgent(one.caller, 'done');
+    finishAgent(one.caller, 'done again');
+    expect(finished).toEqual(['c-worker-1']);
+  });
+
+  it('names a worker chat when the browser finishes it from its settled answer', () => {
+    const finished: string[] = [];
+    onWorkerFinished((id) => finished.push(id));
+    startSwarm(1);
+    startWorker('worker-1');
+    finishWorkerConversation('c-worker-1', 'answered');
+    expect(finished).toEqual(['c-worker-1']);
+  });
+
+  it('names a worker chat only once a staged finish commits', () => {
+    const finished: string[] = [];
+    onWorkerFinished((id) => finished.push(id));
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    const rolledBack = stageFinishAgent(worker.caller, 'done');
+    rolledBack.rollback();
+    expect(finished).toEqual([]);
+    const staged = stageFinishAgent(worker.caller, 'done');
+    staged.commit();
+    expect(finished).toEqual(['c-worker-1']);
+  });
+});
+
+/** Worker chats the broker will never use again, for archiving them in ChatGPT (#1460). */
+describe('retired worker chats', () => {
+  it('names every worker chat of a cleared run, and none while a run is only parked', () => {
+    const retired: string[][] = [];
+    onWorkerChatsRetired((ids) => retired.push([...ids]));
+    startSwarm(2);
+    startWorker('worker-1');
+    startWorker('worker-2');
+    resetSwarm();
+    expect(retired).toEqual([['c-worker-1', 'c-worker-2']]);
+  });
+
+  it('names the workers of a parked run once that run is cleared', () => {
+    const retired: string[][] = [];
+    onWorkerChatsRetired((ids) => retired.push([...ids]));
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    fillContext('c-worker-1');
+    finishAgent(worker.caller, 'done');
+    expect(releaseQuiescentRun()).toBe(true);
+    // Parked: the prime can still come back to its workers.
+    expect(retired).toEqual([]);
+    resetSwarm();
+    expect(retired).toEqual([['c-worker-1']]);
+  });
+
+  it('names the workers of a parked run when its history expires after a week (polish 2.1.37)', () => {
+    const retired: string[][] = [];
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    fillContext('c-worker-1');
+    finishAgent(worker.caller, 'done');
+    expect(releaseQuiescentRun()).toBe(true);
+    const saved = structuredClone(snapshotSwarm());
+    resetAgentsForTests();
+    // Registered before the app restores its saved runs, as index.ts does.
+    onWorkerChatsRetired((ids) => retired.push([...ids]));
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(saved!.savedAt + 8 * 24 * 60 * 60_000);
+      restoreSwarm(saved);
+      expect(retired).toEqual([['c-worker-1']]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('names the workers when clearing the prime row ends its run', () => {
+    const retired: string[][] = [];
+    onWorkerChatsRetired((ids) => retired.push([...ids]));
+    startSwarm(1);
+    startWorker('worker-1');
+    clearAgent(PRIME_ID);
+    expect(retired).toEqual([['c-worker-1']]);
+  });
 });

@@ -1,5 +1,7 @@
 import { offerToolInput, acknowledgeToolInput, TOOL_INPUT_HEADER } from '../session/input.js';
+import { STRICT_REFUSAL_PROGRESS_PREFIX, UNPROVEN_WORKER_NOTICE, UNTRUSTED_NOTICE, UNTRUSTED_WORKER_NOTICE } from '../../shared/trust-notices.js';
 import { noteConnectorUse } from '../connector-proof.js';
+import { beginPluginToolCall } from '../plugin-refresh.js';
 import { pluginManager } from '../plugins/manager.js';
 import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-computer.js';
 /**
@@ -25,10 +27,11 @@ import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-compu
 
 import { rawPromises as fs } from '../rawfs.js';
 import { randomUUID } from 'node:crypto';
-import { beginToolTiming, inboundRequestId, inboundPublication } from './inbound.js';
+import { beginToolTiming, inboundRequestId, inboundPublication, inboundProviderRequest } from './inbound.js';
 import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import type { Capabilities, Root } from '../../shared/types.js';
+import type { Capabilities, RemoteFolder, Root } from '../../shared/types.js';
+import { fsForRoot } from '../remote/project-fs.js';
 import { CAPABILITY_LABELS, WRITE_CAPABILITIES } from '../../shared/types.js';
 import { FsOpError, formatBytes, type FileInfo } from '../fsops.js';
 import { logInfo, logWarn } from '../logger.js';
@@ -48,6 +51,7 @@ import { isUserSkillVirtualPath, resolveUserSkillPath } from '../user-skills.js'
 import { ExecError } from '../exec.js';
 import { ComputerError } from '../computer/index.js';
 import { getConfig } from '../config.js';
+import { noteToolCall, toolOutcome } from '../diagnostics-facts.js';
 import {
   AgentError,
   IdentityLostError,
@@ -64,6 +68,7 @@ import {
   silentCeilingWorkerNotice,
   endedWorkerNotice,
   hasDormantWorkerLeases,
+  pendingWorkerSpawns,
   sleepSilentWorkers,
   noteAgentAlive,
   agentForCaller,
@@ -89,6 +94,7 @@ import {
   noteOutcome,
   holdWhileSettling,
   runInCallContext,
+  noteCallReleased,
   runningToolProgress,
   setRequestOwner,
   trackInFlight,
@@ -96,6 +102,7 @@ import {
   type CallContext,
   type CallCaller
 } from './call-context.js';
+import { openCallHold } from '../rotation-hold.js';
 import {
   REQUEST_ID_GRACE_MS,
   awaitFreshCallOrigin,
@@ -108,6 +115,7 @@ import {
 import { requestCorrelation } from '../session/correlation.js';
 import { summarizeRunningCall } from '../session/summarize.js';
 import { anyChatBlocked, BLOCKED_CHAT_REFUSAL, isChatBlocked } from '../session/blocked-chats.js';
+import { ROTATION_FENCE_REFUSAL, rotationFenced } from '../rotation-fence.js';
 import { STRICT_CHAT_REFUSAL, conversationAccessRefusal, strictChatAllowlistEnabled } from '../session/conversation-access.js';
 import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
 import {
@@ -120,23 +128,20 @@ import { DEFAULT_MAX_OUTPUT_TOKENS } from '../codex/unified-exec-constants.js';
 import { unattributedRepairEta } from '../bridge.js';
 import {
   conversationAttachment,
+  replacementOf,
   findSessionByConversation,
   getSession,
   requestBelongsToActiveTurn,
   requestTurnOwnershipCutoff
 } from '../session/store.js';
 import { sessionFinishDeadline } from '../session/finish.js';
+import { noteUntrustedExternalContent } from '../session/director-authority.js';
+import { directorAuthoritySessionId } from '../session/director-owner.js';
 import type { ToolOutcome } from '../../shared/session.js';
 
 /** The page's exact proof of a request id, by which a running call counts for its chat. */
 const requestOwner = (requestId: string): string | null => requestCorrelation(requestId)?.conversationId ?? null;
 
-const UNTRUSTED_NOTICE =
-  'A tool call from an untrusted chat was refused. In the chat list, hover this chat in the sidebar and choose Trust (✓) to allow it.';
-const UNTRUSTED_WORKER_NOTICE =
-  'A tool call from a worker whose owning prime is not currently allowed was refused. In the chat list, hover the owning prime row in the sidebar and choose Trust (✓) if it is untrusted, or Release there if it is blocked.';
-const UNPROVEN_WORKER_NOTICE =
-  'A tool call from an app-created worker was refused because no unique owning prime is currently proven. Return to the owning prime in the chat list; once its row is known, hover it in the sidebar and choose Trust (✓), or Release there if it is blocked, then retry after the worker is attached or recovered there.';
 const WORKER_CONNECTION_PROFILE_REFUSAL =
   'WORKER_CONNECTION_PROFILE_MISMATCH: this worker belongs to a different Chat On Steroids Setup profile. ' +
   'No local tool was run. Return to the owning prime and switch back to the connection that created this worker family; ' +
@@ -191,7 +196,7 @@ async function recordUntrustedRefusalNotice(context: CallContext): Promise<void>
   // A progress id is a presentation identity: reusing it would make foldProgress() collapse a
   // later refusal episode into the old row. The in-memory exact-pair map does deduplication;
   // the durable row therefore gets a fresh identity for each episode.
-  const recorded = await recordProgress(caller.sessionId, `strict-chat-refusal:${randomUUID()}`, message);
+  const recorded = await recordProgress(caller.sessionId, `${STRICT_REFUSAL_PROGRESS_PREFIX}${randomUUID()}`, message);
   if (!recorded) {
     untrustedNoticeEpisodes.delete(key);
     return;
@@ -529,6 +534,9 @@ async function withBackgroundExecRecovery(
  * between a completed local operation, its unknown attribution, and an undelivered agent
  * message: none of those facts implies that completed work is about to disappear.
  */
+/** Tools whose answer does not depend on which chat called them. */
+const IDENTITY_FREE_TOOLS: ReadonlySet<string> = new Set(['usage']);
+
 function withUnattributedNotice(
   conversationId: string | null | undefined,
   result: ToolResult,
@@ -654,15 +662,22 @@ export async function dispatch(
   };
   // Every call runs through here, so the proof is installed before any call can be running.
   setRequestOwner(requestOwner);
+  const confirmUse = !parent && inboundProviderRequest() ? beginPluginToolCall(surface) : null;
   try {
     const result = await trackMcpRequest(() =>
       trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run, !!parent))
     );
     // In-process callers have no socket; resolving their outer invocation publishes it.
     if (!parent && !inboundPublication()) context.publication!.completedAt = Date.now();
+    // Only a provider request has a response ChatGPT receives; in-process callers prove nothing.
+    if (!parent && inboundPublication()) noteCallReleased(context);
+    if (!result.isError) confirmUse?.();
     return result;
   } catch (error) {
-    if (!parent) context.publication!.failed = true;
+    if (!parent) {
+      context.publication!.failed = true;
+      if (inboundPublication()) noteCallReleased(context);
+    }
     throw error;
   }
 }
@@ -693,6 +708,7 @@ async function dispatchTracked(
 ): Promise<ToolResult> {
   noteTransportIdentity(transportKey);
   const markTiming = beginToolTiming();
+  const callStartedAt = Date.now();
   // Recorded here rather than in `guard` because only this layer knows which server
   // answered, and "was this connector ever actually used from ChatGPT" is a per-connector
   // question the setup screen has to answer honestly.
@@ -708,6 +724,15 @@ async function dispatchTracked(
   // touch state. If the page is one tick late this stays null; only handlers that actually
   // require identity wait for their own exact mate. Ordinary absolute reads/execs never wait.
   if (!nested) setCallerConversation(context, callerConversation(name, startedAt, requestId));
+  // Plugin results are third-party content. They can inform reasoning but revoke mutation
+  // authority on the owning Director session (Prime for workers).
+  if (surface === 'plugins' && handlerRan && strictChatAllowlistEnabled() && context.caller.sessionId) {
+    const directorSessionId = await directorAuthoritySessionId(
+      context.caller.sessionId,
+      context.caller.conversationId
+    );
+    if (directorSessionId) noteUntrustedExternalContent(directorSessionId, `plugin:${name}`);
+  }
   await reconcileAgentRequestOwners().catch(error => {
     logWarn(`Worker ownership recovery deferred: ${error instanceof Error ? error.message : String(error)}`);
   });
@@ -738,7 +763,7 @@ async function dispatchTracked(
     name === 'exec' || name === 'update_plan' || (identitySensitive && swarmRunning())
   ));
   if (!context.caller.conversationId && needsExactIdentity && requestId) {
-    const wait = name === 'session_finish'
+    const wait = name === 'session_finish' || (workerStarting() && !desktopContext)
       ? SPAWN_EVIDENCE_MS
       : desktopContext && allowUnattributed
       ? UNATTRIBUTED_DESKTOP_EVIDENCE_MS
@@ -765,7 +790,7 @@ async function dispatchTracked(
   if (!context.caller.conversationId && hasDormantWorkerLeases() && requestId) {
     setCallerConversation(
       context,
-      await awaitFreshCallOrigin(name, startedAt, identityWindow(IDENTITY_EVIDENCE_MS), { requestId })
+      await awaitFreshCallOrigin(name, startedAt, identityWindow(workerStarting() ? SPAWN_EVIDENCE_MS : IDENTITY_EVIDENCE_MS), { requestId })
     );
   }
   // And the user's own block, which needs identity resolved to the same depth as everything
@@ -800,6 +825,11 @@ async function dispatchTracked(
   const supersededConversation = context.caller.conversationId
     ? (await conversationAttachment(context.caller.conversationId, context.caller.sessionId ?? null)) === 'superseded'
     : false;
+  // Named so ChatGPT can send the person on: without it, a replaced chat only learns it is dead (#1688).
+  // A lookup that fails leaves the refusal as it was; it never turns into an error of its own.
+  const replacement = supersededConversation
+    ? await replacementOf(context.caller.conversationId!, context.caller.sessionId ?? null).catch(() => null)
+    : null;
   // Preserve the pre-strict fast path exactly: when strict mode is off, Block is a synchronous
   // exact-chat lookup and ordinary calls do not acquire extra microtask yields. Interactive PTYs
   // are timing-sensitive enough that needless awaits can change which terminal frame a poll sees.
@@ -808,7 +838,9 @@ async function dispatchTracked(
   const conversationPolicyRefusal = (strictChatAllowlistEnabled()
     ? await conversationAccessRefusal(context.caller.conversationId)
     : isChatBlocked(context.caller.conversationId) ? BLOCKED_CHAT_REFUSAL : null) ??
-    workerConnectionProfileRefusal(context.caller);
+    workerConnectionProfileRefusal(context.caller) ??
+    // A turn being stopped to continue in a fresh one: nothing runs until the stop shows.
+    (rotationFenced(context.caller.conversationId) ? ROTATION_FENCE_REFUSAL : null);
   let silentFinishAuthorized = false;
   // Two things about liveness, both before the agent is resolved so that the answer this
   // call gets is the state this call itself established.
@@ -993,7 +1025,10 @@ async function dispatchTracked(
         : supersededConversation
         ? Promise.resolve(
             fail(
-              'CONVERSATION_SUPERSEDED: Compact & Resume replaced this ChatGPT conversation. Its transcript remains readable, but it can no longer execute local tools. Continue only in the replacement chat; no local tool was run.'
+              'CONVERSATION_SUPERSEDED: Compact & Resume replaced this ChatGPT conversation. Its transcript remains readable, but it can no longer execute local tools. ' +
+                (replacement
+                  ? `The work continues in https://chatgpt.com/c/${replacement.conversationId}${replacement.title.trim() ? `, shown in Chat On Steroids as ${JSON.stringify(replacement.title.trim())}` : ''}. Tell the user to continue there; no local tool was run.`
+                  : 'Continue only in the replacement chat; no local tool was run.')
             )
           )
         : silentCeilingWorker
@@ -1014,12 +1049,16 @@ async function dispatchTracked(
               'CALLER_IDENTITY_REQUIRED: a recently retired worker tab may still be open, and the connector could not prove this call belongs to a different chat. No local tool was run. For a browser chat, restore the companion connection and retry. Scheduled or headless runs may have no browser identity: the user can enable "Allow unattributed calls" in the app settings to permit self-contained calls recorded as Unattributed. Exact retired-worker restrictions still apply.'
             )
           )
+        : dormantLeaseAmbiguous && workerStarting()
+        ? Promise.resolve(failIdentity(WORKER_STARTING_REFUSAL))
         : dormantLeaseAmbiguous
         ? Promise.resolve(
             failIdentity(
               'CALLER_IDENTITY_REQUIRED: a dormant worker chat still belongs to its prime history, and the connector could not prove this call belongs to a different conversation. No local tool was run. For a browser chat, restore the companion connection and retry. Scheduled or headless runs may have no browser identity: the user can enable "Allow unattributed calls" in the app settings to permit self-contained calls recorded as Unattributed. This does not identify the caller or grant access to another chat’s workspace or processes.'
             )
           )
+        : !allowUnattributed && swarmRunning() && identitySensitive && !context.caller.conversationId && workerStarting()
+        ? Promise.resolve(failIdentity(WORKER_STARTING_REFUSAL))
         : !allowUnattributed && swarmRunning() && identitySensitive && !context.caller.conversationId
         ? Promise.resolve(
             failIdentity(
@@ -1031,6 +1070,8 @@ async function dispatchTracked(
         : invokeHandler()
   );
   markTiming('handler');
+  // Nested exec children are counted under their own names, like direct calls.
+  noteToolCall(name, toolOutcome(result), Date.now() - callStartedAt);
   if (identityRefusals.has(result)) rememberIdentityRefusal(requestId, name);
   // Identity, once, from this call's own evidence — see callerConversation. `agents` has
   // already established its own inside the call and adopted it, and re-reading here would
@@ -1092,7 +1133,10 @@ async function dispatchTracked(
   // The Plugins handler owns validation/redaction of external results. A dispatcher refusal
   // never visited that owner and therefore needs its own single redaction pass.
   const baseResult = surface === 'plugins' && !handlerRan ? pluginManager.redactResult(result) as ToolResult : result;
-  let delivered = nested ? baseResult : withUnattributedNotice(
+  // A tool that reads nothing belonging to a chat (usage) answers before the page's evidence
+  // for its request arrives; the attribution notice would only add noise to every such answer.
+  const identityFree = IDENTITY_FREE_TOOLS.has(name);
+  let delivered = nested ? baseResult : identityFree ? (deliveryFenced ? baseResult : withInbox(context.caller, context.agent, baseResult, isFinish)) : withUnattributedNotice(
     context.caller.conversationId,
     deliveryFenced ? baseResult : withInbox(context.caller, context.agent, baseResult, isFinish),
     context.caller.requestId,
@@ -1147,6 +1191,9 @@ async function dispatchTracked(
   // are measured separately because a row cannot contain the time of its own later commit.
   const durationMs = recorderStartedAt - startedAt;
   markTiming('delivery');
+  // #1662: a call recorded while its answer is still held lets a due fresh-turn continue go in
+  // while ChatGPT still sees the call running; the answer waits for it below, bounded.
+  const closeHold = !nested && context.caller.conversationId ? openCallHold(context.caller.conversationId) : null;
   const recording = recordToolCall({
     nested,
     tool: name,
@@ -1170,7 +1217,7 @@ async function dispatchTracked(
   // broken history never breaks the tool itself. Only the degraded/unidentified path remains
   // fire-and-forget because it may still spend a grace window waiting for page evidence.
   if (context.caller.conversationId) {
-    await recording;
+    try { await recording; } finally { await closeHold?.(); }
   } else {
     void recording.then(() => logInfo(`mcp recording surface=${surface} recorder_async_ms=${Date.now() - recorderStartedAt}`));
     holdWhileSettling(context, recording);
@@ -1288,7 +1335,14 @@ async function liveWorkspace(): Promise<{ workspace: { virtual: string; real: st
   if (!learned) return { workspace: null, missing: null };
   // A learned folder can be deleted while its chat sleeps. Keeping it would make every
   // relative path and every command without a workdir fail with "Not found" for that folder.
-  const exists = await fs.stat(learned.real).then((stat) => stat.isDirectory(), () => false);
+  // A folder on a server (#1469) is checked there. Only a folder that is gone is forgotten: a
+  // connection that failed keeps it, and the call that needs it says why it cannot reach it.
+  const name = learned.virtual.split('/').find(part => part.length > 0)?.toLowerCase();
+  const server = getConfig().roots.find(root => root.remote !== undefined && root.name.toLowerCase() === name);
+  const exists = server
+    ? await fsForRoot(server).getMetadata(learned.real).then(meta => meta.isDirectory,
+      (error: { code?: string }) => error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR')
+    : await fs.stat(learned.real).then((stat) => stat.isDirectory(), () => false);
   if (exists) return { workspace: learned, missing: null };
   forgetMissingWorkspace(learned.real);
   return { workspace: null, missing: learned.virtual };
@@ -1297,7 +1351,7 @@ async function liveWorkspace(): Promise<{ workspace: { virtual: string; real: st
 export async function resolveIn(
   roots: Parameters<typeof resolvePath>[0],
   requested: string,
-  options: { allowMissing?: boolean; base?: string | null; access?: 'read' } = {}
+  options: { allowMissing?: boolean; base?: string | null; access?: 'read'; remote?: boolean } = {}
 ): Promise<Resolved> {
   // The user's own Skill folders are served only to read tools, and never become a workspace.
   if (isUserSkillVirtualPath(requested)) {
@@ -1314,6 +1368,7 @@ export async function resolveIn(
   const base = options.base !== undefined ? options.base : (workspace?.virtual ?? null);
   const resolveOptions = {
     ...(options.allowMissing === undefined ? {} : { allowMissing: options.allowMissing }),
+    ...(options.remote === undefined ? {} : { remote: options.remote }),
     base
   };
   const resolved = await resolveLinkedSkillAlias(roots, requested, resolveOptions) ??
@@ -1329,6 +1384,8 @@ export interface ResolvedCwd {
   virtual: string;
   /** True when the caller named no folder, so the workspace or first root was used instead. */
   defaulted: boolean;
+  /** Set when the folder is on a server (#1469): commands then run there over ssh. */
+  remote?: RemoteFolder;
 }
 
 /**
@@ -1346,7 +1403,13 @@ export async function resolveCwd(ctx: ToolContext, virtualPath: string | undefin
   const { workspace, missing } = await liveWorkspace();
   // Codex treats an explicitly empty workdir exactly like an omitted one.
   const provided = virtualPath !== undefined && virtualPath !== '';
-  if (!provided && !workspace && swarmRunning()) {
+  // Only a chat that is part of a sub-agent run must name its folder: there the first approved one
+  // may be another agent's. Any other chat falls back as usual, even while another chat has a run
+  // (2026-10-21: with one run anywhere, every new chat outside a project had its first command
+  // refused). A call without a known chat stays as strict as before.
+  const conversationId = currentCall()?.caller.conversationId ?? null;
+  const inRun = conversationId ? currentRunId(conversationId) !== null : swarmRunning();
+  if (!provided && !workspace && inRun) {
     throw new SandboxError(
       missing
         ? `WORKSPACE_REQUIRED: the folder this chat was working in (${missing}) no longer exists. Supply an explicit approved workdir before running a command.`
@@ -1356,7 +1419,12 @@ export async function resolveCwd(ctx: ToolContext, virtualPath: string | undefin
   const fallback = firstTaskRoot(ctx.roots);
   const target = provided ? virtualPath : (workspace?.virtual ?? (fallback ? `/${fallback.name}` : ''));
   if (!target) throw new SandboxError('No folder is approved, so there is nowhere to run');
-  const resolved = await resolveIn(ctx.roots, target);
+  const resolved = await resolveIn(ctx.roots, target, { remote: true });
+  const { remote } = resolved.root;
+  if (remote) {
+    if (!(await fsForRoot(resolved.root).getMetadata(resolved.real)).isDirectory) throw new SandboxError('workdir must be a folder');
+    return { real: resolved.real, virtual: resolved.virtual, defaulted: !provided, remote };
+  }
   const stat = await fs.stat(resolved.real);
   if (!stat.isDirectory()) throw new SandboxError('workdir must be a folder');
   return { real: resolved.real, virtual: resolved.virtual, defaulted: !provided };
@@ -1547,6 +1615,18 @@ export const PRIME_EVIDENCE_MS = evidenceWindow(2_500);
  * seconds are only ever spent by a call that was going to be refused anyway.
  */
 export const IDENTITY_EVIDENCE_MS = evidenceWindow(15_000);
+
+/**
+ * A worker the app started whose chat has not reported in yet (its page proves its calls late on
+ * a busy computer). Its first calls arrive unproven; waiting `SPAWN_EVIDENCE_MS` for them, and
+ * saying to call again rather than to restore a connection, keeps a slow start from ending a
+ * worker's task (VM, 2026-10-20: proof 138 s after the first command; the model gave up after one retry).
+ */
+function workerStarting(): boolean {
+  return pendingWorkerSpawns().length > 0;
+}
+const WORKER_STARTING_REFUSAL =
+  'CALLER_IDENTITY_REQUIRED: this chat is not proven yet. A sub-agent chat that has just started reports in late on a busy computer, and until it does the app cannot tell which chat made this call. No local tool was run. Call this tool again in about 30 seconds with this same app and the same arguments; repeat a few times if needed.';
 
 /** Brief exact-proof preference before allowed Desktop calls fall back to request-scoped state. */
 export const UNATTRIBUTED_DESKTOP_EVIDENCE_MS = evidenceWindow(250);

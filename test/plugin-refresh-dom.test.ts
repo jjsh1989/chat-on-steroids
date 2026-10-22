@@ -54,6 +54,25 @@ it.each([118, 257])('accepts %s declarations for the Plugins connector including
   const view = await api.pluginRefreshView('Chat On Steroids Plugins');
   expect(view?.tools).toHaveLength(count);
 });
+it('reads the Windows Desktop connector with all of its tools (#1763)', async () => {
+  // Windows Desktop with every permission declared 24 tools in 2.1.44; the card was refused at 16,
+  // so its automatic refresh could never be confirmed.
+  const { api, props } = page();
+  props.connector.name = 'Chat On Steroids Desktop';
+  props.actions = Array.from({ length: 24 }, (_, i) => ({ name: `desktop_tool_${i}`, description: `Desktop tool ${i}`, description_model: null,
+    params: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }));
+  expect((await api.pluginRefreshView('Chat On Steroids Desktop'))?.tools).toHaveLength(24);
+});
+it("keeps the own connectors' limit above every tool they declare, in both readers", async () => {
+  const { SURFACES } = await import('../src/main/mcp/surfaces.js');
+  const { OWN_CONNECTOR_MAX_TOOLS } = await import('../src/main/plugin-refresh.js');
+  const limits = [...`${source}\n${fiber}`.matchAll(/externalPlugins \? 257 : (\d+)/g)].map(match => Number(match[1]));
+  expect(limits).toHaveLength(3);
+  // The page readers and the app agree on the bound.
+  expect(new Set([...limits, OWN_CONNECTOR_MAX_TOOLS]).size).toBe(1);
+  // The code-mode tool comes on top of a surface's declared tools.
+  expect(Math.max(SURFACES.core.tools.length, SURFACES.desktop.tools.length) + 1).toBeLessThanOrEqual(limits[0]!);
+});
 it('reads a Plugins catalog that fits the publication budget even with long schemas', async () => {
   // Measured 2026-10-01: Unity's 82 tools are ~116 KB of JSON, well within the 250,000-byte
   // publication budget, but the page reader's worst-case accounting (3 per character) came to
@@ -67,7 +86,7 @@ it('reads a Plugins catalog that fits the publication budget even with long sche
   const view = await api.pluginRefreshView('Chat On Steroids Plugins');
   expect(view?.tools).toHaveLength(82);
 });
-it.each([['Chat On Steroids Plugins', 258], ['Chat On Steroids Core', 17]] as const)('retains the %s observation count guard', async (connector, count) => {
+it.each([['Chat On Steroids Plugins', 258], ['Chat On Steroids Core', 65]] as const)('retains the %s observation count guard', async (connector, count) => {
   const { api, props } = page();
   props.connector.name = connector;
   props.actions = Array.from({ length: count }, (_, i) => ({ name: `tool_${i}`, description: `Tool ${i}`, description_model: null,
@@ -195,8 +214,8 @@ it('reports the page connector tunnel and a settled empty Plugins list', async (
 });
 it.each([
   ['Chat On Steroids Plugins (Windows)', 257, true],
-  ['Chat On Steroids Core (Windows)', 17, false],
-  ['Chat On Steroids Plugins Backup', 17, false]
+  ['Chat On Steroids Core (Windows)', 65, false],
+  ['Chat On Steroids Plugins Backup', 65, false]
 ] as const)('applies the Plugins connector\'s limits to %s by its kind, whatever the computer', async (connector, count, accepted) => {
   // One ChatGPT account on two computers: this computer's Plugins connector carries its suffix
   // and still holds every enabled external plugin's tools.
@@ -325,6 +344,60 @@ it.each(['duplicate-id', 'multiple-core-ids'])('preserves ambiguity among proven
   }
   main.append(other);
   expect(api.pluginInstalledButtons('Chat On Steroids Core')).toEqual([link, other]); // The workflow must refuse length !== 1.
+});
+it.each(['Chat On Steroids Core', 'User renamed it 日本語'])('selects only the enrolled native App Id among two proven Core identities (%s)', name => {
+  const { api, main, link } = renamedNativeList();
+  link.querySelector('span')!.textContent = name;
+  main.insertAdjacentHTML('beforeend', '<a href="/settings/plugins-settings/plugin_asdk_app_other"><span>Other proven Core</span></a>');
+  api.setConnectorApps({ core: [{ appId: 'asdk_app_synthetic', name: 'Chat On Steroids Core' },
+    { appId: 'asdk_app_other', name: 'Other proven Core' }], desktop: [], plugins: [] });
+  expect(api.pluginInstalledButtons('Chat On Steroids Core')).toHaveLength(2);
+  expect(api.pluginInstalledButtons('Chat On Steroids Core', 'asdk_app_synthetic')).toEqual([link]);
+});
+it.each(['core', 'plugins'])('uses the exact proven %s surface when renamed installed connectors share a name', surface => {
+  const { api, main, link } = renamedNativeList();
+  link.textContent = 'Same renamed connector';
+  main.insertAdjacentHTML('beforeend', '<a href="/settings/plugins-settings/plugin_asdk_app_external"><span>Same renamed connector</span></a>');
+  const external = main.querySelectorAll('a')[1];
+  api.setConnectorApps({ core: [{ appId: 'asdk_app_synthetic', name: 'Same renamed connector' }], desktop: [],
+    plugins: [{ appId: 'asdk_app_external', name: 'Same renamed connector' }] });
+  const appId = surface === 'core' ? 'asdk_app_synthetic' : 'asdk_app_external';
+  expect(api.pluginInstalledButtons('Same renamed connector')).toBeNull();
+  expect(api.pluginInstalledButtons('Same renamed connector', appId, surface)).toEqual([surface === 'core' ? link : external]);
+  expect(api.pluginInstalledButtons('Same renamed connector', appId, surface === 'core' ? 'plugins' : 'core')).toBeNull();
+  expect(api.pluginInstalledButtons('Same renamed connector', 'asdk_app_foreign', surface)).toBeNull();
+});
+it('preserves first enrollment while refusing an exact bound row with a mismatched surface', () => {
+  const { api, link } = renamedNativeList();
+  api.setConnectorApps({ core: [], desktop: [], plugins: [] });
+  expect(api.pluginInstalledButtons('Chat On Steroids Core', 'asdk_app_synthetic', 'core')).toEqual([link]);
+  expect(api.pluginInstalledButtons('Chat On Steroids Core', 'asdk_app_synthetic', 'plugins')).toBeNull();
+});
+it('refuses an exact ID proven on multiple surfaces even when the requested surface matches one', () => {
+  const { api } = renamedNativeList();
+  api.setConnectorApps({ core: [{ appId: 'asdk_app_synthetic', name: 'Shared name' }], desktop: [],
+    plugins: [{ appId: 'asdk_app_synthetic', name: 'Shared name' }] });
+  expect(api.pluginInstalledButtons('Shared name', 'asdk_app_synthetic', 'core')).toBeNull();
+  expect(api.pluginInstalledButtons('Shared name', 'asdk_app_synthetic', 'plugins')).toBeNull();
+});
+it.each(['absent', 'foreign-name', 'button', 'hidden', 'wrong-surface', 'invalid-id'])('never substitutes a name or another proven ID for an enrolled native target (%s)', mode => {
+  const { api, main, link } = renamedNativeList();
+  api.setConnectorApps({ core: [{ appId: 'asdk_app_synthetic', name: 'Chat On Steroids Core' },
+    { appId: 'asdk_app_other', name: 'Other proven Core' }], desktop: [{ appId: 'asdk_app_desktop', name: 'Chat On Steroids Desktop' }], plugins: [] });
+  main.insertAdjacentHTML('beforeend', '<a href="/settings/plugins-settings/plugin_asdk_app_other"><span>Chat On Steroids Core</span></a>');
+  let expected = 'asdk_app_synthetic';
+  if (mode === 'absent') link.remove();
+  if (mode === 'foreign-name') { link.href = '/settings/plugins-settings/plugin_asdk_app_foreign'; link.textContent = 'Chat On Steroids Core'; }
+  if (mode === 'button') link.outerHTML = '<button><span>Chat On Steroids Core</span></button>';
+  if (mode === 'hidden') link.hidden = true;
+  if (mode === 'wrong-surface') expected = 'asdk_app_desktop';
+  if (mode === 'invalid-id') expected = 'not-an-app';
+  expect(api.pluginInstalledButtons('Chat On Steroids Core', expected)).toBeNull();
+});
+it('retains duplicate native link ambiguity even for the enrolled App Id', () => {
+  const { api, main, link } = renamedNativeList();
+  main.append(link.cloneNode(true));
+  expect(api.pluginInstalledButtons('Chat On Steroids Core', 'asdk_app_synthetic')).toHaveLength(2);
 });
 it('does not use unproven IDs or an unknown request name to discover a renamed native app', () => {
   const { api, link } = renamedNativeList();

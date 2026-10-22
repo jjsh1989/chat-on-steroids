@@ -3,8 +3,8 @@ import type { MainText } from '../shared/main-texts.js';
 
 /**
  * The tray menu, Session finish notice, tunnel-loss notices and CoS browser tray notice in the
- * selected language. The main process has no catalogs, so this document translates the exact
- * source texts and hands them over.
+ * selected language, including native update restart confirmation. The main process has no
+ * catalogs, so this document translates the exact source texts and hands them over.
  * Literal `t()` calls keep the catalog audit able to see each key.
  */
 export function mainTexts(): Record<MainText, string> {
@@ -15,8 +15,15 @@ export function mainTexts(): Record<MainText, string> {
     'Connect': t('Connect'),
     'Disconnect': t('Disconnect'),
     'Quit': t('Quit'),
+    'Updating Chat On Steroids': t('Updating Chat On Steroids'),
+    'Saving your work…': t('Saving your work…'),
+    'Waiting for your permission in Windows…': t('Waiting for your permission in Windows…'),
+    'Starting the installer. Chat On Steroids opens again by itself.':
+      t('Starting the installer. Chat On Steroids opens again by itself.'),
     'Connected': t('Connected'),
     'No internet': t('No internet'),
+    'OpenAI outage': t('OpenAI outage'),
+    'Diagnostics report': t('Diagnostics report'),
     'Not connected': t('Not connected'),
     'Core connection lost': t('Core connection lost'),
     'Desktop connection lost': t('Desktop connection lost'),
@@ -31,7 +38,40 @@ export function mainTexts(): Record<MainText, string> {
     'Your chats keep going. Choose Show browser in the tray icon’s menu to bring it back.':
       t('Your chats keep going. Choose Show browser in the tray icon’s menu to bring it back.'),
     'Your chats keep going. Choose Show browser in the menu bar icon’s menu to bring it back.':
-      t('Your chats keep going. Choose Show browser in the menu bar icon’s menu to bring it back.')
+      t('Your chats keep going. Choose Show browser in the menu bar icon’s menu to bring it back.'),
+    'Export as Markdown': t('Export as Markdown'),
+    'Export usage as CSV': t('Export usage as CSV'),
+    'Import CoS Pet folder': t('Import CoS Pet folder'),
+    'Import SKILL.md': t('Import SKILL.md'),
+    'Markdown files': t('Markdown files'),
+    'Text files': t('Text files'),
+    'CSV files': t('CSV files'),
+    'Save code': t('Save code'),
+    'Approve a folder for ChatGPT': t('Approve a folder for ChatGPT'),
+    'Import Skill folder': t('Import Skill folder'),
+    'Markdown skills': t('Markdown skills'),
+    'Choose a project folder for ChatGPT': t('Choose a project folder for ChatGPT'),
+    'Select the tunnel executable': t('Select the tunnel executable'),
+    'Programs': t('Programs'),
+    'Attach files': t('Attach files'),
+    'Import MCP bundle': t('Import MCP bundle'),
+    'MCP bundles': t('MCP bundles'),
+    'Remove worker Git checkout?': t('Remove worker Git checkout?'),
+    'Review the worker checkout before removing it': t('Review the worker checkout before removing it'),
+    'Checkout: {0}': t('Checkout: {0}'),
+    'Uncommitted or ignored paths that would be discarded ({0}):': t('Uncommitted or ignored paths that would be discarded ({0}):'),
+    'No uncommitted or ignored paths were detected.': t('No uncommitted or ignored paths were detected.'),
+    'Additional paths are not shown; review the checkout before confirming.': t('Additional paths are not shown; review the checkout before confirming.'),
+    'Ignored files are included in the removal.': t('Ignored files are included in the removal.'),
+    'Commits made only on this branch will remain in Git.': t('Commits made only on this branch will remain in Git.'),
+    'This removes the entire checkout folder, including tracked working files, ignored files and uncommitted changes.': t('This removes the entire checkout folder, including tracked working files, ignored files and uncommitted changes.'),
+    'The Git branch and its commits are kept. Uncommitted files cannot be recovered from Git.': t('The Git branch and its commits are kept. Uncommitted files cannot be recovered from Git.'),
+    'Keep checkout': t('Keep checkout'),
+    'Remove checkout; preserve Git branch': t('Remove checkout; preserve Git branch'),
+    'ChatGPT finished.': t('ChatGPT finished.'),
+    'Goal result needs review': t('Goal result needs review'),
+    'The Goal helper thinks the work is complete, but this has not been checked. Review the chat or send another instruction.':
+      t('The Goal helper thinks the work is complete, but this has not been checked. Review the chat or send another instruction.'),
   };
 }
 

@@ -25,6 +25,9 @@ import nodePath from 'node:path';
 import { z } from 'zod';
 import { DEFAULT_READ_BYTES, MAX_READ_BYTES, formatBytes } from '../fsops.js';
 import { BinaryReadError, listDirectoryLevel, readTextFile, statInfo, walkFiles } from '../codex/read-backend.js';
+import { fsForRoot, localFs, type ProjectFs } from '../remote/project-fs.js';
+import { remoteCommand, sshArgs, sshProgram } from '../remote/ssh.js';
+import os from 'node:os';
 import {
   VIEW_IMAGE_DESCRIPTION,
   VIEW_IMAGE_PATH_DESCRIPTION,
@@ -33,9 +36,9 @@ import {
 } from '../codex/view-image.js';
 import { logInfo, logWarn } from '../logger.js';
 import { SandboxError, isAbsoluteVirtualPath, isNativeWindowsPath, resolvePath, strayVirtualPath } from '../sandbox.js';
-import { currentWorkspace, primeWorkspace, setWorkspaceFor } from '../workspace.js';
+import { currentWorkspace, primeWorkspace } from '../workspace.js';
 import { getSessionProject } from '../projects.js';
-import { allocWorkerWorkspace, validateWorkerWorkspaceLease, WorkerWorktreeError, type WorkerWorktreeLease } from '../worktrees/index.js';
+import { acceptAgentMutation, measureSleepingWorkers, spawnAgentWorkers } from '../agent-admission.js';
 import type { Capabilities, Root } from '../../shared/types.js';
 import { commandHasSameArguments, evaluateCommandAllowlist } from '../../shared/command-allowlist.js';
 import type { FileChange } from '../../shared/session.js';
@@ -51,7 +54,7 @@ import {
   type Hunk,
   type PatchPathResolver
 } from '../codex/apply-patch/index.js';
-import { DEFAULT_APPLY_PATCH_FILE_UPDATE_MODE } from '../codex/apply-patch/mode.js';
+import { approvalCardWaiting } from '../approval-wait.js';
 import { maybeParseApplyPatchForExec } from '../codex/apply-patch/invocation.js';
 import { composeCommandBatch, parseCommandBatchSections } from '../codex/command-batch.js';
 import { formatExecOutputForModel, newStreamOutput } from '../codex/exec-output.js';
@@ -110,13 +113,11 @@ import {
 } from '../exec-hints.js';
 import { childEnv } from '../exec.js';
 import { locateRipgrep } from '../ripgrep.js';
-import { ensureDevToolchain, isGitRepository } from '../toolchain.js';
+import { ensureDevToolchain } from '../toolchain.js';
 import {
   agentForCaller,
   agentFamiliesForCaller,
   reconcileAgentRequestOwners,
-  noteAgentContextTokens,
-  persistCriticalSwarmNow,
   PRIME_ID,
   requestWorkerBootstraps,
   requestWorkerRevivals,
@@ -124,12 +125,9 @@ import {
   stageFinishAgent,
   stageMessages,
   stagePrimeMessage,
-  stageSpawn,
-  markStagedWorkerWorktree,
   managedWorkerIsolationRequired,
   managedWorkerAllocationIdentity,
   swarmRunning,
-  swarmStateForCaller,
   type Caller
 } from '../agents.js';
 import { repairPrimeFromResumeShadow } from '../session/continuation.js';
@@ -250,6 +248,12 @@ function execPrincipal(): string | null {
   const caller = currentCaller();
   return executionPrincipal(caller.requestId, caller.sessionId ?? null);
 }
+
+/**
+ * How a command for a server folder is read here: as POSIX shell text, which is what the server
+ * account's login shell receives (`remoteCommand`). It shapes the allowlist check and batches.
+ */
+const SERVER_SHELL = { shellType: 'sh', shellPath: 'sh' } as const;
 
 export function registerCoreTools(reg: SurfaceRegistrar): void {
   const { ctx, caps, exposedCaps } = reg;
@@ -457,9 +461,9 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               'TOOL_DISABLED: view_image is disabled by the current Chat On Steroids permissions. Ask the user to enable reading in the app.'
             );
           }
-          const resolved = await resolveIn(ctx.roots, path, { access: 'read' });
+          const resolved = await resolveIn(ctx.roots, path, { access: 'read', remote: true });
           try {
-            const image = await viewImage(resolved.real, null, undefined, resolved.virtual);
+            const image = await viewImage(resolved.real, null, undefined, resolved.virtual, undefined, fsForRoot(resolved.root));
             logInfo(`tool view_image ${resolved.virtual} (${formatBytes(image.bytes)})`);
             return {
               content: [{ type: 'image' as const, data: image.base64, mimeType: image.mimeType }]
@@ -597,11 +601,20 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
         reg.guarded('search', 'find', async () => {
           const limit = Math.min(500, Math.max(1, Math.floor(max_results ?? 50)));
           const deadline = Date.now() + 10_000;
-          const scopes: Array<{ real: string; virtual: string }> = [];
+          const scopes: Array<{ real: string; virtual: string; server?: ProjectFs }> = [];
+          /** Server folders a search over every folder could not reach; the rest is still searched. */
+          const unreachable: string[] = [];
           if (p) {
-            const resolved = await resolveIn(ctx.roots, p, { access: 'read' });
-            const stat = await fs.stat(resolved.real);
-            if (stat.isFile()) {
+            const resolved = await resolveIn(ctx.roots, p, { access: 'read', remote: true });
+            const server = resolved.root.remote ? fsForRoot(resolved.root) : undefined;
+            let isFile: boolean, isDirectory: boolean;
+            if (server) ({ isFile, isDirectory } = await server.getMetadata(resolved.real));
+            else {
+              const stat = await fs.stat(resolved.real);
+              isFile = stat.isFile();
+              isDirectory = stat.isDirectory();
+            }
+            if (isFile) {
               const outcome = await searchOneFile(resolved.real, resolved.virtual, {
                 query,
                 mode: mode ?? 'name',
@@ -609,7 +622,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
                 caseSensitive: case_sensitive === true,
                 regex: regex === true,
                 maxResults: limit,
-                deadline
+                deadline,
+                ...(server ? { server } : {})
               });
               const hits = outcome.hits.map((hit) =>
                 hit.line === undefined ? hit.path : `${hit.path}:${hit.line}: ${hit.text}`
@@ -623,10 +637,19 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               }
               return ok(hits.length === 0 ? 'No matches' : `${hits.length} matches\n${hits.join('\n')}`);
             }
-            if (!stat.isDirectory()) return fail(`${resolved.virtual} is not a regular file or folder`);
-            scopes.push({ real: resolved.real, virtual: resolved.virtual });
+            if (!isDirectory) return fail(`${resolved.virtual} is not a regular file or folder`);
+            scopes.push({ real: resolved.real, virtual: resolved.virtual, ...(server ? { server } : {}) });
           } else {
             for (const root of ctx.roots) {
+              if (root.remote) {
+                try {
+                  const resolved = await resolvePath(ctx.roots, `/${root.name}`, { remote: true });
+                  scopes.push({ real: resolved.real, virtual: resolved.virtual, server: fsForRoot(root) });
+                } catch (error) {
+                  unreachable.push(`/${root.name} (${friendlyError(error)})`);
+                }
+                continue;
+              }
               const resolved = await resolvePath(ctx.roots, `/${root.name}`);
               scopes.push({ real: resolved.real, virtual: resolved.virtual });
             }
@@ -643,7 +666,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               break;
             }
             if (hits.length >= limit) break;
-            const outcome = await search({
+            const request = {
               realDir: scope.real,
               virtualDir: scope.virtual,
               query,
@@ -653,8 +676,18 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               caseSensitive: case_sensitive === true,
               regex: regex === true,
               maxResults: limit - hits.length,
-              deadline
-            });
+              deadline,
+              ...(scope.server ? { server: scope.server } : {})
+            };
+            let outcome;
+            try {
+              outcome = await search(request);
+            } catch (error) {
+              // A server that drops away mid-search costs its own folder, not the whole answer.
+              if (!scope.server || p) throw error;
+              unreachable.push(`${scope.virtual} (${friendlyError(error)})`);
+              continue;
+            }
             scanned += outcome.filesScanned;
             elapsedMs += outcome.elapsedMs;
             if (outcome.stoppedBecause) stopReasons.add(outcome.stoppedBecause);
@@ -665,7 +698,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           noteCount(hits.length);
           const reason = stopReasons.size > 0 ? `\ntruncated: ${[...stopReasons].join(',')}` : '';
           const contentLimit = (mode ?? 'name') === 'content' ? `\ncontent_file_limit: ${formatBytes(MAX_CONTENT_FILE_BYTES)}` : '';
-          const meta = `\n\nfiles_scanned: ${scanned}\nelapsed_ms: ${elapsedMs}\nresults_returned: ${hits.length}${contentLimit}${reason}`;
+          const skipped = unreachable.length > 0 ? `\nnot_searched: ${unreachable.join('; ')}` : '';
+          const meta = `\n\nfiles_scanned: ${scanned}\nelapsed_ms: ${elapsedMs}\nresults_returned: ${hits.length}${contentLimit}${reason}${skipped}`;
           if (hits.length === 0) return ok(`No matches${meta}`);
           return ok(`${hits.length} matches\n${hits.join('\n')}${meta}`);
         })
@@ -725,7 +759,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           if (baseVirtual === null) {
             return fail('No folder is approved, so there is nowhere to apply the patch.');
           }
-          const base = await resolveIn(ctx.roots, baseVirtual);
+          const base = await resolveIn(ctx.roots, baseVirtual, { remote: true });
           await validatedWorkspace();
           return (await runParsedPatch(args, ctx.roots, base, caps)).result;
         })
@@ -777,7 +811,10 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               );
             }
           }
-          const shell = input.shell === undefined ? defaultUserShell() : getShellByModelProvidedPath(input.shell, dir.real);
+          const server = dir.remote;
+          const shell = server
+            ? SERVER_SHELL
+            : input.shell === undefined ? defaultUserShell() : getShellByModelProvidedPath(input.shell, dir.real);
           if (!shell) {
             return fail(
               `SHELL_NOT_FOUND: the explicitly requested shell ${JSON.stringify(input.shell)} could not be resolved. ` +
@@ -821,8 +858,17 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           // line PowerShell can actually parse, and a line it cannot repair is left exactly
           // as written for the shell to refuse and the hint to explain.
           const commandNotes: string[] = [];
+          if (server && input.shell !== undefined) {
+            commandNotes.push('shell was ignored: in a server folder commands run in the server account\'s login shell.');
+          }
           const normalizedCommands: string[] = [];
           const boundCommands = rawCommands.map((rawCommand, index) => {
+            // These repairs answer this computer's shells and its bundled ripgrep. A server's
+            // login shell gets the command exactly as written.
+            if (server) {
+              normalizedCommands.push(rawCommand);
+              return rawCommand;
+            }
             const repaired = repairPowerShellQuoting(rawCommand, shell.shellType);
             const normalized = normalizeShellCommand(repaired.cmd, shell.shellType, (relativeDirectory = '.') =>
               nodeFs.readdirSync(nodePath.resolve(dir.real, relativeDirectory))
@@ -933,9 +979,13 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             // id cannot briefly authorize its previous chat before this call publishes the new owner.
             forgetExecOwner(processId);
 
-            const ripgrep = locateRipgrep();
-            const executionCommand = deriveExecArgs(shell,
-              withPosixPathPrefix(boundCommand, shell.shellType, ripgrep ? nodePath.dirname(ripgrep) : null), useLoginShell);
+            const ripgrep = server ? null : locateRipgrep();
+            // A server command is one ssh connection of its own; the folder and login shell are
+            // set up on the server by `remoteCommand`, so the local side only needs somewhere to run.
+            const executionCommand = server
+              ? [sshProgram(), ...sshArgs(server, [(input.tty ?? DEFAULT_TTY) ? '-tt' : '-T'], [remoteCommand(dir.real, boundCommand)])]
+              : deriveExecArgs(shell,
+                withPosixPathPrefix(boundCommand, shell.shellType, ripgrep ? nodePath.dirname(ripgrep) : null), useLoginShell);
             await validatedWorkspace();
             const output = await unifiedExecManager.execCommand({
               classifyExit: (exitCode, rawOutput) => {
@@ -953,7 +1003,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               yieldTimeMs: input.yield_time_ms ?? DEFAULT_EXEC_YIELD_TIME_MS,
               maxOutputTokens: undefined,
               truncationPolicy: EXEC_OUTPUT_CEILING_POLICY,
-              cwd: dir.real,
+              cwd: server ? os.tmpdir() : dir.real,
               displayCwd: dir.virtual,
               env: execChildEnvironment(),
               tty: input.tty ?? DEFAULT_TTY
@@ -1162,6 +1212,22 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
   }
 
 
+  // ----------------------------------------------------------------- usage
+
+  // #482: read-only, so the person can ask for their usage from the chat. Each figure names its
+  // source and age; Codex and Claude Code are read only while Settings › Usage allows it. Like
+  // `read`, offered only while a reading permission is on.
+  if (exposedCaps.read || exposedCaps.browse || exposedCaps.metadata) reg.register('usage', toolDeclaration('usage', () => ({
+    title: 'Usage and limits',
+    description: 'Only when the user asks about their usage, limits or quota. Read-only: ChatGPT\'s and Codex\'s reported limits, and tokens counted from Codex\'s and Claude Code\'s local logs, each with source and age. Report missing figures as not reported; never estimate.',
+    inputSchema: z.object({}),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  })), async () => guard('usage', async () => {
+    const report = usageReport(reportedUsageLimits(), await readProviderUsage(), Date.now());
+    return { content: [{ type: 'text', text: report.text }], structuredContent: report.structured };
+  }));
+
+
   // ----------------------------------------------------------------- agents
 
   if (reg.agentToolsExposed) registerAgentsTool(reg);
@@ -1185,89 +1251,15 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
  * act on and is kept to a sentence or two; ids, states and counts are machine state and belong
  * in a shape the caller can read without parsing English.
  */
-/**
- * Re-measures how full each sleeping worker's chat is, before the prime may wake one.
- *
- * The context ceiling is what makes a stop final, and it is measured from the app's own
- * durable session for that conversation rather than from anything a model reported. The
- * broker keeps the figure in memory and in its snapshot, but a chat that grew while this app
- * was not running — or one whose snapshot predates the measurement entirely — would otherwise
- * be woken into a conversation with no room left in it. Reading it here, on the one call that
- * can wake a worker, is what makes the ceiling survive a crash rather than a restart quietly
- * handing back a worker the prime was already told was finished.
- */
-async function measureSleepingWorkers(caller: Caller): Promise<void> {
-  const state = swarmStateForCaller(caller);
-  if (state.agents.length === 0) return;
-  for (const info of state.agents) {
-    if (info.role !== 'worker' || info.state !== 'sleeping' || !info.conversationId) continue;
-    const summary = await findSessionByConversation(info.conversationId, { requireUnique: true }).catch(() => null);
-    if (summary) noteAgentContextTokens(info.conversationId, summary.contextTokens);
-  }
-  // Measurement is usually telemetry, but crossing the worker ceiling revokes durable revival
-  // authority and can terminalize a parked worker. `status` also calls this helper, so there is
-  // no later message/spawn acceptance barrier we can rely on: make every critical revision seen
-  // through the end of measurement durable before publishing the resulting state to the model.
-  try {
-    if (!(await persistCriticalSwarmNow())) {
-      throw new Error('the broker has no immediate durable persistence sink');
-    }
-  } catch (error) {
-    throw new Error(
-      `Worker context/revival state could not cross its durable barrier. Retry the agents call. (${error instanceof Error ? error.message : String(error)})`
-    );
-  }
-}
-
-/** Publish a staged broker mutation only after its exact revision is durable. */
-async function acceptAgentMutation(
-  staged: { commit(): void | boolean; rollback(): void },
-  failure: string,
-  commitFailure: string = failure,
-  admission?: { validate(): Promise<void>; assertCurrent(): void }
-): Promise<void> {
-  try {
-    let durable: boolean;
-    try {
-      durable = await persistCriticalSwarmNow();
-    } catch (error) {
-      throw new Error(`${failure} (${error instanceof Error ? error.message : String(error)})`);
-    }
-    if (!durable) throw new Error(failure);
-    // The durable write itself awaits filesystem IO. Recheck live ownership after it,
-    // then check the current policy synchronously beside the broker's commit.
-    if (admission) {
-      await admission.validate();
-      admission.assertCurrent();
-    }
-    if (staged.commit() === false) throw new Error(commitFailure);
-  } catch (error) {
-    staged.rollback();
-    if (admission) {
-      // A rejected admission can happen after the persistence sink successfully wrote
-      // the staged topology. Publish the compensating rollback before returning the
-      // rejection, otherwise an immediate restart could restore unaccepted workers.
-      try {
-        if (!(await persistCriticalSwarmNow())) {
-          throw new Error('the broker has no immediate durable persistence sink');
-        }
-      } catch (rollbackError) {
-        throw new Error(`Worker admission rollback could not be made durable (${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)})`);
-      }
-    }
-    throw error;
-  }
-}
-
 function registerAgentsTool(reg: SurfaceRegistrar): void {
   reg.register(
     'agents',
     toolDeclaration('agents', () => ({
       title: 'Multi-agent run',
       description:
-        'Run ChatGPT workers. Omit model and reasoning_effort unless the user explicitly requests an override; saved app defaults apply. Do not ask the user to choose them. Reuse a suitable sleeping worker with message before spawn. ' +
-        'message: prime↔worker. Reports ride tool results, never restart primes. Use status once to collect pending reports before finalizing; otherwise state that review is pending. Never poll repeatedly. ' +
-        'status: your active, sleeping/revivable and terminal workers, including parked families. finish: record the report, then normally sleep.',
+        'Runs ChatGPT workers. Without model/reasoning_effort, saved app defaults apply; they are set only for a user’s explicit request. A suitable sleeping worker is reused with message, not respawned. ' +
+        'message: prime↔worker. Reports arrive with tool results, not by restarting an idle prime. ' +
+        'status: your active, sleeping/revivable and terminal workers, incl. parked families, and pending reports; one call before a final answer collects them. Repeated polling adds nothing. finish: records the report, then normally sleeps.',
       inputSchema: z.object({
         action: z.enum(['spawn', 'message', 'status', 'finish']).describe('What to do.'),
         run_id: z.string().uuid().optional().describe('Select your returned worker family when status lists several; never grants another caller’s workers.'),
@@ -1294,13 +1286,13 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
                 .max(80)
                 .optional()
                 .describe(
-                  'Omit unless explicitly requested by the user; app settings supply defaults. Use an exact account-observed model id or provider alias. Invalid overrides return observed ids before opening; the browser confirms availability before Send.'
+                  'Only for a model the user asked for; app settings supply the default. An exact account-observed model id or provider alias. Invalid overrides return observed ids before opening; the browser checks availability before Send.'
                 ),
               reasoning_effort: z
                 .enum(REASONING_EFFORTS)
                 .optional()
                 .describe(
-                  'Omit unless explicitly requested by the user; app settings supply defaults. Do not ask just to spawn a worker. This selects reasoning only, never a model.'
+                  'Only for an effort the user asked for; app settings supply the default. Selects reasoning only, never a model.'
                 )
             }).strict()
           )
@@ -1308,7 +1300,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           .max(8)
           .optional()
           .describe(
-            'spawn: fresh workers to create only after checking status for a suitable sleeping worker; revive one explicitly with message.'
+            'spawn: fresh workers; status lists sleeping workers that message can revive instead.'
           ),
         messages: z
           .array(
@@ -1322,7 +1314,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           .max(16)
           .optional()
           .describe(
-            'message: atomic batch; prefer this to one call per recipient.'
+            'message: atomic batch for several recipients in one call.'
           ),
         to: z
           .string()
@@ -1387,115 +1379,15 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           if (await managedWorkerIsolationRequired(spawnCaller) && !managedWorkerAllocationIdentity(spawnCaller)) {
             return fail('WORKTREE_OWNER_UNAVAILABLE: a retired worker cannot create a prime run after its isolated checkout owner was lost.');
           }
-          const staged = stageSpawn({
+          const { created, becamePrime, runId, defaultNotes, isolationNotes } = await spawnAgentWorkers({
             workers: input.workers,
             context: input.context ?? null,
             caller: spawnCaller
-          });
-          // Newly staged admissions alone may own Git branches. A repeated spawn may show
-          // existing workers in `created`, but must never reallocate their checkouts.
-          const allocated: WorkerWorktreeLease[] = [];
-          const admittedLeases: WorkerWorktreeLease[] = [];
-          const isolationNotes: string[] = [];
-          let sourceDirty = false;
-          let allocationAttempted = false;
-          try {
-            if (staged.newlyStaged && getConfig().multiAgent.autoWorktrees === true) {
-              // A selected Local Project is durable even before this prime has made its first
-              // file call. Fetch that binding explicitly instead of relying on the cwd cache.
-              const sessionId = currentCall()?.caller.sessionId;
-              const source = (sessionId ? await getSessionProject(sessionId) : null) ??
-                primeWorkspace(currentCaller().conversationId) ?? currentWorkspace();
-              // Unfiled chats without any selected/learned folder can still delegate ordinary
-              // work. Once a source exists, a Git checkout must pass strict isolation checks.
-              if (!source) {
-                isolationNotes.push('No workspace is selected; workers were spawned without isolated Git worktrees.');
-              } else if (isGitRepository(source.real)) {
-                if (reg.ctx.readOnly || !reg.caps.command || !reg.caps.create || !reg.caps.edit) {
-                  throw new Error('WORKTREE_PERMISSION_REQUIRED: worker isolation requires Command, Create and Edit, with Read-only disabled.');
-                }
-                for (const agentId of staged.newlyStagedWorkerIds) {
-                  allocationAttempted = true;
-                  const lease = await allocWorkerWorkspace({
-                    runId: staged.runId,
-                    agentId,
-                    primeWorkspace: source,
-                    approvedRoots: getConfig().roots
-                  });
-                  if (lease.newlyCreated) allocated.push(lease);
-                  // Allocation awaited Git with the then-current approved roots. Revocation,
-                  // rename or replacement during that wait must prevent worker admission.
-                  await validateWorkerWorkspaceLease(lease, getConfig().roots);
-                  admittedLeases.push(lease);
-                  sourceDirty ||= lease.sourceDirty;
-                  markStagedWorkerWorktree(staged.runId, agentId);
-                }
-                if (getConfig().multiAgent.autoWorktrees !== true) {
-                  throw new Error('WORKTREE_POLICY_CHANGED: automatic worker isolation was disabled during the spawn.');
-                }
-                isolationNotes.push(`${staged.newlyStagedWorkerIds.length} newly staged worker(s) received isolated Git worktrees.`);
-                if (sourceDirty) {
-                  isolationNotes.push('Warning: the source checkout has uncommitted changes. Workers start from the committed Git base revision, so those uncommitted changes were not copied into their worktrees.');
-                }
-              } else {
-                isolationNotes.push('The selected workspace is not a Git repository; no worktrees were allocated.');
-              }
-            }
-            staged.prepareDurability();
-            await acceptAgentMutation(staged,
-              'The worker run could not cross its durable acceptance barrier. The spawn was rolled back; retry this same request.',
-              undefined,
-              admittedLeases.length ? {
-                validate: async () => {
-                  for (const lease of admittedLeases) {
-                    await validateWorkerWorkspaceLease(lease, getConfig().roots);
-                  }
-                },
-                assertCurrent: () => {
-                  const liveConfig = getConfig();
-                  if (liveConfig.multiAgent.autoWorktrees !== true) {
-                    throw new Error('WORKTREE_POLICY_CHANGED: automatic worker isolation was disabled during the spawn.');
-                  }
-                  for (const lease of admittedLeases) {
-                    if (!liveConfig.roots.some(root => root.name === lease.approvedRoot.name &&
-                      nodePath.resolve(root.path) === nodePath.resolve(lease.approvedRoot.path))) {
-                      throw new WorkerWorktreeError('WORKTREE_ROOT_CHANGED', 'the owning approved root was revoked during worker admission');
-                    }
-                  }
-                }
-              } : undefined);
-          } catch (error) {
-            staged.rollback();
-            // An unaccepted spawn never opened a worker chat, but user files can appear in a
-            // checkout between a Git status check and `git worktree remove`. Even non-force
-            // removal may erase ignored files. Retain these newly created leases on failure;
-            // they are not broker-admitted and can be inspected/disposed of explicitly later.
-            // In particular, a retry must not take another user's branch or remove its files.
-            if (allocated.length) {
-              const retained = allocated.map(lease => lease.worktreePath).join(', ');
-              logWarn(`multi-agent: spawn failed (${error instanceof Error ? error.message : String(error)}); ${allocated.length} unaccepted managed worktree(s) retained for safe inspection: ${retained}`);
-              throw new Error(`WORKTREE_ROLLBACK_RETAINED: ${allocated.length} unaccepted Git checkout(s) were kept to protect user files. Inspect the local app logs for their locations and the allocation error.`);
-            }
-            if (allocationAttempted) {
-              // Even the first failed allocation can include a native path in a Git or
-              // filesystem error (for example an unsafe managed parent directory).
-              // Only a trusted worktree error code crosses the model-facing boundary.
-              logWarn(`multi-agent: worker allocation failed: ${error instanceof Error ? error.message : String(error)}`);
-              const code = error instanceof WorkerWorktreeError ? error.code : 'WORKTREE_ALLOCATION_FAILED';
-              // A fixed, path-free reason the user can act on may cross; any other stays in the log.
-              const hint = code === 'WORKTREE_STORAGE_UNAVAILABLE'
-                ? 'Worker checkouts are kept next to the repository, inside an approved folder, so the approved folder must contain the repository rather than be it. Ask the user to approve the folder that contains this repository, or to turn off "Isolate new workers in Git worktrees" in Settings.'
-                : 'See local app logs for details.';
-              throw new Error(`${code}: isolated Git checkout allocation failed. ${hint} The worker spawn was rolled back.`);
-            }
-            throw error;
-          }
-          const { created, becamePrime, runId, defaultNotes } = staged;
-          // Keep provisional workspaces out of the cwd cache until the broker has accepted
-          // their owners. A failed stage retains its checkout but exposes no orphan cwd.
-          for (const lease of admittedLeases) {
-            setWorkspaceFor(`agent:${lease.runId}:${lease.agentId}`, lease.workspace);
-          }
+          }, async () => {
+            const sessionId = currentCall()?.caller.sessionId;
+            return (sessionId ? await getSessionProject(sessionId) : null) ??
+              primeWorkspace(currentCaller().conversationId) ?? currentWorkspace();
+          }, () => !reg.ctx.readOnly && reg.caps.command && reg.caps.create && reg.caps.edit);
           if (currentCall()) currentCall()!.caller.runId = runId;
           // Browser tabs are a publication side effect, never part of planning. They become
           // visible only after the exact broker revision above is durable.
@@ -1684,6 +1576,12 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
               : info.state;
         const asleep = state.agents.filter((info) => info.state === 'sleeping' && info.revivable);
         const slots = status.freeWorkerSlots;
+        // ChatGPT's own "allow this app?" card stops a worker until the person answers it. Read
+        // as just "active", the prime decided the runtime was stuck instead of telling the person
+        // a click was needed (VM, 2026-10-17).
+        const needsApproval = (info: { role: string; conversationId: string | null }): boolean =>
+          info.role !== 'prime' && !!info.conversationId && approvalCardWaiting(info.conversationId);
+        const awaitingUser = state.agents.filter(needsApproval);
         return {
           content: [
             {
@@ -1693,7 +1591,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
                 state.agents
                   .map(
                     (info) =>
-                      `${info.id}  ${info.role}  ${shown(info)}  waiting ${info.pending}  ${info.label}` +
+                      `${info.id}  ${info.role}  ${shown(info)}${needsApproval(info) ? ', needs the user to answer a tool approval in its chat' : ''}  waiting ${info.pending}  ${info.label}` +
                       (info.model ? `  model ${info.model}` : '') +
                       (info.reasoningEffort ? `  reasoning ${info.reasoningEffort}` : '') +
                       (info.result
@@ -1716,6 +1614,10 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
                   ? `\n\n${failed.map((info) => info.id).join(', ')} will not report. Do that work yourself or wake ` +
                     'another worker; do not wait for them.'
                   : '') +
+                (awaitingUser.length > 0
+                  ? `\n\n${awaitingUser.map((info) => info.id).join(', ')} ${awaitingUser.length === 1 ? 'waits' : 'wait'} for the user to allow or deny a tool call in ${awaitingUser.length === 1 ? 'its own chat' : 'their own chats'} ` +
+                    'and continue only after the user answers, in the app or in the browser. If you are waiting for them, tell the user.'
+                  : '') +
                 // A status check is a glance, not a stopping point. Without this the table reads
                 // like an answer to hand back to the user, and a prime that has just looked at its
                 // workers stops mid-run to report what it saw.
@@ -1737,6 +1639,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
               state: info.state,
               revivable: info.revivable,
               waiting: info.pending,
+              needs_user_approval: needsApproval(info),
               result: info.result ?? null
             }))
           }
@@ -1838,8 +1741,13 @@ interface PatchRollbackSnapshot {
 /** Keep the connector's atomicity promise bounded even when many large files are patched. */
 const MAX_PATCH_ROLLBACK_BYTES = 64 * 1024 * 1024;
 
-async function readOptionalPatchBytes(real: string): Promise<Buffer | null> {
+async function readOptionalPatchBytes(real: string, projectFs: ProjectFs): Promise<Buffer | null> {
   try {
+    if (projectFs !== localFs) {
+      const metadata = await projectFs.getMetadata(real);
+      if (metadata.isSymlink || !metadata.isFile) throw new Error('apply_patch target changed from a file before execution');
+      return await projectFs.readFile(real);
+    }
     const stat = await fs.lstat(real);
     if (!stat.isFile()) throw new Error('apply_patch target changed from a file before execution');
     return await fs.readFile(real);
@@ -1853,7 +1761,7 @@ async function capturePatchRollbackSnapshots(resolution: PatchResolution): Promi
   const snapshots = new Map<string, PatchRollbackSnapshot>();
   let total = 0;
   for (const [real, virtual] of resolution.virtualPaths) {
-    const bytes = await readOptionalPatchBytes(real);
+    const bytes = await readOptionalPatchBytes(real, resolution.fs);
     total += bytes?.length ?? 0;
     if (total > MAX_PATCH_ROLLBACK_BYTES) {
       throw new Error(
@@ -1900,7 +1808,8 @@ function expectedPatchStates(
  */
 async function rollbackFailedPatch(
   snapshots: Map<string, PatchRollbackSnapshot>,
-  delta: AppliedPatchDelta
+  delta: AppliedPatchDelta,
+  projectFs: ProjectFs
 ): Promise<{ complete: boolean; note: string }> {
   const expected = expectedPatchStates(snapshots, delta);
   const problems: string[] = [];
@@ -1908,7 +1817,7 @@ async function rollbackFailedPatch(
   for (const [real, snapshot] of snapshots) {
     let current: Buffer | null;
     try {
-      current = await readOptionalPatchBytes(real);
+      current = await readOptionalPatchBytes(real, projectFs);
     } catch {
       problems.push(`${snapshot.virtual}: could not inspect current state`);
       continue;
@@ -1920,7 +1829,10 @@ async function rollbackFailedPatch(
       continue;
     }
     try {
-      if (snapshot.bytes === null) await fs.rm(real, { force: true });
+      if (projectFs !== localFs) {
+        if (snapshot.bytes === null) await projectFs.remove(real, { recursive: false, force: true });
+        else await projectFs.writeFile(real, snapshot.bytes);
+      } else if (snapshot.bytes === null) await fs.rm(real, { force: true });
       else await fs.writeFile(real, snapshot.bytes);
     } catch {
       problems.push(`${snapshot.virtual}: restore failed`);
@@ -1930,7 +1842,7 @@ async function rollbackFailedPatch(
   // Prove the final state rather than assuming successful write/remove calls meant restoration.
   for (const [real, snapshot] of snapshots) {
     try {
-      if (!samePatchState(await readOptionalPatchBytes(real), snapshot.bytes)) {
+      if (!samePatchState(await readOptionalPatchBytes(real, projectFs), snapshot.bytes)) {
         if (!problems.some((problem) => problem.startsWith(`${snapshot.virtual}:`))) {
           problems.push(`${snapshot.virtual}: restore verification failed`);
         }
@@ -1976,9 +1888,12 @@ async function runParsedPatch(
       // Preserve the shell gate from `cd dir && apply_patch`: interception must not execute a
       // patch that the submitted shell command would never have reached. The cwd must already
       // exist and be a directory; patch-created parents apply only to paths *inside* it.
-      effectiveBase = await resolveIn(roots, args.workdir, { base: base.virtual });
-      const stat = await fs.stat(effectiveBase.real);
-      if (!stat.isDirectory()) {
+      const workdir = await resolveIn(roots, args.workdir, { base: base.virtual, remote: true });
+      effectiveBase = workdir;
+      const isDirectory = workdir.root.remote
+        ? (await fsForRoot(workdir.root).getMetadata(workdir.real)).isDirectory
+        : (await fs.stat(workdir.real)).isDirectory();
+      if (!isDirectory) {
         return { result: fail('apply_patch workdir must be an existing folder'), content: null, exitCode: null };
       }
     } catch (error) {
@@ -1997,24 +1912,24 @@ async function runParsedPatch(
   }
   if (caps !== undefined) {
     try {
-      const denial = await patchEffectCapabilityDenial(effectiveArgs.hunks, caps, resolution.resolve);
+      const denial = await patchEffectCapabilityDenial(effectiveArgs.hunks, caps, resolution.resolve, resolution.fs);
       if (denial !== null) return { result: fail(denial), content: null, exitCode: null };
     } catch (error) {
       return { result: fail(friendlyError(error)), content: null, exitCode: null };
     }
   }
-  // Move-only is a separate permission from Edit. Upstream's default update mode normalizes
-  // even context-only moves to LF, so a CRLF file would be byte-rewritten under Move alone.
-  // Preserve line endings whenever Edit is unavailable; any real content change was already
-  // rejected by patchCapabilityDenial before resolution.
-  const patchUpdateMode = caps !== undefined && !caps.edit ? 'preserve_line_endings' : DEFAULT_APPLY_PATCH_FILE_UPDATE_MODE;
+  // Upstream's default update mode splits on LF only: lines outside a hunk keep their CR while
+  // the hunk's context and new lines lose it, so one edit leaves a CRLF file with mixed endings
+  // (and a context-only move under Move alone would rewrite bytes). Keep each file's own endings.
+  const patchUpdateMode = 'preserve_line_endings';
 
   try {
     await verifyApplyPatchArgs(
       effectiveArgs,
       effectiveBase.real,
       patchUpdateMode,
-      resolution.resolve
+      resolution.resolve,
+      resolution.fs
     );
   } catch (error) {
     return {
@@ -2037,11 +1952,12 @@ async function runParsedPatch(
     patch: effectiveArgs.patch,
     cwd: effectiveBase.real,
     updateFileMode: patchUpdateMode,
-    resolvePath: resolution.resolve
+    resolvePath: resolution.resolve,
+    fs: resolution.fs
   });
   let rollbackNote = '';
   if (execution.exitCode !== 0 && rollbackSnapshots !== null) {
-    const rollback = await rollbackFailedPatch(rollbackSnapshots, execution.delta);
+    const rollback = await rollbackFailedPatch(rollbackSnapshots, execution.delta, resolution.fs);
     rollbackNote = rollback.note;
   }
   const stdout = safePatchOutput(execution.stdout, resolution);
@@ -2113,11 +2029,14 @@ function patchCapabilityDenial(hunks: readonly Hunk[], caps: Capabilities): stri
 async function patchEffectCapabilityDenial(
   hunks: readonly Hunk[],
   caps: Capabilities,
-  resolve: PatchPathResolver
+  resolve: PatchPathResolver,
+  projectFs: ProjectFs
 ): Promise<string | null> {
   const exists = async (target: string): Promise<boolean> => {
     try {
-      await fs.lstat(target);
+      // A server folder never resolves a dangling link, so following links there loses nothing.
+      if (projectFs === localFs) await fs.lstat(target);
+      else await projectFs.getMetadata(target);
       return true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
@@ -2125,7 +2044,7 @@ async function patchEffectCapabilityDenial(
     }
   };
   const samePath = (left: string, right: string): boolean =>
-    process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+    projectFs === localFs && process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
 
   for (const hunk of hunks) {
     if (hunk.kind === 'add_file') {
@@ -2150,6 +2069,8 @@ interface PatchResolution {
   virtualPaths: Map<string, string>;
   /** Exact model-visible/real spellings that must never be echoed back as native paths. */
   displayRewrites: Map<string, string>;
+  /** Where every path of the patch lives: this computer, or the one server folder (#1469). */
+  fs: ProjectFs;
 }
 
 function safePatchOutput(text: string, resolution: PatchResolution): string {
@@ -2182,17 +2103,19 @@ async function resolvePatchPaths(
   // resolution has to model that same presence state instead of consulting only pre-patch disk.
   const pendingPresence = new Map<string, boolean>();
   const pathKey = (real: string): string => (process.platform === 'win32' ? real.toLowerCase() : real);
+  const touchedRoots = new Map<string, Root>();
 
   const add = async (spelledPath: string, requireExisting: boolean): Promise<string> => {
     // First resolve the sandbox identity without requiring the leaf to exist. This gives later
     // hunks a stable real key even when the path exists only in the patch's simulated state.
-    let resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: true });
+    let resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: true, remote: true });
     const state = pendingPresence.get(pathKey(resolved.real));
     // An untouched initial Update/Delete keeps the old strict Not-found behaviour. Once an
     // earlier hunk has established presence/absence, the verifier owns the sequential verdict.
     if (requireExisting && state === undefined) {
-      resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: false });
+      resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: false, remote: true });
     }
+    touchedRoots.set(resolved.root.name, resolved.root);
     realBySpelling.set(spelledPath, resolved.real);
     virtualPaths.set(resolved.real, resolved.virtual);
     displayRewrites.set(resolved.real, resolved.virtual);
@@ -2222,6 +2145,16 @@ async function resolvePatchPaths(
     pendingPresence.set(pathKey(destination), true);
   }
 
+  // One patch is applied through one file system. A server folder's files are reached over its
+  // own SFTP session, so a patch there stays inside that folder; mixing it with any other folder
+  // would need two file systems and two rollbacks that could not succeed or fail together.
+  const remote = [...touchedRoots.values()].find(root => root.remote);
+  if (remote && touchedRoots.size > 1) {
+    throw new SandboxError(
+      `This patch changes files in /${remote.name}, a folder on a server, and in another folder. A patch can change files in one server folder at a time; split it into one patch per folder.`
+    );
+  }
+
   const resolve: PatchPathResolver = (spelledPath) => {
     const resolved = realBySpelling.get(spelledPath);
     if (resolved === undefined) {
@@ -2229,7 +2162,7 @@ async function resolvePatchPaths(
     }
     return resolved;
   };
-  return { resolve, virtualPaths, displayRewrites };
+  return { resolve, virtualPaths, displayRewrites, fs: remote ? fsForRoot(remote) : localFs };
 }
 
 function patchFileChanges(delta: AppliedPatchDelta, virtualPaths: ReadonlyMap<string, string>): Array<{ change: FileChange; before: string; after: string }> {
@@ -2295,8 +2228,9 @@ async function expandGlob(
   const rest = segments.slice(baseSegments.length).join('/');
   if (!rest) return { matches: [normalised], truncated: null };
 
-  const resolved = await resolveIn(roots, base, { access: 'read' });
-  const info = await statInfo(resolved.real, resolved.virtual, { scanContent: false });
+  const resolved = await resolveIn(roots, base, { access: 'read', remote: true });
+  const projectFs = fsForRoot(resolved.root);
+  const info = await statInfo(resolved.real, resolved.virtual, { scanContent: false, fs: projectFs });
   if (info.type !== 'directory') throw new SandboxError(`${resolved.virtual} is not a folder, so it cannot be globbed`);
 
   // `**` walks with Codex's bounded breadth-first walk; a single-level pattern needs one
@@ -2306,12 +2240,13 @@ async function expandGlob(
   if (rest.includes('**')) {
     const walked = await walkFiles(resolved.real, resolved.virtual, {
       maxEntries: GLOB_SCAN_LIMIT,
-      exclude: DEFAULT_EXCLUDES
+      exclude: DEFAULT_EXCLUDES,
+      fs: projectFs
     });
     candidates = walked.files;
     scanTruncated = walked.truncated;
   } else {
-    const listed = await listDirectoryLevel(resolved.real, resolved.virtual, GLOB_SCAN_LIMIT, false);
+    const listed = await listDirectoryLevel(resolved.real, resolved.virtual, GLOB_SCAN_LIMIT, false, projectFs);
     candidates = listed.entries.filter((entry) => entry.type === 'file').map((entry) => entry.virtualPath);
     scanTruncated = listed.truncated;
   }
@@ -2388,13 +2323,13 @@ async function nearestFolderListing(roots: Root[], requested: string, err: unkno
     candidate = parent;
     let resolved;
     try {
-      resolved = await resolveIn(roots, candidate, { access: 'read' });
+      resolved = await resolveIn(roots, candidate, { access: 'read', remote: true });
     } catch (error) {
       if (error instanceof SandboxError && error.message.startsWith('Not found:')) continue;
       return '';
     }
     try {
-      const { entries, truncated } = await listDirectoryLevel(resolved.real, resolved.virtual, MISSING_PATH_LISTING, false);
+      const { entries, truncated } = await listDirectoryLevel(resolved.real, resolved.virtual, MISSING_PATH_LISTING, false, fsForRoot(resolved.root));
       const names = entries.map((entry) => `${entry.type === 'directory' ? 'd' : 'f'} ${entry.name}`);
       const more = truncated ? `, …` : '';
       return `\nThe nearest existing folder is ${resolved.virtual}${
@@ -2422,7 +2357,7 @@ async function pathUnderNamedRoot(roots: Root[], requested: string): Promise<str
     if (!root) continue;
     const candidate = `/${[root.name, ...segments.slice(index + 1)].join('/')}`;
     try {
-      return (await resolveIn(roots, candidate, { access: 'read' })).virtual;
+      return (await resolveIn(roots, candidate, { access: 'read', remote: true })).virtual;
     } catch {
       continue;
     }
@@ -2453,14 +2388,15 @@ async function readOne(
       : `--- / — ${options.roots.length} entr${options.roots.length === 1 ? 'y' : 'ies'}, one level ---\n${options.roots.map(root => `d ${root.name}`).join('\n')}`;
     return { text, bytes: Buffer.byteLength(text, 'utf8') };
   }
-  const resolved = await resolveIn(options.roots, requested, { access: 'read' });
-  const info = await statInfo(resolved.real, resolved.virtual, { scanContent: !options.canRead });
+  const resolved = await resolveIn(options.roots, requested, { access: 'read', remote: true });
+  const projectFs = fsForRoot(resolved.root);
+  const info = await statInfo(resolved.real, resolved.virtual, { scanContent: !options.canRead, fs: projectFs });
 
   if (info.type === 'directory') {
     if (!options.canBrowse) {
       return { text: `--- ${resolved.virtual} ---\nTOOL_DISABLED: listing folders needs the Browse folders permission.`, bytes: 0 };
     }
-    const { entries, truncated } = await listDirectoryLevel(resolved.real, resolved.virtual, MAX_DIR_ENTRIES);
+    const { entries, truncated } = await listDirectoryLevel(resolved.real, resolved.virtual, MAX_DIR_ENTRIES, true, projectFs);
     const prefixLength = resolved.virtual.length + 1;
     const body = entries
       .map((entry) => {
@@ -2501,7 +2437,7 @@ async function readOne(
     // must not fail solely because it is larger than the text budget. Still charge base64,
     // not just compressed file bytes, and refuse an exhausted image batch before decoding.
     if (options.imageBytes <= 0) throw new Error('Read image output cap reached; read remaining images in another call or use view_image.');
-    const image = await viewImage(resolved.real, null, undefined, resolved.virtual);
+    const image = await viewImage(resolved.real, null, undefined, resolved.virtual, undefined, projectFs);
     logInfo(`tool read image ${resolved.virtual} (${formatBytes(image.bytes)})`);
     const text = `--- ${resolved.virtual} — ${formatBytes(image.bytes)} ${image.mimeType} ---`;
     if (image.base64.length > options.imageBytes) {
@@ -2530,7 +2466,8 @@ async function readOne(
     result = await readTextFile(resolved.real, {
       startLine: options.startLine,
       endLine: options.endLine,
-      maxBytes: options.maxBytes
+      maxBytes: options.maxBytes,
+      fs: projectFs
     });
   } catch (error) {
     if (!(error instanceof BinaryReadError)) throw error;
@@ -2624,3 +2561,6 @@ function boundedNumberedRead(
 
 export type { ToolResult };
 import { firstTaskRoot } from '../skill-access.js';
+import { reportedUsageLimits } from '../session/usage.js';
+import { readProviderUsage } from '../provider-usage.js';
+import { usageReport } from '../usage-tool.js';

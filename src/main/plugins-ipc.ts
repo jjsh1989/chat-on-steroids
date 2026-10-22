@@ -4,6 +4,8 @@ import { z } from 'zod';
 import { pluginManager } from './plugins/manager.js';
 import { refreshPluginPublication } from './connection.js';
 import { rearmPluginRefresh } from './plugin-refresh.js';
+import { dialogLabel, mainText } from './main-texts.js';
+import { MAX_PLUGIN_LONGEST_CALL_SECONDS } from '../shared/plugins.js';
 
 const values = z.record(z.string().min(1).max(128), z.string().max(16_384)).refine(value => Object.keys(value).length <= 64, 'At most 64 configuration fields');
 const source = z.object({
@@ -13,7 +15,7 @@ const source = z.object({
   command: z.string().max(4096).optional(), args: z.array(z.string().max(4096)).max(128).optional(),
   url: z.string().max(4096).optional(), path: z.string().max(4096).optional(), auth: z.literal('oauth').optional()
 }).strict();
-const patch = z.object({ source: source.optional(), name: z.string().min(1).max(100).optional(), config: values.optional(), credentials: values.optional() }).strict();
+const patch = z.object({ source: source.optional(), name: z.string().min(1).max(100).optional(), config: values.optional(), credentials: values.optional(), longestCallSeconds: z.number().int().min(1).max(MAX_PLUGIN_LONGEST_CALL_SECONDS).optional() }).strict();
 const install = patch.extend({ catalogId: z.string().max(80).optional() });
 const identity = z.object({ id: z.string().min(1).max(80) });
 type Register = <T>(channel: string, fn: (payload: unknown) => Promise<T>) => void;
@@ -48,7 +50,7 @@ export function registerPluginIpc(
     await pluginManager.setToolEnabled(input.id, input.name, input.enabled); return pluginManager.snapshot();
   });
   handle('plugins:importBundle', async () => {
-    const result = await dialog.showOpenDialog({ title: 'Import MCP bundle', properties: ['openFile'], filters: [{ name: 'MCP bundles', extensions: ['mcpb'] }] });
+    const result = await dialog.showOpenDialog({ ...dialogLabel('Import MCP bundle'), properties: ['openFile'], filters: [{ name: mainText('MCP bundles'), extensions: ['mcpb'] }] });
     return result.canceled ? null : result.filePaths[0] ?? null;
   });
   pluginManager.onChanged(() => {

@@ -12,6 +12,12 @@ import type { PluginPublication, PluginRefreshRequest, PluginRefreshStatus, Plug
 
 const app = z.string().regex(/^asdk_app_[a-zA-Z0-9_-]{1,160}$/);
 const LEGACY_PLUGIN_MAX_TOOLS = 64;
+/**
+ * A sanity bound for the app's own Core and Desktop connectors, not a catalog: they declare a few
+ * dozen tools at most (Windows Desktop 24 in 2.1.44, which the old bound of 16 refused, #1763). The
+ * extension's page readers use the same number; a test keeps it above what they declare.
+ */
+export const OWN_CONNECTOR_MAX_TOOLS = 64;
 const requestedVersion = z.string().regex(/^\d+\.\d+\.\d+$/).optional();
 const rowSchema = z.object({
   surface: z.enum(['core', 'desktop', 'plugins']), schemaId: z.string(), id: z.string().uuid(), appId: app.nullable(),
@@ -168,7 +174,7 @@ const hash = (value: unknown) => createHash('sha256').update(canonical(value)).d
 const declaration = (tools: PluginToolSchema[]) => tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })).sort((a, b) => a.name.localeCompare(b.name));
 function recognizable(tools: unknown, surface: PluginSurface = 'core'): tools is PluginToolSchema[] {
   // The registrar can append one local exec tool to the bounded upstream catalog.
-  if (!Array.isArray(tools) || (!tools.length && surface !== 'plugins') || tools.length > (surface === 'plugins' ? PLUGIN_MAX_TOOLS + 1 : 16) || JSON.stringify(tools).length > 300000) return false;
+  if (!Array.isArray(tools) || (!tools.length && surface !== 'plugins') || tools.length > (surface === 'plugins' ? PLUGIN_MAX_TOOLS + 1 : OWN_CONNECTOR_MAX_TOOLS) || JSON.stringify(tools).length > 300000) return false;
   if (tools.some(tool => !tool || typeof tool.name !== 'string' || typeof tool.description !== 'string' || !tool.inputSchema || typeof tool.inputSchema !== 'object')) return false;
   return tools.every(tool => tool.inputSchema.type === 'object') && new Set(tools.map(tool => tool.name)).size === tools.length;
 }
@@ -336,8 +342,16 @@ function reconcileRows(current: Row[]): boolean {
     if (currentPublication(publication.surface) !== publication) continue;
     const stored = current.find(row => row.surface === publication.surface);
     // An unknown old tunnel is not a different tunnel. Keep its consumed/manual custody
-    // until the same installed app proves its current tunnel and full declarations.
-    if (stored && legacyIdentity(stored)) {
+    // until the same installed app proves its current tunnel and full declarations, as long as
+    // that custody is about the schema still published. A failed, parked or unconfirmed receipt
+    // for an older schema guards nothing any more: a scoped row in that state is replaced by a
+    // fresh one below, and the page still refuses a click unless ChatGPT is behind. Kept, it
+    // blocked automatic refresh for every later schema (live 2026-10-15, Core).
+    const superseded = stored && legacyIdentity(stored) && stored.schemaId !== publication.schemaId && !stored.manual &&
+      !(stored.observe && requestedHere(stored)) &&
+      (!!stored.parked || stored.completedSchemaId !== stored.schemaId || (!!stored.error && stored.failure !== 'inspection'));
+    if (superseded) logInfo(`plugin refresh starts over surface=${publication.surface}: an old build's receipt for an earlier schema failed`);
+    if (stored && legacyIdentity(stored) && !superseded) {
       // A disconnected explicit request can adopt its first live publication once.
       if (stored.observe && requestedHere(stored) && !stored.requestedSchemaId) {
         stored.requestedSchemaId = publication.schemaId; changed = true;
@@ -417,7 +431,9 @@ export function pendingPluginRefreshes(automatic = true): Promise<PluginRefreshR
       if (legacyIdentity(row)) return legacyCheckCurrent(row) && (row.observe || refreshableLegacy(row, publication) || (!row.error && !row.parked))
         ? [{ ...structuredClone(publication), id: row.id, appId: row.appId, ...(!refreshableLegacy(row, publication) ? { observeOnly: true } : {}) }] : [];
       return row.tunnelKey === scope(row.surface) && publication.schemaId === row.schemaId && (row.observe || (!row.attempted && !row.manual && !row.parked && row.completedSchemaId !== row.schemaId))
-        ? [{ ...structuredClone(publication), id: row.id, appId: row.observe ? null : row.appId, ...(row.observe ? { observeOnly: true } : {}) }] : [];
+        // An observation must rediscover this enrolled app in the installed list; dropping its
+        // identity makes other proven aliases on the same surface look like competing targets.
+        ? [{ ...structuredClone(publication), id: row.id, appId: row.appId, ...(row.observe ? { observeOnly: true } : {}) }] : [];
     });
   });
 }

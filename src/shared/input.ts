@@ -19,7 +19,8 @@ type InputIntent = {
 /** A native upload may wait for a browser boundary while retaining immediate intent.
  * Admission and presentation must classify that same durable row identically. */
 export function manualInput(row: InputIntent): boolean {
-  return (row.requestedMode ?? row.mode) === 'auto' && !row.finishOwner && row.purpose !== 'decision' && row.attachmentDelivery !== 'tool';
+  return (row.requestedMode ?? row.mode) === 'auto' && !row.finishOwner && row.purpose !== 'decision' && row.purpose !== 'rotation' &&
+    row.attachmentDelivery !== 'tool';
 }
 export function queuedFollowup(row: InputIntent): boolean {
   return !row.opening && !manualInput(row) &&
@@ -33,4 +34,12 @@ export function browserInputModel(input: { mode: string; model: string | null; r
   return input.mode === 'finish'
     ? { model: null, reasoningEffort: null }
     : { model: input.model, reasoningEffort: input.reasoningEffort };
+}
+
+/**
+ * What the person wrote, as the chat shows it and names itself by. A plan's first message carries
+ * stage 1's generated wording as its text; the request the person typed is its objective.
+ */
+export function authoredTextOf(entry: Readonly<{ text: string; objective?: string; authoredSource?: 'text' | 'objective' | 'none' }>): string {
+  return entry.authoredSource === 'objective' && entry.objective?.trim() ? entry.objective : entry.text;
 }

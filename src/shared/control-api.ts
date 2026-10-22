@@ -18,14 +18,19 @@ export const CONTROL_API_ROUTES = [
   '/v1/sessions/{id}/events/stream',
   '/v1/inputs',
   '/v1/agents',
-  '/v1/log'
+  '/v1/workers/{ownerId}',
+  '/v1/workers/{ownerId}/reports',
+  '/v1/log',
+  '/v1/models'
 ] as const;
 
 /**
  * Routes that change something. They are served only while the user has also switched on
  * `controlApi.allowActions`, and are listed apart from `CONTROL_API_ROUTES` for that reason.
  */
-export const CONTROL_API_ACTION_ROUTES = ['POST /v1/inputs', 'POST /v1/inputs/{id}/cancel'] as const;
+export const CONTROL_API_ACTION_ROUTES = ['POST /v1/inputs', 'POST /v1/inputs/{id}/cancel',
+  'POST /v1/workers/{ownerId}/spawn', 'POST /v1/workers/{ownerId}/message', 'POST /v1/workers/{ownerId}/ack',
+  'POST /v1/sessions/{id}/stop'] as const;
 
 /** Written to `userData/control-api/endpoint.json` while the listener is up. */
 export interface ControlApiEndpoint {
@@ -359,6 +364,15 @@ export interface ControlApiAgents {
   }>;
 }
 
+/** The models this ChatGPT account offers, as the app last read them from ChatGPT's own picker. */
+export interface ControlApiModels {
+  /** `ready` once the app has read the picker; `unknown`, `pending` or `unavailable` until then. */
+  state: string;
+  observedAt: number | null;
+  /** An `id` and one of its `efforts` are what `POST /v1/inputs` takes as `model` and `reasoningEffort`. */
+  models: Array<{ id: string; label: string; efforts: string[] }>;
+}
+
 export interface ControlApiLog {
   entries: Array<{ time: number; level: string; message: string; agent?: string; truncated?: true }>;
   /** Entries the in-memory ring holds, before the filters. */
@@ -376,4 +390,12 @@ export interface ControlApiCancelResult {
   input: ControlApiInput;
   /** False when the row was already cancelled or failed. `input.delivery` says whether it may have been sent. */
   cancelled: boolean;
+}
+
+export interface ControlApiStopResult {
+  /**
+   * The chat right after the request. `stopPending` is true until the browser presses Stop or the
+   * request expires; only the recorded `turn_end` proves the answer ended.
+   */
+  live: ControlApiLive;
 }

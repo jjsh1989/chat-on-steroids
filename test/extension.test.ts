@@ -912,6 +912,26 @@ describe('popup-only ChatGPT session transfer', () => {
     expect(requests).toHaveLength(1);
   });
 
+  // Without access to chatgpt.com no content script runs: the extension pairs and takes work, but
+  // nothing on the page ever answers. Firefox shows this after a revoked permission, Chrome with
+  // site access "On click"; measured on the VM 2026-10-14, a new chat then sat unclaimed.
+  it.each([[true, true], [false, false], [undefined, undefined]] as const)('reports whether it may access ChatGPT (%s)', async (granted, reported) => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetch = vi.fn(async (input: string, init?: Record<string, unknown>) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') { if (init?.body) bodies.push(JSON.parse(String(init.body))); return response(200, { ok: true, repairs: [] }); }
+      return response(404, {});
+    });
+    const contains = vi.fn(async (_query: { origins?: string[] }) => granted as boolean);
+    const worker = loadWorker({ local: new FakeStorageArea({ port: 8765, token: 'paired-token' }), session: new FakeStorageArea(), fetch,
+      ...(granted === undefined ? {} : { permissions: { contains } }) });
+    await worker.fireAlarm();
+    expect(bodies.length).toBeGreaterThan(0);
+    expect(bodies.at(-1)!.chatgptAccess).toBe(reported);
+    if (granted !== undefined) expect(contains).toHaveBeenCalledWith({ origins: ['https://chatgpt.com/*'] });
+  });
+
   it('reports the browser presence with ChatGPT’s answer, asking once per page load', async () => {
     const presence: unknown[] = [];
     const fetch = vi.fn(async (input: string, init?: Record<string, unknown>) => {
@@ -2657,7 +2677,7 @@ describe('worker settings authority', () => {
     expect(posted).toEqual([{ autoCompact: false, conversationId: CHAT }]);
   });
 
-  it('forwards compaction ticket, safe source loss, and both irreversible dispatch checkpoints', async () => {
+  it('forwards compaction ticket, safe source loss, a deferred automatic attempt, and both irreversible dispatch checkpoints', async () => {
     const posted: Record<string, unknown>[] = [];
     const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
       const url = new URL(input);
@@ -2677,12 +2697,15 @@ describe('worker settings authority', () => {
     await worker.send({ type: 'compact', conversationId: CHAT, ticket: true, automatic: true }, 44);
     const sourceError = 'The browser could not insert the handoff request (native_edit_rejected).';
     await worker.send({ type: 'compact', conversationId: CHAT, token, sourceLost: true, sourceError }, 44);
+    const deferredError = 'ChatGPT has not confirmed receiving the latest tool results. Nothing was compacted.';
+    await worker.send({ type: 'compact', conversationId: CHAT, token, sourceDeferred: true, sourceError: deferredError }, 44);
     await worker.send({ type: 'compact', conversationId: CHAT, token, sourceDispatch: true }, 44);
     await worker.send({ type: 'compact', conversationId: CHAT, token, destinationDispatch: true }, 44);
 
     expect(posted).toEqual([
       expect.objectContaining({ conversationId: CHAT, ticket: true, automatic: true }),
       expect.objectContaining({ conversationId: CHAT, token, sourceLost: true, sourceError }),
+      expect.objectContaining({ conversationId: CHAT, token, sourceDeferred: true, sourceError: deferredError }),
       expect.objectContaining({ conversationId: CHAT, token, sourceDispatch: true }),
       expect.objectContaining({ conversationId: CHAT, token, destinationDispatch: true })
     ]);
@@ -3858,6 +3881,39 @@ describe('extension revival delivery', () => {
 });
 
 describe('extension observation journal', () => {
+  // #1744: a chat started inside a ChatGPT Project joins the CoS project linked to it; the app
+  // learns the Project from the tab that recorded the chat, never from the page's own report.
+  it.each([
+    ['inside a ChatGPT Project', `https://chatgpt.com/g/g-p-${'d'.repeat(32)}-kunden/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee`, `g-p-${'d'.repeat(32)}`],
+    ['on a Project home before the chat has an id', `https://chatgpt.com/g/g-p-${'d'.repeat(32)}/project`, `g-p-${'d'.repeat(32)}`, true],
+    // A late batch for a named chat must not take the Project a tab shows by then.
+    ['on a Project home for a chat that already has an id', `https://chatgpt.com/g/g-p-${'d'.repeat(32)}/project`, undefined],
+    ['outside any Project', 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', undefined],
+    ['showing another chat of that Project', `https://chatgpt.com/g/g-p-${'d'.repeat(32)}/c/11111111-2222-4333-8444-555555555555`, undefined]
+  ] as Array<[string, string, string | undefined, boolean?]>)('sends the ChatGPT Project its tab showed with a chat\'s events: %s', async (_case, url, expected, fresh) => {
+    const chat = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const posted: Array<Record<string, unknown>> = [];
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch: async (input, init = {}) => {
+        const pathname = new URL(input).pathname;
+        if (pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (pathname !== '/events') return response(404, {});
+        const batch = JSON.parse(String(init.body));
+        posted.push(batch);
+        return response(200, { stored: batch.events.length });
+      },
+      tabsGet: async (id) => ({ id, url })
+    });
+    await worker.registerTab(61);
+    // A fresh chat's first observation has no id yet; it is journalled under the tab and bound once ChatGPT names it.
+    await worker.send({ type: 'events', ...(fresh ? {} : { conversationId: chat }), entries: [{ ...(fresh ? {} : { conversationId: chat }), event: { kind: 'progress', time: Date.now(), text: 'x' } }] }, 61);
+    if (fresh) await worker.send({ type: 'events', conversationId: chat, entries: [] }, 61);
+    await vi.waitFor(() => expect(posted).toHaveLength(1), { timeout: 10_000 });
+    expect(posted[0]!.chatgptProject).toBe(expected);
+  });
+
   it.each([false, true])('retains a slow durable event batch beyond ten seconds, including a split retry: %s', async split => {
     vi.useFakeTimers();
     const chat = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
@@ -4439,6 +4495,37 @@ describe('extension observation journal', () => {
 
     for (const reply of replies) expect(reply).toMatchObject({ ok: true, durable: true });
     expect(journalOf(session).map((entry) => entry.event.text)).toEqual(['A', 'B']);
+  });
+
+  // #1648: on a slow Windows machine every events message rewrote the whole journal (up to 4 MiB),
+  // one write after another, and pages waited up to ~100 s for their acknowledgement. Messages that
+  // arrive while a write is in flight share the next write: it is taken when it starts, so it holds
+  // every one of them, and each reply still waits until its observations are stored.
+  it('stores observations that arrive during a slow journal write together in one following write', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const journalWrites: string[][] = [];
+    const set = session.set.bind(session);
+    session.set = async (values: Record<string, unknown>) => {
+      if (Array.isArray(values.journal)) {
+        journalWrites.push((values.journal as Array<{ event: { text: string } }>).map(entry => entry.event.text));
+        // The first journal write is slow, as on the loaded machine.
+        if (journalWrites.length === 1) await new Promise((resolve) => setTimeout(resolve, 80));
+      }
+      return set(values);
+    };
+    const worker = loadWorker({ local, session });
+    // Each message comes from its own ChatGPT tab, as with a main chat and its workers.
+    const send = (text: string, time: number) => worker.send(
+      { type: 'events', entries: [{ conversationId: null, event: { kind: 'user_message', time, text } }] }, time);
+    const first = send('A', 1);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const later = ['B', 'C', 'D', 'E'].map((text, index) => send(text, index + 2));
+    const replies = await Promise.all([first, ...later]);
+
+    for (const reply of replies) expect(reply).toMatchObject({ ok: true, durable: true });
+    expect(journalOf(session).map((entry) => entry.event.text)).toEqual(['A', 'B', 'C', 'D', 'E']);
+    expect(journalWrites).toEqual([['A'], ['A', 'B', 'C', 'D', 'E']]);
   });
 
   it('serializes live tab snapshots so a slow older write cannot forget a newer tab owner', async () => {
@@ -5982,5 +6069,107 @@ describe('this install\'s connector names', () => {
     names = { core: 'Chat On Steroids Core', desktop: 'Chat On Steroids Desktop', plugins: 'Chat On Steroids Plugins' };
     await worker.fireAlarm();
     expect((await worker.send({ type: 'status' }) as any).connectorNames).toEqual(names);
+  });
+});
+
+describe('archiving retired worker chats (#1460)', () => {
+  const chat = 'aaaaaaaa-1111-4222-8333-444444444444';
+  function archiveWorker(outcome: unknown, job: Record<string, unknown> = { conversationId: chat }) {
+    const results: unknown[] = [];
+    let next: Record<string, unknown> | null = job;
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }), session: new FakeStorageArea(),
+      fetch: async (input, init = {}) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (route === '/worker-archive/next') { const body = next ?? { conversationId: null }; next = null; return response(200, body); }
+        if (route === '/worker-archive/result') { results.push(JSON.parse(String(init.body))); return response(200, { ok: true }); }
+        return response(200, {});
+      },
+      tabsSendMessage: async (_tabId, message) => message.type === 'clf-archive-chat' ? outcome : { ok: true }
+    });
+    return { worker, results };
+  }
+
+  it('archives the next chat from a registered ChatGPT page and reports what it said', async () => {
+    const { worker, results } = archiveWorker({ outcome: 'archived' });
+    await worker.createTab({ id: 1, url: 'https://chatgpt.com/' });
+    await worker.registerTab(1);
+    await worker.fireAlarm();
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(1, { type: 'clf-archive-chat', conversationId: chat, archive: true }, expect.objectContaining({ documentId: expect.any(String) }));
+    expect(results).toEqual([{ conversationId: chat, outcome: 'archived' }]);
+  });
+
+  it('defers when no ChatGPT page of this extension is open', async () => {
+    const { worker, results } = archiveWorker({ outcome: 'archived' });
+    await worker.fireAlarm();
+    expect(worker.tabsSendMessage).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ type: 'clf-archive-chat' }), expect.anything());
+    expect(results).toEqual([{ conversationId: chat, outcome: 'deferred' }]);
+  });
+
+  it('restores a chat the app archived before its worker is woken (#1701)', async () => {
+    const { worker, results } = archiveWorker({ outcome: 'unarchived' }, { conversationId: null, unarchive: chat });
+    await worker.createTab({ id: 1, url: 'https://chatgpt.com/' });
+    await worker.registerTab(1);
+    await worker.fireAlarm();
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(1, { type: 'clf-archive-chat', conversationId: chat, archive: false }, expect.objectContaining({ documentId: expect.any(String) }));
+    expect(results).toEqual([{ conversationId: chat, outcome: 'unarchived' }]);
+  });
+
+  it('never reports a restore as an archive, or the other way round', async () => {
+    const restoring = archiveWorker({ outcome: 'archived' }, { conversationId: null, unarchive: chat });
+    await restoring.worker.createTab({ id: 1, url: 'https://chatgpt.com/' });
+    await restoring.worker.registerTab(1);
+    await restoring.worker.fireAlarm();
+    expect(restoring.results).toEqual([{ conversationId: chat, outcome: 'failed' }]);
+    const archiving = archiveWorker({ outcome: 'unarchived' });
+    await archiving.worker.createTab({ id: 1, url: 'https://chatgpt.com/' });
+    await archiving.worker.registerTab(1);
+    await archiving.worker.fireAlarm();
+    expect(archiving.results).toEqual([{ conversationId: chat, outcome: 'failed' }]);
+  });
+
+  it('reports a failure the page could not explain as failed', async () => {
+    const { worker, results } = archiveWorker({ outcome: 'deleted' });
+    await worker.createTab({ id: 1, url: 'https://chatgpt.com/' });
+    await worker.registerTab(1);
+    await worker.fireAlarm();
+    expect(results).toEqual([{ conversationId: chat, outcome: 'failed' }]);
+  });
+});
+
+describe('a ChatGPT page that moves to a new address', () => {
+  const chat = 'bbbbbbbb-1111-4222-8333-444444444444';
+  function routeWorker() {
+    return loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }), session: new FakeStorageArea(),
+      fetch: async (input) => new URL(input).pathname === '/hello'
+        ? response(200, { app: 'chat-on-steroids', paired: true }) : response(200, {})
+    });
+  }
+  const routeNotices = (worker: ReturnType<typeof routeWorker>) =>
+    worker.tabsSendMessage.mock.calls.filter(call => (call[1] as { type?: string }).type === 'clf-route-changed');
+
+  it('tells that same page at once, so a hidden tab need not wait for its own throttled timer', async () => {
+    // 2026-10-15, Firefox: an app-opened chat in a minimized window moved to /c/<id> while its
+    // own once-a-second check ran far less often, so its Send receipt came late.
+    const worker = routeWorker();
+    const documentId = 'route-document-1';
+    await worker.registerTab(5, documentId);
+    const url = `https://chatgpt.com/c/${chat}`;
+    worker.scriptingExecuteScript.mockImplementation(async () => [{ frameId: 0, documentId, result: url }]);
+    worker.updateTab(5, { url }, { id: 5, windowId: 7, url });
+    await vi.waitFor(() => expect(routeNotices(worker)).toEqual([[5, { type: 'clf-route-changed' }, { documentId }]]));
+  });
+
+  it('tells nothing to a page the address change did not happen in', async () => {
+    const worker = routeWorker();
+    await worker.registerTab(5, 'route-document-1');
+    const url = `https://chatgpt.com/c/${chat}`;
+    // Another document answers: the change was a new page load, not this page's own route.
+    worker.scriptingExecuteScript.mockImplementation(async () => [{ frameId: 0, documentId: 'route-document-2', result: url }]);
+    worker.updateTab(5, { url }, { id: 5, windowId: 7, url });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(routeNotices(worker)).toEqual([]);
   });
 });

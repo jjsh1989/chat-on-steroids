@@ -345,6 +345,8 @@ var CLF_DOM = (() => {
     // The same failures on a pt-BR account, as measured 2026-10-12 (a send that never reached the
     // model, and its dropped answer). Only observed wording; other languages stay unrecognised.
     if (/^(?:a entrega da mensagem atingiu o tempo limite(?:\. tente novamente\.?)?|conexão interrompida\.? aguardando a resposta completa\.?)(?: tentar novamente)?$/i.test(line)) return true;
+    // The same two on a German account, as measured 2026-10-14 after a long answer's stream broke.
+    if (/^(?:zeitüberschreitung bei der übermittlung der nachricht(?:\. bitte versuche es erneut\.?)?|verbindung unterbrochen\.? warten auf die vollständige antwort\.?)(?: erneut versuchen)?$/i.test(line)) return true;
     return /^(?:message delivery timed out(?:\. please try again\.?)?|connection interrupted\.? waiting for the complete answer\.?|chatgpt stream recovery polling timed out\.?|stream cache expired\.?|unknown error occurred\.?|there was an error generating (?:a|the) response\.?|error in message stream\.?|network error\.?|a network error occurred\.?(?: please check your connection and try again\.?)?|resume stream unavailable\.?|something went wrong\.?|something went wrong while generating the response(?:\. if this issue persists please contact us through our help center at help\.openai\.com\.?)?\.?)(?: retry)?$/i.test(line);
   }
 
@@ -613,6 +615,21 @@ var CLF_DOM = (() => {
     if (!turn || !stamp?.startsWith(`${turn}:`)) return null;
     try { return decodeURIComponent(stamp.slice(turn.length + 1)) || null; } catch { return null; }
   }
+  /**
+   * Whether the page shows exactly one exchange, the chat's first, running without its question
+   * (fiber.js `data-clf-fiber-first`), and no user message anywhere. The stamp counts only under
+   * the exchange's current turn stamp, like every other MAIN stamp; a stale one is no evidence.
+   */
+  function firstQuestionPending() {
+    return safe(() => {
+      const all = turns();
+      if (all.length !== 1 || all[0].role !== 'assistant' || messages().some(message => message.role === 'user')) return false;
+      const section = all[0].node;
+      if (!section?.matches?.(SHELL_TURN)) return false;
+      const turn = section.getAttribute('data-clf-fiber-turn'), stamp = section.getAttribute('data-clf-fiber-first');
+      return !!turn && stamp === turn;
+    }, false);
+  }
   function turns() {
     return safe(() => {
       const out = [];
@@ -627,13 +644,17 @@ var CLF_DOM = (() => {
         if (node.matches?.(SHELL_TURN)) {
           const users = [...node.querySelectorAll('[data-content-search-unit-key$=":user"]')].filter(slot => slot.closest('[data-turn-key]') === node);
           const answered = node.querySelector('[data-chatgpt-agent-turn-start], [data-content-search-unit-key$=":assistant"]');
-          // Two user slots in one exchange are ambiguous and stay unread. A missing one is not: ChatGPT
-          // unmounts the question while its answer stays (#900), and skipping the whole exchange then
-          // hid that answer's final, so its turn never ended (#910). The answer keeps the exchange's
-          // own key; nothing here is joined by text or position.
+          // Two slots with the same key in one exchange are ambiguous and stay unread. Slots with
+          // their own keys are not: in a chat's later turns ChatGPT keeps a message sent into the
+          // running answer in the question's exchange, as its own slot (#1662). Skipping such an
+          // exchange hid the fresh turn's answer, and that turn never ended. A missing slot is not
+          // ambiguous either: ChatGPT unmounts the question while its answer stays (#900), and
+          // skipping the whole exchange then hid that answer's final, so its turn never ended (#910).
+          // The answer keeps the exchange's own key; nothing here is joined by text or position.
+          const keys = users.map(slot => slot.getAttribute('data-content-search-unit-key'));
           const unrendered = users.length ? null : unrenderedUserIdOf(node);
-          if (users.length > 1 || !id || (!users.length && !answered && !unrendered)) continue;
-          if (users.length) out.push({ node: users[0], nodes: [users[0]], id, role: 'user' });
+          if (new Set(keys).size !== keys.length || !id || (!users.length && !answered && !unrendered)) continue;
+          if (users.length) for (const slot of users) out.push({ node: slot, nodes: [slot], id, role: 'user' });
           else if (unrendered) out.push({ node, nodes: [node], id, role: 'user', unrenderedUserId: unrendered });
           if (answered) out.push({ node, nodes: [node], id, role: 'assistant' });
           previous = null; continue;
@@ -886,8 +907,66 @@ var CLF_DOM = (() => {
    * card on a kept (undisplayed) page, or one without an enabled button, is not waiting.
    */
   function approvalWaiting() {
-    return safe(() => [...document.querySelectorAll(APPROVAL_CARD)].some(card =>
-      !onKeptPage(card) && card.getClientRects().length > 0 && card.querySelector('button:not([disabled])') !== null), false);
+    return safe(() => waitingApprovalCard() !== null, false);
+  }
+
+  function waitingApprovalCard() {
+    return [...document.querySelectorAll(APPROVAL_CARD)].find(card =>
+      !onKeptPage(card) && card.getClientRects().length > 0 && card.querySelector('button:not([disabled])') !== null) ?? null;
+  }
+
+  /**
+   * The waiting card as the app shows it to the person (2.1.38): its words, line by line, without
+   * its buttons and key hints, and whether ChatGPT lets Allow once be pressed. In a chat with
+   * external app access switched off, ChatGPT shows the card with Allow once disabled and only
+   * Deny enabled (2026-10-14), so the app must not offer Allow there. Only text leaves the page.
+   */
+  function approvalCard() {
+    return safe(() => {
+      const node = waitingApprovalCard();
+      if (!node) return null;
+      const clone = node.cloneNode(true);
+      for (const drop of clone.querySelectorAll('button, kbd, svg, script, style, [aria-hidden="true"]')) drop.remove();
+      const lines = [];
+      const block = element => element.closest('div, p, li, h1, h2, h3, h4, h5, h6');
+      const groups = new Map();
+      const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const owner = node.parentElement && block(node.parentElement);
+        if (!owner) continue;
+        groups.set(owner, (groups.get(owner) || '') + node.textContent);
+      }
+      for (const text of groups.values()) {
+        const line = text.replace(/\s+/g, ' ').trim().slice(0, 300);
+        if (line && lines.at(-1) !== line && lines.length < 8) lines.push(line);
+      }
+      return { node, lines, allow: approvalButton(node, 'allow') !== null };
+    }, null);
+  }
+
+  /** Deny carries an Esc key hint and Allow once a Return hint (2026-10-14); no label is read. */
+  function approvalButton(card, choice) {
+    const hint = choice === 'deny' ? 'Esc' : choice === 'allow' ? '\u23CE' : null;
+    if (!hint) return null;
+    const buttons = [...card.querySelectorAll('button')].filter(button =>
+      [...button.querySelectorAll('kbd')].some(kbd => kbd.textContent.trim() === hint));
+    const button = buttons.length === 1 ? buttons[0] : null;
+    return button && !button.disabled && button.getAttribute('aria-disabled') !== 'true' ? button : null;
+  }
+
+  /**
+   * Presses Deny or Allow once on exactly the card the person answered in the app. A card that is
+   * gone or replaced is never answered through an old reference, and the options menu beside
+   * Allow once (where "always" lives) is never touched.
+   */
+  function answerApprovalCard(card, choice) {
+    return safe(() => {
+      if (!card || !card.isConnected || waitingApprovalCard() !== card) return 'card_changed';
+      const button = approvalButton(card, choice);
+      if (!button) return 'unavailable';
+      button.click();
+      return 'clicked';
+    }, 'unavailable');
   }
 
   /** Stop is a busy hint only; the exact provider terminal still owns turn completion. */
@@ -1924,13 +2003,16 @@ var CLF_DOM = (() => {
    */
   function composerActions() {
     return safe(() => {
-      // The current provider microphone has no stable button test id; its sprite and
-      // composer trailing parent identify it without interpreting a translated label.
+      // The current provider microphone has no stable button test id; its sprite inside the
+      // composer's own form identifies it without interpreting a translated label. Neither the
+      // trailing row marker nor the sprite's weight is stable: on 2026-10-17 the row had no
+      // marker and the glyph was microphone-light-20, so an empty German composer had no anchor
+      // and the app's composer control never appeared.
       const anchor = sendButton() || stopButton() || nativeComposerControls(SPEECH)[0] ||
-        [...(composerBox()?.querySelectorAll(`${TRAILING} button`) || [])]
+        nativeComposerControls('button')
         .find(button => !button.closest(OWN_SURFACES) && [...button.querySelectorAll('svg use')].some(use => {
           const href = use.getAttribute('href') || use.getAttribute('xlink:href') || '';
-          return href.slice(href.lastIndexOf('#')) === '#microphone-regular-24';
+          return href.slice(href.lastIndexOf('#')).startsWith('#microphone-');
         }));
       const explicit = anchor ? anchor.closest(TRAILING) : [...(composerBox() || document).querySelectorAll(TRAILING)].find(renderedComposerNode);
       if (!anchor) return explicit ? { host: explicit, before: null } : null;
@@ -2287,7 +2369,14 @@ var CLF_DOM = (() => {
    * not a reason to hold a finished Goal reply at "sending" (2026-09-03: one letter did).
    */
   function insertPrompt(value, mode = false, failure = () => undefined) {
-    const box = composer();
+    return insertIntoEditor(composer(), value, mode, failure, box => composer() === box);
+  }
+
+  /**
+   * One native insertion into a ChatGPT editor: the composer, or the inline editor ChatGPT opens to
+   * edit a question (#365). `stillOwned` says the editor is still the one this insertion was for.
+   */
+  function insertIntoEditor(box, value, mode, failure, stillOwned) {
     const reject = reason => {
       // A bounded predicate survives tab retirement without exposing authored data.
       safe(() => failure(reason), undefined);
@@ -2314,7 +2403,7 @@ var CLF_DOM = (() => {
           value = `\n${value}`;
         }
       } else selection.selectAllChildren(box);
-      if (!box.isConnected || composer() !== box) return reject('editor_replaced');
+      if (!box.isConnected || !stillOwned(box)) return reject('editor_replaced');
       if (document.activeElement !== box) return reject('composer_not_focused');
       if (!selection.rangeCount || !box.contains(selection.anchorNode) || !box.contains(selection.focusNode)) return reject('selection_changed');
       // One native HTML edit uses the actual browser selection, including on a
@@ -2339,7 +2428,7 @@ var CLF_DOM = (() => {
       if (!document.execCommand('insertHTML', false, paragraph.innerHTML)) return reject('native_edit_rejected');
       const compact = text => String(text || '').replace(/\s+/g, '');
       const expected = mode === 'append' ? existing + value : value;
-      if (!box.isConnected || composer() !== box) return reject('editor_replaced');
+      if (!box.isConnected || !stillOwned(box)) return reject('editor_replaced');
       if (compact(box.textContent) !== compact(expected)) return reject('text_mismatch');
       return true;
     } catch {
@@ -2417,7 +2506,15 @@ var CLF_DOM = (() => {
     }
   }
 
-  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null, receiptTimeoutMs = null, mention = null, explain = null, sentRequest = null, whileGenerating = false } = {}) {
+  /** Runs `run` on a later task. A message is not throttled like a timer in a background tab. */
+  function nextTask(run) {
+    if (typeof MessageChannel !== 'function') return void setTimeout(run, 0);
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => { channel.port1.close(); run(); };
+    channel.port2.postMessage(null);
+  }
+
+  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, stillCurrentAfterClick = null, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null, receiptTimeoutMs = null, mention = null, explain = null, sentRequest = null, whileGenerating = false } = {}) {
     // Why a Send ended without acceptance, as one short code for the caller's diagnostics (#820).
     // It names the first refusal only and never changes what Send does.
     const refused = (why) => { try { explain?.(why); } catch { /* Diagnostics never change Send. */ } return false; };
@@ -2548,7 +2645,10 @@ var CLF_DOM = (() => {
         };
         const check = () => {
           if (done) return;
-          if (!stillCurrent() || (beforeConversation && conversationId() !== beforeConversation)) return finish(false, 'chat-changed');
+          // A caller's deadline may forbid the click without disowning a click already made: its
+          // receipt is evidence the caller still has to report (#1086 worker starts).
+          const owned = attempted && stillCurrentAfterClick ? stillCurrentAfterClick : stillCurrent;
+          if (!owned() || (beforeConversation && conversationId() !== beforeConversation)) return finish(false, 'chat-changed');
           if (attempted) {
             if (accepted()) finish(true);
             return;
@@ -2583,8 +2683,11 @@ var CLF_DOM = (() => {
                 mentionAdded = true;
                 mentioning = true;
                 resumeClick = () => click(true);
-                mentionTimers = [setTimeout(() => { mentionTicked = true; settleMention(); }, 0),
-                  setTimeout(() => { mentionTicked = true; settleMention(true); }, 1500)];
+                // One task later by a message, not a 0 ms timer: Firefox held that timer 25 s in
+                // the minimized window of app-opened chats (2026-10-15). The 1.5 s fallback for a
+                // dropped token may run late there; it only matters when the editor draws nothing.
+                nextTask(() => { mentionTicked = true; settleMention(); });
+                mentionTimers = [setTimeout(() => { mentionTicked = true; settleMention(true); }, 1500)];
                 return;
               }
             }
@@ -2743,7 +2846,7 @@ var CLF_DOM = (() => {
     const route = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.hash) ||
       (!location.hash ? /^\/(?:settings\/plugins-settings|plugins)\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.pathname) : null);
     if (!snapshot || snapshot.appId !== route?.[1] || (expectedAppId ? snapshot.appId !== expectedAppId : !ownSnapshot(snapshot, connectorName)) ||
-        !Array.isArray(snapshot.tools) || (snapshot.tools.length < 1 && !externalPlugins) || snapshot.tools.length > (externalPlugins ? 257 : 16) || JSON.stringify(snapshot.tools).length > 300000 ||
+        !Array.isArray(snapshot.tools) || (snapshot.tools.length < 1 && !externalPlugins) || snapshot.tools.length > (externalPlugins ? 257 : 64) || JSON.stringify(snapshot.tools).length > 300000 ||
         snapshot.tools.some(tool => !tool || typeof tool.name !== 'string' || !/^[a-z][a-z0-9_]{0,79}$/.test(tool.name) || typeof tool.description !== 'string' || tool.inputSchema?.type !== 'object') ||
         new Set(snapshot.tools.map(tool => tool.name)).size !== snapshot.tools.length) return null;
     const buttons = [...document.querySelectorAll('button[data-clf-plugin-refresh]')].filter(button => button.getAttribute('data-clf-plugin-refresh') === snapshot.appId && button.getClientRects().length > 0);
@@ -2759,10 +2862,24 @@ var CLF_DOM = (() => {
     const proven = provenAppsFor(connectorName);
     return proven !== null && (proven.length ? proven.some(app => app.appId === snapshot.appId) : snapshot.connectorName === connectorName);
   }
-  function pluginInstalledButtons(connectorName) {
+  function pluginInstalledButtons(connectorName, expectedAppId = null, expectedSurface = null) {
     // Native links name their exact App Id, even when a fresh provider rename has not reached
     // the learned name yet. Legacy buttons still need names; the destination proves identity.
-    const proven = provenAppsFor(connectorName);
+    // A scoped enrolled observation keeps its App Id; other proven aliases cannot replace it.
+    if (expectedAppId !== null && (typeof expectedAppId !== 'string' || !/^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(expectedAppId))) return null;
+    let proven = provenAppsFor(connectorName);
+    if (expectedAppId !== null && expectedSurface !== null) {
+      const surfaceAt = ['core', 'desktop', 'plugins'].indexOf(expectedSurface);
+      if (surfaceAt < 0) return null;
+      const identified = ownApps.filter(app => app.appId === expectedAppId);
+      if (identified.length) {
+        // The durable exact ID and its requested surface survive colliding renames.
+        // An ID associated with another surface cannot borrow this row's authority.
+        if (identified.some(app => app.surface !== expectedSurface)) return null;
+        proven = identified;
+      } else if (proven !== null && (proven.some(app => app.surface !== expectedSurface) ||
+          (!proven.length && connectorNames()[surfaceAt] !== connectorName))) return null;
+    }
     if (proven === null) return null;
     const names = [connectorName, ...proven.map(app => app.name).filter(Boolean)];
     const named = node => names.includes(text(node));
@@ -2779,12 +2896,16 @@ var CLF_DOM = (() => {
             const url = new URL(button.href, location.href);
             const route = /^\/settings\/plugins-settings\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(url.pathname);
             if (url.origin !== location.origin || !route || url.hash) return false;
+            if (expectedAppId !== null && route[1] !== expectedAppId) return false;
             if (proven.length) return proven.some(app => app.appId === route[1]);
+            if (expectedAppId !== null) return true;
           }
+          if (expectedAppId !== null) return false; // An enrolled observation needs the link's exact ID, never a name-only button.
           return [...button.querySelectorAll('*')].some(node => !node.children.length && named(node));
         });
         return rows.length ? rows : null;
       }
+      if (expectedAppId !== null) return null; // Legacy rows cannot prove a native installed App Id.
       const panels = [...document.querySelectorAll('[role="tabpanel"]')].filter(panel => panel.getClientRects().length > 0 &&
         (panel.querySelector('[data-testid="plugin-icon-wrapper"]') || panel.querySelector('a[href="/plugins"]')));
       if (panels.length !== 1) return null;
@@ -2862,6 +2983,134 @@ var CLF_DOM = (() => {
     });
   }
 
+  /**
+   * Branch in new chat (#482): runs ChatGPT's own action on one reply's turn, without its labels.
+   *
+   * The reply's "More actions" menu (ellipsis icon) holds a Branch entry (branch icon) whose
+   * submenu offers a new chat and, on some plans, Work mode. The page world tells the two apart by
+   * handler (fiber.js). Returns 'clicked' once the new-chat entry was chosen; any missing or
+   * ambiguous step returns 'branch_unavailable' after closing what it opened. `isCurrent` fences
+   * every wait, so a page that changed meanwhile is never acted on.
+   */
+  async function branchInNewChat(turnNode, isCurrent = () => true) {
+    const shown = node => !!node && node.getClientRects().length > 0;
+    const close = () => {
+      for (let i = 0; i < 3 && document.querySelector('[role="menu"]'); i++) {
+        (document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+      }
+    };
+    const press = node => {
+      const init = { bubbles: true, cancelable: true, pointerType: 'mouse', button: 0 };
+      node.dispatchEvent(new PointerEvent('pointerdown', init)); node.dispatchEvent(new PointerEvent('pointerup', init)); node.click();
+    };
+    const until = async (read, ms = 3000) => {
+      for (const end = Date.now() + ms; Date.now() < end; await new Promise(resolve => setTimeout(resolve, 50))) {
+        if (!isCurrent()) return null;
+        const value = read();
+        if (value) return value;
+      }
+      return null;
+    };
+    const icon = (node, name) => [...node.querySelectorAll('svg use')].some(use => (use.getAttribute('href') || use.getAttribute('xlink:href') || '').includes(`#${name}`));
+    const unavailable = () => { close(); return 'branch_unavailable'; };
+    if (!turnNode || !isCurrent()) return 'branch_unavailable';
+    const triggers = [...turnNode.querySelectorAll('button[aria-haspopup="menu"]')]
+      .filter(button => !button.closest(OWN_SURFACES) && shown(button) && icon(button, 'ellipsis-horizontal'));
+    if (triggers.length !== 1) return 'branch_unavailable';
+    press(triggers[0]);
+    const branch = await until(() => {
+      const items = [...document.querySelectorAll('[role="menuitem"][aria-haspopup="menu"]')].filter(item => shown(item) && icon(item, 'branch'));
+      return items.length === 1 ? items[0] : null;
+    });
+    if (!branch) return unavailable();
+    branch.focus();
+    branch.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
+    const submenu = await until(() => {
+      const menu = document.getElementById(branch.getAttribute('aria-controls') || '');
+      return shown(menu) && menu.querySelector('[role="menuitem"]') ? menu : null;
+    });
+    if (!submenu) return unavailable();
+    const nonce = crypto.randomUUID();
+    const marked = await new Promise(resolve => {
+      const finish = value => { clearTimeout(timer); window.removeEventListener('message', receive); resolve(value); };
+      const receive = event => {
+        const data = event.data;
+        if (event.source === window && event.origin === location.origin && data?.source === 'clf-branch-reply' && data.nonce === nonce && data.v === 1) finish(data.marked);
+      };
+      const timer = setTimeout(() => finish(0), 1500);
+      window.addEventListener('message', receive);
+      window.postMessage({ source: 'clf-branch-ask', nonce }, location.origin);
+    });
+    const choice = [...submenu.querySelectorAll('[role="menuitem"]')].filter(item => item.getAttribute('data-clf-branch-new-chat') === nonce);
+    if (marked !== 1 || choice.length !== 1 || !isCurrent()) return unavailable();
+    press(choice[0]);
+    return 'clicked';
+  }
+
+  /**
+   * Edit & resubmit (#365): opens ChatGPT's own editor on one question, without reading a label.
+   *
+   * The page world marks that question's Edit control by handler (fiber.js); pressing it puts an
+   * editor into that same turn, inside a form whose submit button resubmits the question and whose
+   * other button cancels. Returns a handle once the editor is there, or 'edit_message_missing' /
+   * 'edit_unavailable' after closing anything it opened. `isCurrent` fences every wait.
+   */
+  async function openQuestionEdit(messageId, isCurrent = () => true) {
+    const shown = node => !!node && node.isConnected && node.getClientRects().length > 0;
+    const until = async (read, ms = 3000) => {
+      for (const end = Date.now() + ms; Date.now() < end; await new Promise(resolve => setTimeout(resolve, 50))) {
+        if (!isCurrent()) return null;
+        const value = read();
+        if (value) return value;
+      }
+      return null;
+    };
+    const turnOf = () => {
+      const keyed = [...document.querySelectorAll('[data-turn-key]')].filter(node => node.getAttribute('data-turn-key') === messageId);
+      const legacy = [...document.querySelectorAll('[data-message-id]')].filter(node => node.getAttribute('data-message-id') === messageId)
+        .map(node => node.closest('[data-testid^="conversation-turn"], article'));
+      const turns = [...new Set([...keyed, ...legacy].filter(Boolean))];
+      return turns.length === 1 ? turns[0] : null;
+    };
+    if (!isCurrent()) return { failure: 'edit_unavailable' };
+    const turn = turnOf();
+    if (!turn) return { failure: 'edit_message_missing' };
+    const nonce = crypto.randomUUID();
+    const marked = await new Promise(resolve => {
+      const finish = value => { clearTimeout(timer); window.removeEventListener('message', receive); resolve(value); };
+      const receive = event => {
+        const data = event.data;
+        if (event.source === window && event.origin === location.origin && data?.source === 'clf-edit-reply' && data.nonce === nonce && data.v === 1) finish(data.marked);
+      };
+      const timer = setTimeout(() => finish(0), 1500);
+      window.addEventListener('message', receive);
+      window.postMessage({ source: 'clf-edit-ask', nonce, messageId }, location.origin);
+    });
+    const control = [...turn.querySelectorAll('button')].filter(button => button.getAttribute('data-clf-edit') === nonce);
+    if (marked !== 1 || control.length !== 1 || !isCurrent()) return { failure: 'edit_unavailable' };
+    control[0].removeAttribute('data-clf-edit');
+    control[0].click();
+    const opened = await until(() => {
+      const editors = [...turn.querySelectorAll('.ProseMirror[contenteditable="true"]')].filter(node => shown(node) && node.closest('form'));
+      if (editors.length !== 1) return null;
+      const form = editors[0].closest('form');
+      const submits = [...form.querySelectorAll('button[type="submit"]')].filter(shown);
+      const cancels = [...form.querySelectorAll('button[type="button"]')].filter(shown);
+      return submits.length === 1 && cancels.length === 1 ? { editor: editors[0], form, submit: submits[0], cancel: cancels[0] } : null;
+    });
+    if (!opened) return { failure: 'edit_unavailable' };
+    return {
+      editor: opened.editor,
+      /** The editor is still the one opened here, in the same turn. */
+      current: () => opened.editor.isConnected && turn.isConnected && opened.form.contains(opened.editor) && isCurrent(),
+      write: (value, failure = () => undefined) => insertIntoEditor(opened.editor, value, true, failure,
+        box => box === opened.editor && opened.form.contains(box)),
+      submit: () => { if (!opened.submit.isConnected || opened.submit.disabled) return false; opened.submit.click(); return true; },
+      // Closing without sending restores the question as it was; a closed editor needs nothing.
+      cancel: () => { if (opened.cancel.isConnected) opened.cancel.click(); }
+    };
+  }
+
   const normalizeModelLabel = value => String(value || '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}.]/gu, '');
   /** One bounded read through the existing MAIN-world helper; no provider API or setters. */
   function readPickerState() {
@@ -2890,6 +3139,25 @@ var CLF_DOM = (() => {
     });
   }
   /** UI only transports a requested selection. Provider state proves identity and availability. */
+  /**
+   * Which of ChatGPT's controls this page still has, for the diagnostics report (2026-10-15):
+   * after ChatGPT changes its page, a report says what the extension no longer finds. Booleans
+   * and the page's language tag only, never text from the page.
+   */
+  function pageChecks() {
+    return safe(() => {
+      const language = document.documentElement.getAttribute('lang') || '';
+      return {
+        composer: Boolean(composer()),
+        sendArea: Boolean(composerActions()),
+        modelMenu: Boolean(modelPickerTrigger()),
+        // The October 2026 composer marks it only as its add-context navigation target.
+        plusMenu: Boolean(document.querySelector('[data-composer-navigation-target="add-context"],#composer-plus-btn,[data-testid="composer-plus-btn"]')),
+        language: /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(language) ? language : null
+      };
+    }, { composer: false, sendArea: false, modelMenu: false, plusMenu: false, language: null });
+  }
+
   function modelPickerTrigger() {
     const reported = '[data-codex-intelligence-trigger],[data-composer-navigation-target="reasoning"]';
     const candidates = [...new Set([...(composer()?.closest('form')?.querySelectorAll('button[aria-haspopup="menu"]') || []),
@@ -3104,6 +3372,15 @@ var CLF_DOM = (() => {
   }
   async function selectModelSettings(model, effort, stillCurrent = () => true) {
     if (!model && !effort) return true;
+    // The page's own picker state, read without opening anything. A worker tab opens with its model
+    // in the address and ChatGPT applies it; opening the picker only to prove that left its closing
+    // animation unfinished in a hidden, throttled tab, its focus scope hid the composer, and every
+    // worker failed "after model selection" (#1086). The same account-evaluated proof as below.
+    if (!document.querySelector(PICKER)) {
+      const passive = await readPickerState();
+      const now = passive?.choices.find(choice => choice.bucket === passive.currentBucket);
+      if (now?.available && (!model || now.id === model || now.familyId === model) && (!effort || now.effort === effort)) return stillCurrent();
+    }
     const ui = modelPickerAccess(stillCurrent), original = await ui.open();
     if (!original) { await ui.close(); return false; }
     // Account-evaluated exact selection is already proof; visiting unrelated
@@ -3405,6 +3682,7 @@ var CLF_DOM = (() => {
     turnIdOf,
     messageIdOf,
     composerAuthoredText,
+    pageChecks,
     userPromptText,
     userMessageReaction,
     presentUserPrompts,
@@ -3413,6 +3691,8 @@ var CLF_DOM = (() => {
     prepareChatModelSurface,
     modelPickerReadable,
     newChatControl,
+    branchInNewChat,
+    openQuestionEdit,
     projectCreateControl,
     projectCreateForm,
     revealSidebar,
@@ -3477,10 +3757,13 @@ var CLF_DOM = (() => {
     turns,
     presentationTurns,
     messages,
+    firstQuestionPending,
     messagesIn,
     sectionSignature,
     generating,
     approvalWaiting,
+    approvalCard,
+    answerApprovalCard,
     stopButton,
     stopGeneration,
     sendButton,

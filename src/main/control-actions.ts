@@ -1,7 +1,14 @@
 import { z } from 'zod';
-import type { ControlApiCancelResult, ControlApiSendResult } from '../shared/control-api.js';
+import { serveWorkerAction } from './control-workers.js';
+import { resolveChatModel } from '../shared/chat-models.js';
+import type { ControlApiCancelResult, ControlApiSendResult, ControlApiStopResult } from '../shared/control-api.js';
+import { REASONING_EFFORTS } from '../shared/session.js';
+import type { ReasoningEffort } from '../shared/session.js';
+import { getChatModels } from './chat-models.js';
+import { stopSessionTurn } from './bridge.js';
+import type { SessionControlsView } from './bridge.js';
 import { getConfig } from './config.js';
-import { projectInput, RequestError } from './control-reads.js';
+import { projectInput, projectLive, RequestError } from './control-reads.js';
 import { logInfo } from './logger.js';
 import { deliveryProof, listInputs, sessionInputPolicy } from './session/input.js';
 import type { InputArgs, InputEntry } from './session/input.js';
@@ -11,10 +18,12 @@ import { cancelDesktopInput, sendDesktopInput } from './session/start-input.js';
 
 /**
  * The action routes of the local control API: send a message to an existing chat or start a new
- * chat with it, and cancel one that has not been handed over.
+ * chat with it, cancel one that has not been handed over, stop the answer a chat is writing, or
+ * delegate to the existing worker broker.
  *
  * There is no new send path. A message goes through `sendDesktopInput`, the same entry the
- * composer uses, and is cancelled through `cancelDesktopInput`; the outbox stays the only owner
+ * composer uses, and is cancelled through `cancelDesktopInput`. Stop goes through
+ * `stopSessionTurn`, the same entry as the app's Stop button. The outbox stays the only owner
  * of what was admitted, what was delivered and what is unknown. The caller's UUID is the outbox
  * id, so repeating it returns the row that already exists instead of sending again. What a row
  * proves about delivery comes from `deliveryProof`, never from time, text or a turn range, and a
@@ -45,18 +54,27 @@ const sendBody = z
     projectId: lowerUuid.optional(),
     text: z.string().max(MAX_TEXT).refine((value) => value.trim().length > 0, 'text is empty'),
     // Consent to a send that would stop the answer ChatGPT is writing right now.
-    interrupt: z.boolean().optional()
+    interrupt: z.boolean().optional(),
+    // A model and one of its thinking levels from GET /v1/models, always together, as the composer sends them.
+    model: z.string().min(1).max(80).optional(),
+    reasoningEffort: z.enum(REASONING_EFFORTS).optional()
   })
   .strict()
-  .refine((body) => body.sessionId === undefined || body.projectId === undefined, { path: ['projectId'], message: 'a project belongs to a new chat' });
+  .refine((body) => body.sessionId === undefined || body.projectId === undefined, { path: ['projectId'], message: 'a project belongs to a new chat' })
+  .refine((body) => (body.model === undefined) === (body.reasoningEffort === undefined), { path: ['reasoningEffort'], message: 'model and reasoningEffort go together' });
 
 const cancelBody = z.object({}).strict();
 
+// Stop names the exact answer it ends (`live.activeTurnId`), so a late request never stops a newer one.
+const stopBody = z.object({ turnId: z.string().min(1).max(256) }).strict();
+
 const CANCEL_ROUTE = /^\/v1\/inputs\/([0-9a-f-]{36})\/cancel$/;
+const STOP_ROUTE = /^\/v1\/sessions\/([0-9a-z-]{8,64})\/stop$/;
 
 /** Every path an action can arrive on, whatever the id, so one gate can refuse them all alike. */
 export function isActionPath(route: string): boolean {
-  return route === '/v1/inputs' || /^\/v1\/inputs\/[^/]+\/cancel$/.test(route);
+  return route === '/v1/inputs' || /^\/v1\/inputs\/[^/]+\/cancel$/.test(route) || /^\/v1\/workers\/[^/]+\/(spawn|message|ack)$/.test(route) ||
+    /^\/v1\/sessions\/[^/]+\/stop$/.test(route);
 }
 
 export interface ActionReply {
@@ -97,16 +115,34 @@ async function controllable(sessionId: string | null): Promise<void> {
   if (origin === 'worker' || origin === 'helper') throw new RequestError(409, 'session_not_controllable');
 }
 
+/**
+ * The catalog id and a thinking level it offers, checked against the models the app last read from
+ * ChatGPT's picker, exactly as the composer only offers those. Without them ChatGPT keeps its own selection.
+ */
+function chosenModel(model: string | undefined, effort: ReasoningEffort | undefined): { model: string | null; reasoningEffort: ReasoningEffort | null } {
+  if (model === undefined || effort === undefined) return { model: null, reasoningEffort: null };
+  const catalog = getChatModels();
+  if (catalog.state !== 'ready' || !catalog.models.length) {
+    throw new RequestError(409, 'models_unknown', "the app has not read this account's models yet; refresh them in the app");
+  }
+  const choice = resolveChatModel(catalog.models, model);
+  if (!choice) throw new RequestError(409, 'model_unknown', 'GET /v1/models lists the models this account offers');
+  if (!choice.efforts.includes(effort)) throw new RequestError(409, 'effort_unavailable', choice.id + ' offers ' + choice.efforts.join(', '));
+  return { model: choice.id, reasoningEffort: effort };
+}
+
 async function send(rawBody: unknown): Promise<ActionReply> {
   const body = parse(sendBody, rawBody);
   const text = body.text.trim();
+  const selection = chosenModel(body.model, body.reasoningEffort);
 
   // A repeated id names the row that already exists. It is answered here because the outbox
   // compares the whole request, `dueAt` included, and a retry a moment later would not match.
   const existing = await find(body.id);
   if (existing) {
     // A new chat's first message is filed under its own id.
-    if (existing.purpose === 'decision' || existing.sessionId !== (body.sessionId ?? body.id) || existing.text !== text) {
+    if (existing.purpose === 'decision' || existing.sessionId !== (body.sessionId ?? body.id) || existing.text !== text ||
+        existing.model !== selection.model || existing.reasoningEffort !== selection.reasoningEffort) {
       throw new RequestError(409, 'id_conflict', 'this id belongs to a different message');
     }
     const replay: ControlApiSendResult = { input: projectInput(existing), replayed: true };
@@ -137,8 +173,7 @@ async function send(rawBody: unknown): Promise<ActionReply> {
     text,
     mode: 'auto',
     dueAt: Date.now(),
-    model: null,
-    reasoningEffort: null,
+    ...selection,
     authoredSource: 'text'
   };
   // The switch can flip while the lookups above run; this is the last point before the outbox.
@@ -204,11 +239,39 @@ async function cancel(id: string, rawBody: unknown): Promise<ActionReply> {
   return { status: 200, body: done };
 }
 
+async function stop(sessionId: string, rawBody: unknown): Promise<ActionReply> {
+  const body = parse(stopBody, rawBody);
+  const session = await readSession(sessionId);
+  if (!session) throw new RequestError(404, 'session_not_found');
+  await controllable(sessionId);
+  if (!session.conversationId) throw new RequestError(409, 'no_chat', 'this session has no ChatGPT chat to stop');
+  if (!actionsAllowed()) throw new RequestError(403, 'actions_disabled');
+  let controls: SessionControlsView;
+  try {
+    controls = await stopSessionTurn(sessionId, body.turnId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '';
+    if (message === 'active_turn_changed') throw new RequestError(409, 'turn_not_running', 'the answer this turnId names is not running');
+    if (message === 'conversation_superseded' || message === 'conversation_changed') throw new RequestError(409, 'no_chat', 'this session moved to another chat');
+    throw error;
+  }
+  logInfo('control API: stop requested for session ' + sessionId + ', turn ' + body.turnId);
+  // Requested, not done: the browser presses Stop, and the recorded `turn_end` is the proof.
+  const reply: ControlApiStopResult = { live: projectLive(controls) };
+  return { status: 202, body: reply };
+}
+
 /** Undefined when the method and path are not an action. */
 export async function serveAction(method: string, route: string, body: unknown): Promise<ActionReply | undefined> {
   if (method !== 'POST') return undefined;
+  const worker = await serveWorkerAction(method, route, body, () => {
+    if (!actionsAllowed()) throw new RequestError(403, 'actions_disabled');
+  });
+  if (worker) return worker;
   if (route === '/v1/inputs') return send(body);
   const match = CANCEL_ROUTE.exec(route);
   if (match) return cancel(match[1]!, body);
+  const stopMatch = STOP_ROUTE.exec(route);
+  if (stopMatch) return stop(stopMatch[1]!, body);
   return undefined;
 }
