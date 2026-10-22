@@ -1048,6 +1048,20 @@ function materializeStages(current: InputEntry[], entry: InputEntry): InputEntry
   });
   return next;
 }
+/**
+ * Exact delivery receipt lookup for a pending Director instruction.
+ * The candidate id originates only at the explicit desktop UI boundary.
+ */
+export function inputDeliveryReceipt(sessionId: string, inputId: string): Promise<number | null> {
+  return serial(async () => {
+    const row = (await load()).find(entry => entry.id === inputId);
+    if (!row || row.purpose === 'decision' || row.authoredSource === 'none' || !manualInput(row) ||
+        (row.sessionId !== sessionId && row.deliveredSessionId !== sessionId) ||
+        deliveryProof(row) !== 'sent' || !Number.isFinite(row.deliveredAt)) return null;
+    return row.deliveredAt ?? null;
+  });
+}
+
 export function listInputs(): Promise<InputEntry[]> {
   return serial(async () => {
     const current = await retireRemovedSessionReceipts(await load(), true);
