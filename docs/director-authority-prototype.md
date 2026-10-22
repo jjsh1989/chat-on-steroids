@@ -1,5 +1,7 @@
 # Director authority prototype on current upstream
 
+Validation base: stable tag `v2.1.45`.
+
 Base: upstream `main` at `8ea2c3b16c23267945dd74ea72e6c60c00876cfb` (2026-10-22), at the stable 2.1.45 release, including Chat groups, persistent drafts, bookmarks, improved Compact & Resume and current message-delivery recovery.
 
 ## Invariant
