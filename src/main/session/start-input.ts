@@ -4,6 +4,8 @@ import { startBridge } from '../bridge.js';
 import { wakeBrowserUrl, resetBrowserStartupForTests } from '../browser-startup.js';
 import { getConfig } from '../config.js';
 import { enqueueInput, cancelInput, listInputs, noteInputStartupError, type InputArgs, type InputEntry } from './input.js';
+import { manualInput } from '../../shared/input.js';
+import { noteDirectorInstruction } from './director-authority.js';
 
 function wakeBrowser(entry: InputEntry, retry = false): Promise<void> {
   const marker = `cos-input=${encodeURIComponent(entry.id)}`;
@@ -90,6 +92,17 @@ export async function sendDesktopInput(input: InputArgs): Promise<InputEntry> {
     if (starting.get(input.id) === controller) starting.delete(input.id);
     throw error;
   }
+}
+/**
+ * Explicit renderer-authored send boundary. The Local control API keeps using sendDesktopInput()
+ * directly, so automation can create or steer chats without minting human Director authority.
+ */
+export async function sendUserDesktopInput(input: InputArgs): Promise<InputEntry> {
+  const entry = await sendDesktopInput(input);
+  if (entry.sessionId && manualInput(entry) && entry.authoredSource !== 'none') {
+    noteDirectorInstruction(entry.sessionId, entry.id, entry.createdAt);
+  }
+  return entry;
 }
 export function stopInputStartup(): void {
   stopped = true;
