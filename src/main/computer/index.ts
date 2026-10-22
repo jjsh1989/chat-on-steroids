@@ -20,9 +20,10 @@ import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { Worker } from 'node:worker_threads';
 import { ensureUsablePath, normalizeEnvironment } from '../env.js';
-import { findWindowsPowerShell, terminateProcessTree } from '../exec.js';
+import { findWindowsPowerShell, terminateProcess, terminateProcessTree } from '../exec.js';
 import { logInfo, logWarn } from '../logger.js';
 import type { MacOSDesktopAccessStatus, MacOSPermissionState } from '../../shared/types.js';
+import { noteMacOSGrants } from './macos-grants.js';
 import { HELPER_SCRIPT } from './helper.js';
 
 /** Width the screenshot is scaled down to, matching computer-use convention. */
@@ -325,7 +326,12 @@ function retireHelper(runtime: HelperRuntime): Promise<void> {
   const task = (async () => {
     if (runtime.child.exitCode === null && runtime.child.pid !== undefined) {
       const closed = new Promise<void>((resolve) => runtime.child.once('close', () => resolve()));
-      await terminateProcessTree(runtime.child.pid);
+      // On Windows every app launch_app started is this helper's child, and taskkill /T would
+      // close those apps (and their unsaved work) with it. The helper starts nothing of its own.
+      if (process.platform === 'win32') {
+        logInfo(`desktop helper ${runtime.child.pid} retired alone: apps it launched keep running`);
+        await terminateProcess(runtime.child.pid);
+      } else await terminateProcessTree(runtime.child.pid);
       await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 2_000))]);
     }
     await cleanupHelperScript(runtime);
@@ -381,6 +387,8 @@ async function startHelper(): Promise<HelperRuntime> {
           args = [];
         } else {
           host = findWindowsPowerShell() ?? 'powershell.exe';
+          // The helper leaves this app's own windows out of every lookup, as on macOS.
+          env.COS_APP_PID = String(process.pid);
           args = ['-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-File', scriptFile!];
         }
         const child = spawn(host, args, {
@@ -440,6 +448,12 @@ async function startHelper(): Promise<HelperRuntime> {
               continue;
             }
             const reply = parsed as Record<string, any>;
+            // The Windows helper says when a window came forward only on its second attempt.
+            if (Array.isArray(reply['focusNotes'])) {
+              for (const note of reply['focusNotes'].slice(0, 4)) {
+                if (typeof note === 'string') logInfo(`desktop focus: ${note.slice(0, 200)}`);
+              }
+            }
             runtime.ready = true;
             clearTimeout(pending.timer);
             runtime.pending = null;
@@ -1015,7 +1029,7 @@ async function findUiLocked(
     let imageBounds: Rect | null = null;
     let imageCenter: { x: number; y: number } | null = null;
     if (
-      frame &&
+      frame && bounds.width > 0 && bounds.height > 0 &&
       // A screen fallback can contain an occluding application's pixels even though the
       // semantic tree belongs to the requested window. Keep refs and desktop bounds, but
       // do not claim those controls occupy pixels the screenshot may not show.
@@ -1070,6 +1084,8 @@ async function findUiLocked(
 
 export async function getWindowState(opts: {
   window?: number;
+  query?: string;
+  role?: string;
   maxWidth?: number;
   maxElements?: number;
   includeScreenshot?: boolean;
@@ -1081,6 +1097,7 @@ export async function getWindowState(opts: {
   screenshot: Screenshot | null;
   elements: UiElementInfo[];
   uiUnavailable: { code: string; message: string } | null;
+  screenshotUnavailable?: { code: string; message: string };
   uiTruncated?: boolean;
   accessibility?: AccessibilityContext;
   related?: Array<{ window: WindowInfo; screenshot: Screenshot | null; error?: string }>;
@@ -1100,6 +1117,8 @@ export async function getWindowState(opts: {
         ...(opts.window === undefined ? {} : { id: opts.window }),
         includeScreenshot,
         includeUi,
+        ...(opts.query === undefined ? {} : { query: opts.query }),
+        ...(opts.role === undefined ? {} : { role: opts.role }),
         includeRelated: process.platform === 'win32' && opts.includeRelated === true,
         maxWidth: limit,
         maxResults: Math.min(100, Math.max(1, Math.floor(opts.maxElements ?? 60))),
@@ -1108,7 +1127,10 @@ export async function getWindowState(opts: {
       const value = reply['window'];
       const window = value && typeof value === 'object' ? (value as WindowInfo) : null;
       if (!window) throw new ComputerError('WINDOW_NOT_FOUND: no matching visible window is available');
-      const shot = file ? await screenshotFromReply(reply, file, window.id) : null;
+      const pixelFailure = reply['screenshotUnavailable'] as Record<string, unknown> | undefined;
+      const screenshotUnavailable = includeScreenshot && includeUi && pixelFailure?.code === 'CAPTURE_FAILED' && typeof pixelFailure.message === 'string'
+        ? { code: 'CAPTURE_FAILED', message: pixelFailure.message.slice(0, 500) } : undefined;
+      const shot = file && !screenshotUnavailable ? await screenshotFromReply(reply, file, window.id) : null;
       const frame = shot ? frameById(shot.frameId) : null;
       const unavailableValue = reply['uiUnavailable'];
       const uiUnavailable =
@@ -1122,7 +1144,7 @@ export async function getWindowState(opts: {
         ? await findUiLocked({ window: window.id, maxResults: opts.maxElements ?? 60 }, frame, reply)
         : { window: window.id, snapshotId: null, elements: [] as UiElementInfo[], accessibility: undefined };
       const related: Array<{ window: WindowInfo; screenshot: Screenshot | null; error?: string }> = [];
-      if (process.platform === 'win32' && opts.includeRelated && Array.isArray(reply['relatedWindows'])) {
+      if (process.platform === 'win32' && opts.includeRelated && !screenshotUnavailable && Array.isArray(reply['relatedWindows'])) {
         for (const relatedWindow of (reply['relatedWindows'] as WindowInfo[]).slice(0, 3)) {
           if (!Number.isSafeInteger(relatedWindow.id) || relatedWindow.id <= 0 || relatedWindow.id === window.id) continue;
           try {
@@ -1144,6 +1166,7 @@ export async function getWindowState(opts: {
         screenshot: shot,
         elements: found.elements,
         uiUnavailable,
+        ...(screenshotUnavailable ? { screenshotUnavailable } : {}),
         ...(includeUi && uiUnavailable === null && typeof reply['truncated'] === 'boolean' ? { uiTruncated: reply['truncated'] } : {}),
         ...(found.accessibility ? { accessibility: found.accessibility } : {}),
         ...(related.length > 0 ? { related } : {})
@@ -1956,18 +1979,6 @@ async function electronClipboard(): Promise<Pick<Electron.Clipboard, 'readText' 
   }
 }
 
-/** Confirms the helper can run at all, so the UI can say so before ChatGPT tries. */
-export async function checkAvailable(): Promise<string | null> {
-  try {
-    await listWindows();
-    return null;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logWarn(`computer use unavailable: ${message}`);
-    return message;
-  }
-}
-
 /**
  * Starts and initializes the helper off the first tool call's critical path.
  *
@@ -2003,6 +2014,8 @@ export async function refreshMacOSDesktopAccess(
       checkedAt: Date.now(),
       error: null
     };
+    try { status.grantedBefore = await noteMacOSGrants(status); }
+    catch { /* Without the memory the status still says what is missing, only not why. */ }
     if (generation === macOSDesktopAccessRefreshGeneration) publishMacOSDesktopAccess(status);
     return generation === macOSDesktopAccessRefreshGeneration ? status : macOSDesktopAccess;
   } catch (err) {

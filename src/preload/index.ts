@@ -1,3 +1,7 @@
+import type { ChatGroup, ChatGroupsState } from '../shared/chat-groups.js';
+import type { WorkspaceTerminalEvent, WorkspaceTerminalInfo } from '../shared/workspace-terminal.js';
+import type { ApprovalCardView } from '../shared/approval-wait.js';
+import type { DictationEvent } from '../shared/dictation.js';
 import type { ChatModelCatalog } from '../shared/chat-models.js';
 import type { GoalModel } from '../shared/goal-reasoning.js';
 import type { TaskProgress } from '../shared/task-progress.js';
@@ -5,9 +9,16 @@ import type { BrowserPreferences } from '../shared/browser-preferences.js';
 import type { SessionControlsView } from '../main/bridge.js';
 import type { InputAttachment } from '../shared/input.js';
 import type { UsageOverview } from '../shared/usage.js';
+import type { ProviderUsage } from '../shared/provider-usage.js';
 import type { InputArgs, InputEntry } from '../main/session/input.js';
-import type { LocalProject } from '../shared/projects.js';
-import type { SkillSummary } from '../shared/skills.js';
+import type { LocalProject, ProjectColor } from '../shared/projects.js';
+import type { ProjectDirectoryListing, ProjectFileMutationResult, ProjectFilePreview, ProjectFileSaveResult, ProjectFilesChanged } from '../shared/project-files.js';
+import type { ProjectGitChanged, ProjectGitDiff, ProjectGitSnapshot } from '../shared/project-git.js';
+import type { PetLibraryState, PetOverlayControlState, PetRuntimeAsset } from '../shared/pets.js';
+import type { SkillSummary, ManagedSkill, GitHubSkillUpdateCheck, SkillLibrary, SkillsDraftScope } from '../shared/skills.js';
+import type { RunningToolActivity, SessionChange, SessionSearchReply, SessionSearchLocation, SessionBookmark, ToolEditReview } from '../shared/session.js';
+import type { TurnTrace } from '../shared/turn-trace.js';
+import type { RunningExecProcess } from '../shared/background-exec.js';
 import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '../shared/plugins.js';
 /**
  * The entire renderer-facing API.
@@ -18,7 +29,7 @@ import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '..
  */
 
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { AppState, Capabilities, Config, Diagnosis, LogEntry } from '../shared/types.js';
+import type { AppState, Capabilities, CompanionDiagnostics, Config, Diagnosis, LogEntry } from '../shared/types.js';
 import type {
   Handoff,
   ImageStorageClearMode,
@@ -27,6 +38,8 @@ import type {
   SessionEvent,
   SessionSummary,
   ClearAgentResult,
+  WorkerWorktreeCleanupOffer,
+  WorkerWorktreeCleanupResult,
   SwarmState,
   TokenPressure
 } from '../shared/session.js';
@@ -39,6 +52,7 @@ const call = <T>(channel: string, payload?: unknown): Promise<Reply<T>> =>
 export interface SettingsPatch {
   capabilities: Capabilities;
   readOnly: boolean;
+  commandAllowlist: Config['commandAllowlist'];
   tunnel: Config['tunnel'];
   ui: Config['ui'];
   sessions: Config['sessions'];
@@ -46,6 +60,10 @@ export interface SettingsPatch {
   multiAgent: Config['multiAgent'];
   goal: Config['goal'];
   mcp: Config['mcp'];
+  /** Optional so callers that save other sections never have to carry it. */
+  controlApi?: Config['controlApi'];
+  /** This computer's connector name suffix; omitted by callers that do not edit it. */
+  connectorSuffix?: string;
 }
 
 /** One page of the model catalogue, as the model picker asks for it. */
@@ -60,6 +78,16 @@ export interface SessionList {
   activeId: string | null;
   /** ChatGPT conversation ids the user has blocked from using local tools. */
   blocked: string[];
+  /** ChatGPT conversation ids whose page shows ChatGPT's tool approval card, waiting for the user. */
+  approval: string[];
+  /**
+   * ChatGPT conversation ids whose recovery stopped after its last pickup reload while the input,
+   * Continue or Goal/Loop step it was collecting is still owed: the user has to act. The same chats
+   * whose `SessionControlsView.recovery` holds a `pickup-stopped` countdown.
+   */
+  recoveryStopped: string[];
+  /** ChatGPT conversation ids explicitly trusted for strict allowlisting. */
+  trusted?: string[];
   pressure: Array<TokenPressure & { id: string }>;
   /** Total retained sessions, not merely the current IPC page. */
   total: number;
@@ -80,6 +108,26 @@ export interface SessionDetail {
 }
 
 const api = {
+  /** System.Speech is available only through Windows PowerShell. */
+  dictationSupported: process.platform === 'win32',
+  /** Start microphone access only on explicit user action; audio stays in Windows recognizer. */
+  startDictation: () => call<{ status: 'starting' }>('dictation:start'),
+  stopDictation: () => call<void>('dictation:stop'),
+  onDictationEvent: (listener: (event: DictationEvent) => void): (() => void) => {
+    const wrapped = (_event: unknown, value: DictationEvent): void => listener(value);
+    ipcRenderer.on('dictation:event', wrapped);
+    return () => ipcRenderer.removeListener('dictation:event', wrapped);
+  },
+  terminalCreate: (id: string, projectId: string | null, cols: number, rows: number) => call<WorkspaceTerminalInfo>('workspaceTerminal:request', { action: 'create', id, projectId, cols, rows }),
+  terminalWrite: (id: string, data: string) => call<void>('workspaceTerminal:request', { action: 'write', id, data }),
+  terminalResize: (id: string, cols: number, rows: number) => call<void>('workspaceTerminal:request', { action: 'resize', id, cols, rows }),
+  terminalAck: (id: string, count: number) => call<void>('workspaceTerminal:request', { action: 'ack', id, count }),
+  terminalClose: (id: string) => call<void>('workspaceTerminal:request', { action: 'close', id }),
+  onTerminalEvent: (listener: (event: WorkspaceTerminalEvent) => void): (() => void) => {
+    const wrapped = (_event: unknown, value: WorkspaceTerminalEvent): void => listener(value);
+    ipcRenderer.on('workspaceTerminal:event', wrapped);
+    return () => ipcRenderer.removeListener('workspaceTerminal:event', wrapped);
+  },
   openLegalNotices: () => call<void>('plugins:legalNotices'),
   pluginsSnapshot: () => call<PluginSnapshot>('plugins:snapshot'),
   pluginsInstall: (request: PluginInstallRequest) => call<PluginSnapshot>('plugins:install', request),
@@ -98,23 +146,97 @@ const api = {
     return () => ipcRenderer.removeListener('plugins:changed', wrapped);
   },
   chooseFiles: () => call<InputAttachment[]>('sessions:files'),
+  chatGroups: () => call<ChatGroupsState>('chatGroups:get'),
+  createChatGroup: (projectId: string, name: string) => call<{ group: ChatGroup; state: ChatGroupsState }>('chatGroups:create', { projectId, name }),
+  renameChatGroup: (id: string, name: string) => call<ChatGroupsState>('chatGroups:rename', { id, name }),
+  deleteChatGroup: (id: string) => call<ChatGroupsState>('chatGroups:delete', { id }),
+  assignChatGroup: (sessionId: string, groupId: string | null) => call<ChatGroupsState>('chatGroups:assign', { sessionId, groupId }),
+  petsList: () => call<PetLibraryState>('pets:list'),
+  petsOverlayState: () => call<PetOverlayControlState>('pets:overlayState'),
+  petsSetOverlayVisible: (visible: boolean) => call<PetOverlayControlState>('pets:overlayVisible', { visible }),
+  /** The selected language's texts for the stopped-chat desktop notices (#855). */
+  setStopNoticeTexts: (texts: Record<string, string>) => call<void>('ui:stopNoticeTexts', texts),
+  setMainTexts: (texts: Record<string, string>) => call<void>('ui:mainTexts', texts),
+  /** The interface language, kept by the app for the browser extension. */
+  setUiLanguage: (language: string) => call<void>('ui:language', language),
+  markWhatsNewSeen: () => call<void>('ui:whatsNewSeen'),
+  /** The one-time automatic plugin refresh offer: true turns it on; either answer is kept. */
+  answerPluginRefreshOffer: (turnOn: boolean) => call<AppState>('pluginRefresh:offer', { turnOn }),
+  petsImport: () => call<PetLibraryState | null>('pets:import'),
+  petsSetEnabled: (id: string, enabled: boolean) => call<PetLibraryState>('pets:enabled', { id, enabled }),
+  petsSetFavorite: (id: string, favorite: boolean) => call<PetLibraryState>('pets:favorite', { id, favorite }),
+  petsDelete: (id: string) => call<PetLibraryState>('pets:delete', { id }),
+  petsAsset: (id: string, preview = false) => call<PetRuntimeAsset>('pets:asset', { id, preview }),
+  onPetOverlayStateChanged: (listener: (state: PetOverlayControlState) => void): (() => void) => {
+    const wrapped = (_event: unknown, state: PetOverlayControlState): void => listener(state);
+    ipcRenderer.on('pet-overlay:stateChanged', wrapped);
+    return () => ipcRenderer.removeListener('pet-overlay:stateChanged', wrapped);
+  },
+  /** True right before a Keychain read that may wait on the macOS password prompt; false once it settled. */
+  onKeychainWaiting: (listener: (waiting: boolean) => void): (() => void) => {
+    const wrapped = (_event: unknown, waiting: boolean): void => listener(waiting === true);
+    ipcRenderer.on('keychain:waiting', wrapped);
+    return () => ipcRenderer.removeListener('keychain:waiting', wrapped);
+  },
+  keychainNoticeReady: () => call<void>('keychain:noticeReady'),
+  onPetOverlayOpenOwner: (listener: (screen: 'chat' | 'pets') => void): (() => void) => {
+    const wrapped = (_event: unknown, screen: 'chat' | 'pets'): void => listener(screen);
+    ipcRenderer.on('pet-overlay:openOwner', wrapped);
+    return () => ipcRenderer.removeListener('pet-overlay:openOwner', wrapped);
+  },
   listSkills: () => call<SkillSummary[]>('skills:list'),
-  importSkill: () => call<SkillSummary | null>('skills:import'),
+  listManagedSkills: () => call<ManagedSkill[]>('skills:managed'),
+  listRecommendedSkills: () => call<Array<{ id: string; name: string; description: string; installed: boolean }>>('skills:recommended'),
+  installRecommendedSkill: (id: string) => call<ManagedSkill[]>('skills:installRecommended', { id }),
+  skillsImport: (kind: 'folder' | 'file') => call<ManagedSkill[] | null>('skills:import', { kind }),
+  skillsImportGithub: (url: string) => call<ManagedSkill[]>('skills:githubImport', { url }),
+  skillsLinkGithub: (id: string, url: string) => call<ManagedSkill[]>('skills:githubLink', { id, url }),
+  skillsCheckGithub: (id: string) => call<GitHubSkillUpdateCheck[]>('skills:githubCheck', { id }),
+  skillsUpdateGithub: (id: string) => call<{ status: 'current' | 'updated'; skills: ManagedSkill[]; warning?: string }>('skills:githubUpdate', { id }),
+  skillsRemove: (id: string) => call<ManagedSkill[]>('skills:remove', { id }),
+  skillLibrary: (scope: SkillsDraftScope) => call<SkillLibrary>('skills:library', scope),
   dropFiles: async (files: File[]): Promise<Reply<InputAttachment[]>> => {
     if (!files.length || files.length > 20) return { ok: false, error: 'Attach up to 20 files per message' };
     try {
-      const sources = [];
-      for (const file of files) {
+      const staged: Array<InputAttachment | undefined> = new Array(files.length);
+      const paths: Array<{ index: number; path: string }> = [];
+      const memory: Array<{ index: number; file: File }> = [];
+      for (const [index, file] of files.entries()) {
         const path = webUtils.getPathForFile(file);
         if (!path && file.size > 12 * 1024 * 1024) return { ok: false, error: 'Pasted images must be 12 MB or smaller' };
-        sources.push(path || { name: file.name, bytes: new Uint8Array(await file.arrayBuffer()) });
+        if (path) paths.push({ index, path });
+        else memory.push({ index, file });
       }
-      return await call<InputAttachment[]>('sessions:dropFiles', { files: sources });
+      // Native disk drops carry only paths. Pathless clipboard/paste files have to materialize
+      // bytes in the sandboxed preload; send those one at a time so their ArrayBuffers and IPC
+      // copies do not all coexist in memory while preserving the original file order.
+      if (paths.length) {
+        const reply = await call<InputAttachment[]>('sessions:dropFiles', { files: paths.map(entry => entry.path) });
+        if (!reply.ok) return reply;
+        if (reply.data.length !== paths.length) return { ok: false, error: 'Could not stage the attachments' };
+        for (const [offset, entry] of paths.entries()) staged[entry.index] = reply.data[offset];
+      }
+      for (const entry of memory) {
+        const bytes = new Uint8Array(await entry.file.arrayBuffer());
+        const reply = await call<InputAttachment[]>('sessions:dropFiles', { files: [{ name: entry.file.name, bytes }] });
+        if (!reply.ok) return reply;
+        if (reply.data.length !== 1) return { ok: false, error: 'Could not stage the attachment' };
+        staged[entry.index] = reply.data[0];
+      }
+      if (staged.some(attachment => !attachment)) return { ok: false, error: 'Could not stage the attachments' };
+      return { ok: true, data: staged as InputAttachment[] };
     } catch { return { ok: false, error: 'Could not read the attachment' }; }
   },
   attachText: (text: string) => call<InputAttachment>('sessions:attachText', { text }),
   getUsage: () => call<UsageOverview>('usage:get'),
+  /** Codex's and Claude Code's usage from their logs here; `fresh` skips the 30-second cache. */
+  getProviderUsage: (fresh = false) => call<ProviderUsage>('usage:providers', { fresh }),
+  /** Saves the Usage page as CSV through a save dialog; `divisor` is the page's token divisor. */
+  exportUsage: (divisor: number) => call<{ saved: false } | { saved: true; name: string }>('usage:export', { divisor }),
   getState: () => call<AppState>('state:get'),
+  resetPluginRefresh: () => call<AppState>('plugin-refresh:reset'),
+  /** Sets an unreadable credentials file aside (kept as a backup) so keys can be saved again. */
+  startFreshCredentials: () => call<{ state: AppState; setAside: boolean }>('credentials:start-fresh'),
   saveSettings: (patch: SettingsPatch, base: SettingsPatch) => call<AppState>('settings:save', { patch, base }),
   addRoot: () => call<AppState>('roots:add'),
   /** A folder dropped on the window; only the preload can learn a dropped File's path. */
@@ -129,39 +251,86 @@ const api = {
   setGoalKey: (value: string) => call<AppState>('secret:set', { value, key: 'openRouterApiKey' }),
   // The same, for a custom provider endpoint. Optional: keyless local servers need nothing stored.
   setCustomProviderKey: (value: string) => call<AppState>('secret:set', { value, key: 'customProviderApiKey' }),
-  listGoalModels: (offset: number) => call<GoalModelPage>('goal:models', { offset }),
+  listGoalModels: (offset: number, query = '') => call<GoalModelPage>('goal:models', { offset, query }),
   pickBinary: () => call<AppState>('binary:pick'),
   connect: () => call<AppState>('connection:connect'),
   disconnect: () => call<AppState>('connection:disconnect'),
   runDiagnostics: () => call<Diagnosis>('diagnostics:run'),
+  saveDiagnosticsReport: () => call<{ saved: false } | { saved: true; name: string }>('diagnostics:saveReport'),
   requestDesktopAccessibility: () => call<AppState>('desktop:requestAccessibility'),
+  repairDesktopAccess: () => call<AppState>('desktop:repairPermissions'),
   getLog: () => call<LogEntry[]>('log:get'),
   getLogText: () => call<string>('log:text'),
   getLogJson: () => call<string>('log:json'),
   writeClipboard: (text: string) => call<boolean>('clipboard:write', { text }),
-  openLink: (url: string) => call<boolean>('link:open', { url }),
+  // A code block's Save: main asks where, in a native dialog, and `name` is only its suggestion.
+  saveCode: (request: { text: string; name: string }) => call<{ done: 'saved'; name: string } | { done: 'cancelled' }>('code:save', request),
+  exportMarkdown: (request: { id: string; scope: 'answer' | 'latest' | 'session'; turnId?: string; messageId?: string; target: 'clipboard' | 'file' }) =>
+    call<{ done: 'copied' } | { done: 'saved'; name: string } | { done: 'cancelled' }>('sessions:exportMarkdown', request),
+  // `external`: the system's own browser even for a page the CoS browser would open.
+  openLink: (url: string, options: { external?: boolean } = {}) => call<boolean>('link:open', { url, ...(options.external ? { external: true } : {}) }),
+  showCosBrowser: () => call<boolean>('cosBrowser:show'),
+  openChatGpt: () => call<boolean>('chatgpt:open'),
+  signOutChatGpt: () => call<boolean>('chatgpt:signOut'),
+  openSetupBrowser: (browser: 'chrome' | 'edge' | 'brave' | 'firefox', page: 'extensions' | 'chatgpt') => call<boolean>('browser:setupOpen', { browser, page }),
   // Applies the update this app has already downloaded and verified: the app quits, the
   // installer runs, and the app comes back as the new version. It takes no argument because
   // there is nothing here to choose - the main process knows what is staged.
   installUpdate: () => call<boolean>('update:install'),
+  /** Check/stage/apply supported updates and request one connector refresh round. May restart. */
+  updateAll: (restartVersion?: string) => call<import('../shared/types.js').UpdateAllResult>('update:all', restartVersion),
+  downloadUpdate: () => call<boolean>('update:download'),
+  /** Settings opened: re-check for an update if the last answer is older than ten minutes. */
+  refreshUpdate: () => call<boolean>('update:refresh'),
 
   // Sessions, compaction and the browser bridge. Everything here is read-only or a
   // named action; there is still no channel that takes a path or a command.
-  listSessions: (options?: { cursor?: SessionListCursor; limit?: number }) =>
+  listSessions: (options?: { cursor?: SessionListCursor; limit?: number; projectId?: string }) =>
     call<SessionList>('sessions:list', options ?? {}),
   listProjects: () => call<LocalProject[]>('projects:list'),
   addProject: () => call<LocalProject | null>('projects:add'),
+  addRemoteProject: (address: string, folder: string) => call<LocalProject>('projects:addRemote', { address, folder }),
+  retryChatgptProject: (id: string) => call<LocalProject | null>('projects:chatgpt-retry', { id }),
   removeProject: (id: string) => call<LocalProject>('projects:remove', { id }),
+  setProjectColor: (id: string, color: ProjectColor | null) => call<LocalProject>('projects:color', { id, color }),
+  listProjectFiles: (projectId: string, directory = '') => call<ProjectDirectoryListing>('projectFiles:list', { projectId, directory }),
+  watchProjectFiles: (projectId: string | null, directories: string[]) => call<boolean>('projectFiles:watch', { projectId, directories }),
+  onProjectFilesChanged: (listener: (event: ProjectFilesChanged) => void): (() => void) => {
+    const wrapped = (_event: unknown, change: ProjectFilesChanged): void => listener(change);
+    ipcRenderer.on('projectFiles:changed', wrapped);
+    return () => ipcRenderer.removeListener('projectFiles:changed', wrapped);
+  },
+  previewProjectFile: (projectId: string, path: string) => call<ProjectFilePreview>('projectFiles:preview', { projectId, path }),
+  createProjectFileEntry: (projectId: string, directory: string, name: string, kind: 'file' | 'directory') =>
+    call<ProjectFileMutationResult>('projectFiles:create', { projectId, directory, name, kind }),
+  renameProjectFileEntry: (projectId: string, path: string, name: string) => call<ProjectFileMutationResult>('projectFiles:rename', { projectId, path, name }),
+  saveProjectFile: (projectId: string, path: string, text: string, expectedModifiedAt: string, expectedBytes: number, expectedRevision: string) =>
+    call<ProjectFileSaveResult>('projectFiles:save', { projectId, path, text, expectedModifiedAt, expectedBytes, expectedRevision }),
+  deleteProjectFileEntry: (projectId: string, path: string) => call<boolean>('projectFiles:delete', { projectId, path }),
+  revealProjectFileEntry: (projectId: string, path = '') => call<boolean>('projectFiles:reveal', { projectId, path }),
+  attachProjectFile: (projectId: string, path: string) => call<InputAttachment>('projectFiles:attach', { projectId, path }),
+  getProjectGitSnapshot: (projectId: string, baseRef?: string) => call<ProjectGitSnapshot>('projectGit:snapshot', { projectId, ...(baseRef ? { baseRef } : {}) }),
+  getProjectGitDiff: (projectId: string, path: string, baseRef?: string, expectedRevision?: string) => call<ProjectGitDiff>('projectGit:diff', {
+    projectId, path, ...(baseRef ? { baseRef } : {}), ...(expectedRevision ? { expectedRevision } : {})
+  }),
+  getToolEditReview: (sessionId: string, callId: string, changeIndex: number) =>
+    call<ToolEditReview | null>('sessions:toolEditReview', { sessionId, callId, changeIndex }),
+  onProjectGitChanged: (listener: (event: ProjectGitChanged) => void): (() => void) => {
+    const wrapped = (_event: unknown, change: ProjectGitChanged): void => listener(change);
+    ipcRenderer.on('projectGit:changed', wrapped);
+    return () => ipcRenderer.removeListener('projectGit:changed', wrapped);
+  },
   getSessionImage: (id: string, assetId: string) => call<string | null>('sessions:image', { id, assetId }),
   getImageStorage: () => call<ImageStorageInfo>('sessions:imageStorage'),
   clearImageStorage: (mode: ImageStorageClearMode) => call<ImageStorageClearResult>('sessions:clearImageStorage', { mode }),
-  getSession: (id: string, options?: { from?: number; before?: number; limit?: number }) =>
+    getSession: (id: string, options?: { from?: number; before?: number; after?: number; limit?: number; actions?: boolean }) =>
     call<SessionDetail>('sessions:events', { id, ...options }),
   stopSessionTurn: (id: string, expectedTurnId: string) => call<SessionControlsView>('sessions:stopTurn', { id, expectedTurnId }),
   releaseSessionFinish: (id: string, expectedTurnId: string) => call<SessionControlsView>('sessions:releaseFinish', { id, expectedTurnId }),
   generateFinishGoal: (id: string, expectedTurnId: string) => call<string>('sessions:generateFinishGoal', { id, expectedTurnId }),
   getChatModels: () => call<ChatModelCatalog>('chatModels:get'),
   browserPreferences: (patch: Partial<BrowserPreferences> = {}) => call<BrowserPreferences>('browser:preferences', patch),
+  companionDiagnostics: () => call<CompanionDiagnostics | null>('bridge:diagnostics'),
   requestChatModels: () => call<ChatModelCatalog>('chatModels:request'),
   onToolApprovalNotice: (listener: () => void): (() => void) => {
     const wrapped = (): void => listener();
@@ -174,28 +343,59 @@ const api = {
     return () => ipcRenderer.removeListener('chatModels:changed', wrapped);
   },
   getSessionControls: (id: string) => call<SessionControlsView>('sessions:controls', { id }),
+  cancelRecovery: (id: string) => call<boolean>('sessions:cancelRecovery', { id }),
   setSessionAutomation: (id: string, automation: SessionControlsView['automation'], afterTurn?: boolean) => call<SessionControlsView>('sessions:automation', { id, automation, afterTurn }),
   setSessionObjective: (id: string, text: string, mode: 'goal' | 'loop') => call<SessionControlsView>('sessions:objective', { id, text, mode }),
   compactSession: (id: string) => call<SessionControlsView>('sessions:compact', { id }),
+  resumeFromHandoff: (id: string, handoffId: string) => call<SessionControlsView>('sessions:resumeFromHandoff', { id, handoffId }),
   cancelSessionCompaction: (id: string) => call<SessionControlsView>('sessions:cancelCompaction', { id }),
   draftTaskPlan: (text: string, backend: 'api' | 'chatgpt', requestId?: string) => call<string[]>('sessions:plan', { text, backend, requestId }),
   sendInput: (input: InputArgs) => call<InputEntry>('sessions:send', input),
   retryInputBrowser: (id: string) => call<InputEntry | null>('sessions:retryBrowser', { id }),
   listInputs: () => call<InputEntry[]>('sessions:outbox'),
   listPausedHelpers: () => call<Array<{ id: string; sourceSessionId: string }>>('sessions:pausedHelpers'),
+  runningTools: (conversationIds: string[]) => call<RunningToolActivity[]>('sessions:runningTools', { conversationIds }),
+  turnTraces: (id: string, turnIds: string[]) => call<Record<string, TurnTrace>>('sessions:traces', { id, turnIds }),
+  runningProcesses: (sessionId: string) => call<RunningExecProcess[]>('sessions:runningProcesses', { sessionId }),
+  stopProcess: (sessionId: string, processId: number, incarnation: number) =>
+    call<boolean>('sessions:stopProcess', { sessionId, processId, incarnation }),
+  onBackgroundProcessesChanged: (listener: () => void): (() => void) => {
+    const wrapped = (): void => listener();
+    ipcRenderer.on('sessions:backgroundExecChanged', wrapped);
+    return () => ipcRenderer.removeListener('sessions:backgroundExecChanged', wrapped);
+  },
   retryHelper: (id: string, sourceSessionId: string) => call<boolean>('sessions:retryHelper', { id, sourceSessionId }),
   editQueuedInput: (id: string, text: string, afterTurn?: boolean) => call<boolean>('sessions:editInput', { id, text, afterTurn }),
+  sendQueuedInputNow: (id: string) => call<boolean>('sessions:sendQueuedNow', { id }),
   reorderQueuedInputs: (sessionId: string, ids: string[]) => call<boolean>('sessions:reorderInputs', { sessionId, ids }),
   cancelInput: (id: string) => call<boolean>('sessions:cancelInput', { id }),
   setInputAutomation: (id: string, mode: 'off' | 'goal' | 'loop', loopAfterTurn?: boolean) => call<boolean>('sessions:inputAutomation', { id, mode, loopAfterTurn }),
   setZoom: (factor: number) => call<number>('window:zoom', { factor }),
   getZoom: () => call<number>('window:getZoom'),
   openSessionChat: (id: string) => call<boolean>('sessions:openChat', { id }),
+  /** ChatGPT's tool approval card in this chat's page, as the app may show it (2.1.38). */
+  approvalCard: (id: string) => call<ApprovalCardView | null>('sessions:approvalCard', { id }),
+  /** The person's answer to that exact card; the page presses it only if the card still stands. */
+  answerApproval: (id: string, cardId: string, choice: 'allow' | 'deny') =>
+    call<{ ok: true } | { ok: false; error: string }>('sessions:answerApproval', { id, cardId, choice }),
+  followSessionTab: (id: string) => call<boolean>('sessions:followTab', { id }),
   // Stops a chat this app cannot stop in the page: every tool call it has already been proved
   // to own is refused until it is released. Returns the whole blocked set, so one press
   // repaints without a second read.
   setSessionBlocked: (id: string, blocked: boolean) => call<string[]>('sessions:block', { id, blocked }),
+  setSessionTrusted: (id: string, expectedConversationId: string, trusted: boolean) =>
+    call<string[]>('sessions:trust', { id, expectedConversationId, trusted }),
   deleteSession: (id: string) => call<boolean>('sessions:delete', { id }),
+  /** Chats matching every word of `query`, by title first, then by what was said in them. */
+  searchSessions: (query: string) => call<SessionSearchReply>('sessions:search', { query }),
+  locateSearchMatch: (id: string, query: string) => call<SessionSearchLocation | null>('sessions:locate-match', { id, query }),
+  locateMessage: (id: string, messageId: string) => call<SessionSearchLocation | null>('sessions:locate-message', { id, messageId }),
+  listBookmarks: (id: string) => call<SessionBookmark[]>('sessions:bookmarks', { id }),
+  setBookmark: (id: string, messageId: string, excerpt: string, messageTime: number, on: boolean) =>
+    call<SessionBookmark[]>('sessions:bookmark', { id, messageId, excerpt, messageTime, on }),
+  findInChat: (id: string, query: string) => call<SessionSearchLocation[]>('sessions:find', { id, query }),
+  /** The chat's own name in the app; null clears it and ChatGPT's title shows again. */
+  renameSession: (id: string, title: string | null) => call<boolean>('sessions:rename', { id, title }),
   getHandoff: (id: string, handoffId?: string) => call<Handoff | null>('handoff:get', { id, handoffId }),
 
   unpairExtension: () => call<AppState>('bridge:unpair'),
@@ -211,6 +411,11 @@ const api = {
   // Clearing the prime ends the run; clearing a worker frees that slot. Which of the two
   // happened comes back in the result — the renderer does not decide it.
   clearAgent: (id: string, runId?: string) => call<ClearAgentResult>('swarm:clearAgent', { id, runId }),
+  /** Review only. Scans retained broker-owned checkouts on demand, never at app startup. */
+  listWorktreeCleanupOffers: () => call<WorkerWorktreeCleanupOffer[]>('swarm:worktreeCleanupList'),
+  /** Main process asks the user for explicit approval before discarding checkout files. */
+  removeWorktreeCleanupOffer: (runId: string, agentId: string) =>
+    call<WorkerWorktreeCleanupResult>('swarm:worktreeCleanupRemove', { runId, agentId }),
 
   onStateChanged: (listener: (state: AppState) => void): (() => void) => {
     const wrapped = (_event: unknown, state: AppState): void => listener(state);
@@ -222,8 +427,9 @@ const api = {
     ipcRenderer.on('log:entry', wrapped);
     return () => ipcRenderer.removeListener('log:entry', wrapped);
   },
-  onSessionChanged: (listener: () => void): (() => void) => {
-    const wrapped = (): void => listener();
+  /** `change` names changed transcript owners; without it only catalog/controls changed. */
+  onSessionChanged: (listener: (change?: SessionChange) => void): (() => void) => {
+    const wrapped = (_event: unknown, change?: SessionChange): void => listener(change);
     ipcRenderer.on('session:changed', wrapped);
     return () => ipcRenderer.removeListener('session:changed', wrapped);
   },

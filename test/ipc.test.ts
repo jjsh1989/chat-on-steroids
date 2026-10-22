@@ -8,6 +8,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 
 type Handler = (event: unknown, payload: unknown) => Promise<unknown>;
 const handlers = new Map<string, Handler>();
@@ -19,8 +20,8 @@ vi.mock('electron', () => ({
   },
   BrowserWindow: class {},
   clipboard: { readText: () => '', writeText: () => undefined },
-  dialog: { showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] as string[] })) },
-  shell: { openExternal: vi.fn(async () => undefined), openPath: vi.fn(async () => '') },
+  dialog: { showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] as string[] })), showSaveDialog: vi.fn(async () => ({ canceled: true })), showMessageBox: vi.fn(async () => ({ response: 0 })) },
+  shell: { openExternal: vi.fn(async () => undefined), openPath: vi.fn(async () => ''), showItemInFolder: vi.fn() },
   nativeTheme: { themeSource: 'system' },
   safeStorage: {
     isAsyncEncryptionAvailable: vi.fn(async () => true),
@@ -28,16 +29,20 @@ vi.mock('electron', () => ({
     encryptStringAsync: vi.fn(async (value: string) => Buffer.from(value, 'utf8')),
     decryptStringAsync: vi.fn(async (buffer: Buffer) => ({ result: buffer.toString('utf8'), shouldReEncrypt: false }))
   },
-  app: { getPath: () => '', getVersion: vi.fn(() => '0.0.0'), getAppPath: () => process.cwd(), isPackaged: false }
+  app: { on: vi.fn(), once: vi.fn(), getPath: (_name: string) => '', getLocale: () => 'en-US', getVersion: vi.fn(() => '0.0.0'), getAppPath: () => process.cwd(), isPackaged: false }
 }));
 
 // This suite owns IPC behavior, not Electron's packaged-vs-checkout path discovery.
-vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd() }));
+vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd(), shippedExtensionBuild: () => null, extensionUpdateOffer: () => null, prepareExtensionUpdate: () => null }));
 vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: vi.fn(async () => 'chrome.exe') }));
+const surfacePaths = vi.hoisted(() => ({ forget: vi.fn(async () => undefined) }));
+vi.mock('../src/main/mcp/persistent-paths.js', () => ({
+  loadSurfaceTokens: vi.fn(async () => ({})), rememberSurfaceTokens: vi.fn(async () => true), forgetSurfaceTokens: surfacePaths.forget
+}));
 
 const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath, resetSecretsCacheForTests } = await import('../src/main/secrets.js');
-const { appendEvent, createSession, initSessionStore, rebindSession, resetSessionStoreForTests } = await import('../src/main/session/store.js');
+const { appendEvent, createSession, getSession, initSessionStore, rebindSession, resetSessionStoreForTests, upsertMessageEvent } = await import('../src/main/session/store.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
 const { pendingCommands, resetBridgeForTests, setBrowserOpener, startBridge, stopBridge } = await import(
   '../src/main/bridge.js'
@@ -61,12 +66,13 @@ const {
   spawn,
   swarmStateForCaller
 } = await import('../src/main/agents.js');
-const { registerIpc } = await import('../src/main/ipc.js');
+const { registerIpc, cleanSessionName } = await import('../src/main/ipc.js');
 const { openInPreferredBrowser } = await import('../src/main/browser.js');
+const bridgeModule = await import('../src/main/bridge.js');
 const { app, nativeTheme, safeStorage, shell, dialog } = await import('electron');
 const { extensionDownloadUrl } = await import('../src/main/version.js');
 const { resetWorkspaces, setWorkspaceFor, workspaceEntries } = await import('../src/main/workspace.js');
-const { makeTempDir, removeTempDir } = await import('./helpers.js');
+const { faultGate, makeTempDir, removeTempDir } = await import('./helpers.js');
 
 let dir: string;
 let currentWindow: {
@@ -84,6 +90,161 @@ const renameRoot = (payload: unknown): Promise<any> => handlers.get('roots:renam
 const removeRoot = (payload: unknown): Promise<any> => handlers.get('roots:remove')!(null, payload) as Promise<any>;
 const sessionEvents = (payload: unknown): Promise<any> => handlers.get('sessions:events')!(null, payload) as Promise<any>;
 const sessionList = (): Promise<any> => handlers.get('sessions:list')!(null, undefined) as Promise<any>;
+
+it('keeps the reported interface language and the extension preferences through a Settings save', async () => {
+  // Neither is part of the settings form. The save replaces the whole `ui` object, so both must be
+  // carried through, or the extension would lose its language and its kept preferences.
+  await handlers.get('ui:language')!(null, 'en');
+  expect(getConfig().ui.language).toBe('en');
+  expect(await handlers.get('ui:language')!(null, 'klingon')).toMatchObject({ ok: false });
+  expect(getConfig().ui.language).toBe('en');
+  await saveConfig({ ...getConfig(), ui: { ...getConfig().ui, browserPreferences: { overwrite: false, durations: true } } });
+  const base = getConfig();
+  expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.language).toBe('en');
+  expect(getConfig().ui.browserPreferences).toEqual({ overwrite: false, durations: true });
+});
+
+it.each(['playfulStatus', 'playfulContinue', 'followOutput'] as const)('saves the %s display switch from Settings', async key => {
+  // Both are plain ui booleans saved by the general Settings save. The save schema dropped keys
+  // it did not list, so a switch that was not listed reverted on the next state push.
+  const base = getConfig();
+  const wanted = !(base.ui[key] ?? (key === 'followOutput'));
+  expect(await save({ ...base, ui: { ...base.ui, [key]: wanted } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui[key]).toBe(wanted);
+  // A stale snapshot that never touched the switch keeps the saved value.
+  expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui[key]).toBe(wanted);
+});
+
+it('saves Auto-select Skills through Settings and preserves it across a stale unrelated save', async () => {
+  const base = getConfig();
+  const wanted = !(base.ui.autoSelectSkills ?? false);
+  expect(await save({ ...base, ui: { ...base.ui, autoSelectSkills: wanted } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.autoSelectSkills).toBe(wanted);
+  expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.autoSelectSkills).toBe(wanted);
+});
+
+it('saves the Continue prompt from Settings, keeps it through a stale save, and clears it when emptied', async () => {
+  const base = getConfig();
+  expect(await save({ ...base, ui: { ...base.ui, customContinue: '  Keep going, and run the tests at the end.  ' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.customContinue).toBe('Keep going, and run the tests at the end.');
+  expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.customContinue).toBe('Keep going, and run the tests at the end.');
+  const saved = getConfig();
+  expect(await save({ ...saved, ui: { ...saved.ui, customContinue: 'x'.repeat(501) } }, saved)).toMatchObject({ ok: false });
+  expect(await save({ ...saved, ui: { ...saved.ui, customContinue: '   ' } }, saved)).toMatchObject({ ok: true });
+  expect(getConfig().ui.customContinue).toBeUndefined();
+});
+
+it('names a chat with one clean line, and clears the name for an empty one (#1107)', async () => {
+  expect(cleanSessionName('  Release\nprep\t\u0000now  ')).toBe('Release prep now');
+  expect(cleanSessionName('x'.repeat(300))).toHaveLength(120);
+  expect(cleanSessionName(' \u2028 ')).toBeNull();
+  expect(cleanSessionName(null)).toBeNull();
+  const session = await createSession({ conversationId: 'ipc-rename-chat', title: 'From ChatGPT' });
+  const rename = (title: unknown) => handlers.get('sessions:rename')!(null, { id: session.id, title }) as Promise<unknown>;
+  await rename('  My   name ');
+  expect(await getSession(session.id)).toMatchObject({ title: 'My name', titleSource: 'manual' });
+  await rename('');
+  expect((await getSession(session.id))?.title).toBe('From ChatGPT');
+  expect(await rename(42)).toMatchObject({ ok: false });
+  expect(await handlers.get('sessions:rename')!(null, { id: 'missing-session-0001', title: 'x' })).toMatchObject({ ok: false, error: expect.stringContaining('Session not found') });
+});
+
+it('enabling strict chat allowlisting keeps existing chats untrusted', async () => {
+  const { isChatTrusted, resetTrustedChatsForTests } = await import('../src/main/session/trusted-chats.js');
+  resetTrustedChatsForTests();
+  const conversationId = 'strict-existing-chat-stays-untrusted';
+  await createSession({ title: 'Existing chat before strict mode', conversationId });
+  const base = getConfig();
+  try {
+    expect(await save({ ...base, multiAgent: { ...base.multiAgent, strictChatAllowlist: true } }, base)).toMatchObject({ ok: true });
+    expect(getConfig().multiAgent.strictChatAllowlist).toBe(true);
+    expect(isChatTrusted(conversationId)).toBe(false);
+  } finally {
+    resetTrustedChatsForTests();
+  }
+});
+
+it('trusts a strict CoS opening through the configured session-policy fence only after exact bind', async () => {
+  const outbox = await import('../src/main/session/input.js');
+  const { isChatTrusted, resetTrustedChatsForTests } = await import('../src/main/session/trusted-chats.js');
+  resetTrustedChatsForTests();
+  const original = await outbox.listInputs();
+  await writeDurableNow('session-input', []); outbox.resetInputForTests();
+  const base = getConfig();
+  const id = 'f0f00015-1111-4111-8111-111111111111';
+  const conversationId = 'f0f00016-1111-4111-8111-111111111111';
+  try {
+    expect(await save({ ...base, multiAgent: { ...base.multiAgent, strictChatAllowlist: true } }, base)).toMatchObject({ ok: true });
+    const row = await outbox.enqueueInput({ id, sessionId: null, text: 'Strict composer opening', mode: 'auto',
+      dueAt: Date.now(), model: null, reasoningEffort: null });
+    expect(await outbox.claimBrowserInput(row.id, 'strict-ipc-opening', null, true)).not.toBeNull();
+    expect(await outbox.authorizeBrowserInput(row.id, 'strict-ipc-opening', null)).toBe(true);
+    expect(isChatTrusted(conversationId)).toBe(false);
+    expect(await outbox.bindBrowserInputProject(row.id, 'strict-ipc-opening', conversationId)).toBe(true);
+    expect(isChatTrusted(conversationId)).toBe(true);
+  } finally {
+    await writeDurableNow('session-input', original); outbox.resetInputForTests();
+    resetTrustedChatsForTests();
+  }
+});
+
+it('saves port choices, merges stale snapshots and serializes concurrent port edits', async () => {
+  const ports = await import('../src/main/bridge-ports.js');
+  const bridge = await import('../src/main/bridge.js');
+  const selection = vi.spyOn(ports, 'bridgePortSelection').mockReturnValue({ candidates: [0], overridden: false });
+  try {
+    const base = getConfig();
+    const results = await Promise.all([8767, 8768].map(browserBridgePort => save({ ...base, ui: { ...base.ui, browserBridgePort } }, base)));
+    expect(results.every(result => result.ok)).toBe(true);
+    const active = bridge.bridgePort();
+    expect(await save({ ...base, ui: { ...base.ui, theme: 'light' } }, base)).toMatchObject({ ok: true });
+    expect(getConfig().ui).toMatchObject({ browserBridgePort: 8768, theme: 'light' });
+    expect(bridge.bridgePort()).toBe(active);
+  } finally { selection.mockRestore(); }
+});
+
+it('rejects occupied port edits through Settings IPC and preserves the old bridge and disk', async () => {
+  const http = await import('node:http');
+  const ports = await import('../src/main/bridge-ports.js');
+  const bridge = await import('../src/main/bridge.js');
+  await startBridge(); const old = bridge.bridgePort();
+  const blocker = http.createServer();
+  await new Promise<void>(resolve => blocker.listen(0, '127.0.0.1', resolve));
+  const selection = vi.spyOn(ports, 'bridgePortSelection').mockReturnValue({ candidates: [(blocker.address() as { port: number }).port], overridden: false });
+  try {
+    const base = getConfig(); const disk = await fs.readFile(path.join(dir, 'config.json'), 'utf8');
+    expect(await save({ ...base, ui: { ...base.ui, browserBridgePort: 8767 } }, base)).toMatchObject({ ok: false });
+    expect(getConfig()).toBe(base); expect(bridge.bridgePort()).toBe(old);
+    expect(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).toBe(disk);
+  } finally { selection.mockRestore(); await new Promise<void>(resolve => blocker.close(() => resolve())); }
+});
+
+it('enforces the environment override for explicit edits while accepting unrelated saves', async () => {
+  const base = getConfig();
+  // vitest.config.ts supplies the real CLF_BRIDGE_PORTS=0 override.
+  const result = await save({ ...base, ui: { ...base.ui, browserBridgePort: 8767 } }, base);
+  expect(result).toMatchObject({ ok: false, error: expect.stringContaining('CLF_BRIDGE_PORTS') });
+  expect(getConfig().ui.browserBridgePort).toBe('auto');
+  const unrelated = await save({ ...base, ui: { ...base.ui, theme: 'light' } }, base);
+  expect(unrelated).toMatchObject({ ok: true, data: { bridge: { portOverridden: true } } });
+});
+
+it('persists arbitrary colors through Settings IPC and preserves concurrent per-field edits', async () => {
+  const { defaultAppearance } = await import('../src/shared/appearance.js');
+  const base = getConfig();
+  const appearance = defaultAppearance(); appearance.dark.sidebar = '#fa89c2'; appearance.font = 'serif';
+  expect(await save({ ...base, ui: { ...base.ui, appearance } }, base)).toMatchObject({ ok: true });
+  const nextAppearance = defaultAppearance(); nextAppearance.dark.accent = '#4a6be2';
+  expect(await save({ ...base, ui: { ...base.ui, appearance: nextAppearance } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.appearance).toMatchObject({ font: 'serif', dark: { sidebar: '#fa89c2', accent: '#4a6be2' } });
+  const current = getConfig();
+  expect(await save({ ...current, ui: { ...current.ui, appearance: { ...current.ui.appearance, fontSize: 100 } } }, current)).toMatchObject({ ok: false });
+  expect(getConfig().ui.appearance).toEqual(current.ui.appearance);
+});
 
 it('switches setup IDs and encrypted key ownership without changing shared settings', async () => {
   const { getSecret } = await import('../src/main/secrets.js');
@@ -199,6 +360,73 @@ it('publishes Goal draft progress through the session refresh channel without a 
   }
 });
 
+it('publishes the exact transcript owners of one recorder burst and an explicit global invalidation', async () => {
+  const { notifyChanged, recordNote } = await import('../src/main/session/recorder.js');
+  const first = await createSession({ title: 'Changed A', conversationId: 'ipc-changed-a' });
+  const second = await createSession({ title: 'Changed B', conversationId: 'ipc-changed-b' });
+  const send = vi.fn();
+  currentWindow = { setBackgroundColor: vi.fn(), setTitleBarOverlay: vi.fn(), isDestroyed: () => false, webContents: { send } };
+  const changes = () => send.mock.calls.filter(([channel]) => channel === 'session:changed').map(([, change]) => change as { sessionIds: string[] });
+  // One burst names each owner once. Driven directly: three awaited disk writes can outlast the
+  // 400 ms burst on a busy machine and legitimately publish twice.
+  notifyChanged(first.id); notifyChanged(second.id); notifyChanged(first.id);
+  await vi.waitFor(() => expect(changes()).toHaveLength(1), { timeout: 5_000 });
+  expect(changes()[0]!.sessionIds).toEqual(expect.arrayContaining([first.id, second.id]));
+  expect(new Set(changes()[0]!.sessionIds).size).toBe(changes()[0]!.sessionIds.length);
+  send.mockClear();
+  // Recorder writes publish their owners, each publish naming an owner at most once.
+  await recordNote(first.id, 'first owner');
+  await recordNote(second.id, 'second owner');
+  await recordNote(first.id, 'first owner again');
+  await vi.waitFor(() => expect(changes().flatMap(change => change.sessionIds)).toEqual(expect.arrayContaining([first.id, second.id])), { timeout: 5_000 });
+  for (const change of changes()) expect(new Set(change.sessionIds).size).toBe(change.sessionIds.length);
+  send.mockClear();
+  expect(await handlers.get('sessions:clearImageStorage')!(null, { mode: 'all' })).toMatchObject({ ok: true });
+  expect(send).toHaveBeenCalledWith('session:changed', { allTranscripts: true });
+});
+
+it('publishes the owning session when delivered input history is revised in place', async () => {
+  const input = await import('../src/main/session/input.js');
+  const store = await import('../src/main/session/store.js');
+  const previous = await readDurable('session-input');
+  const session = await createSession({ title: 'Input revision owner', conversationId: 'input-revision-owner' });
+  const id = '30000000-0000-4000-8000-000000000002';
+  const send = vi.fn();
+  currentWindow = { setBackgroundColor: vi.fn(), setTitleBarOverlay: vi.fn(), isDestroyed: () => false, webContents: { send } };
+  const owners = () => send.mock.calls.filter(([channel, change]) => channel === 'session:changed' && change?.sessionIds?.includes(session.id));
+  const row = { id, sessionId: session.id, text: 'Revised fixture', mode: 'auto', model: null, reasoningEffort: null, dueAt: 100,
+    createdAt: 100, owner: 'request', conversationId: 'input-revision-owner', offeredAt: 200, historyRecorded: false };
+  try {
+    await writeDurableNow('session-input', [{ ...row, state: 'tool' }]);
+    input.resetInputForTests();
+    expect(await handlers.get('sessions:outbox')!(null, undefined)).toMatchObject({ ok: true });
+    await vi.waitFor(() => expect(owners()).toHaveLength(1));
+    send.mockClear();
+    // Same canonical key, same anchor and count: only the delivery state changes in place.
+    await writeDurableNow('session-input', [{ ...row, state: 'sent', owner: null, messageId: `input:${id}`, deliveredAt: 300 }]);
+    input.resetInputForTests();
+    expect(await handlers.get('sessions:outbox')!(null, undefined)).toMatchObject({ ok: true });
+    await vi.waitFor(() => expect(owners()).toHaveLength(1));
+    const users = (await store.readEvents(session.id)).filter(event => event.kind === 'user_message');
+    expect(users).toHaveLength(1);
+    expect(users[0]).toMatchObject({ inputId: id, inputDelivery: 'confirmed' });
+  } finally {
+    await writeDurableNow('session-input', previous ?? []);
+    input.resetInputForTests();
+  }
+});
+
+// #924: turning stable connector URLs off forgets the stored tokens; turning it on keeps the running ones.
+it('forgets the stored connector URL tokens when the option is turned off', async () => {
+  surfacePaths.forget.mockClear();
+  expect(await save({ ...getConfig(), mcp: { instructions: getConfig().mcp.instructions, persistentUrls: true } })).toMatchObject({ ok: true });
+  expect(getConfig().mcp.persistentUrls).toBe(true);
+  expect(surfacePaths.forget).not.toHaveBeenCalled();
+  expect(await save({ ...getConfig(), mcp: { instructions: getConfig().mcp.instructions, persistentUrls: false } })).toMatchObject({ ok: true });
+  expect(getConfig().mcp.persistentUrls).toBe(false);
+  expect(surfacePaths.forget).toHaveBeenCalledTimes(1);
+});
+
 it('stages clipboard image bytes with a preview through the general attachment owner', async () => {
   const drop = (payload: unknown) => handlers.get('sessions:dropFiles')!(null, payload) as Promise<any>;
   expect(await drop({ files: [] })).toMatchObject({ ok: false });
@@ -236,7 +464,7 @@ it('round-trips Goal controls and cannot revive old periodic input when Off canc
     await store.observeSessionModel(session.id, 'periodic-settings-chat', 'gpt-6-astra', Date.now());
     const row = await outbox.enqueueInput({ id: 'f0f00014-1111-4111-8111-111111111111', sessionId: session.id,
       text: 'Pending automatic instruction', mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null },
-      { turnId: 'periodic-turn', periodic: false, userRequested: true });
+      { turnId: 'periodic-turn', periodic: false, mode: 'goal', userRequested: true });
     // Seed an old-version row; current code deliberately refuses new periodic input.
     await writeDurableNow('session-input', [{ ...row, finishOwner: { turnId: 'periodic-turn', periodic: true } }]);
     outbox.resetInputForTests();
@@ -309,11 +537,49 @@ it('adds picker-selected projects, reuses containing approval, and leaves cancel
   expect(getConfig().roots).toHaveLength(1);
   const listed = await handlers.get('projects:list')!(null, {}) as any;
   expect(listed.data).toHaveLength(2);
+  const colored = await handlers.get('projects:color')!(null, { id: first.data.id, color: 'blue' }) as any;
+  expect(colored).toMatchObject({ ok: true, data: { id: first.data.id, color: 'blue' } });
+  expect(await handlers.get('projects:color')!(null, { id: first.data.id, color: 'chartreuse' })).toMatchObject({ ok: false });
+  const uncolored = await handlers.get('projects:color')!(null, { id: first.data.id, color: null }) as any;
+  expect(uncolored).toMatchObject({ ok: true, data: { id: first.data.id } });
+  expect(uncolored.data.color).toBeUndefined();
   const removed = await handlers.get('projects:remove')!(null, { id: first.data.id }) as any;
   expect(removed).toMatchObject({ ok: true, data: { id: first.data.id, ungrouped: true } });
   expect(getConfig().roots).toHaveLength(1);
   expect((await fs.stat(folder)).isDirectory()).toBe(true);
   expect(await handlers.get('projects:remove')!(null, { id: folder })).toMatchObject({ ok: false });
+  expect(await handlers.get('projectGit:snapshot')!(null, { projectId: folder })).toMatchObject({ ok: false });
+  expect(await handlers.get('projectGit:diff')!(null, { projectId: first.data.id, path: '' })).toMatchObject({ ok: false });
+  expect(await handlers.get('sessions:toolEditReview')!(null, {
+    sessionId: first.data.id, callId: 'not-a-uuid', changeIndex: 0
+  })).toMatchObject({ ok: false });
+});
+
+it('does not install a stale Git watch after a newer Files project watch', async () => {
+  const { ProjectFileWatchSet } = await import('../src/main/project-file-watcher.js');
+  const { ProjectGitWatchSet } = await import('../src/main/project-git.js');
+  const contents = Object.assign(new EventEmitter(), { send: vi.fn(), isDestroyed: () => false });
+  currentWindow = { isDestroyed: () => false, webContents: contents } as any;
+  const firstId = '11111111-1111-4111-8111-111111111111';
+  const secondId = '22222222-2222-4222-8222-222222222222';
+  let finishFirst!: () => void, finishSecond!: () => void;
+  const fileSync = vi.spyOn(ProjectFileWatchSet.prototype, 'sync').mockImplementation(projectId =>
+    new Promise<void>(resolve => { if (projectId === firstId) finishFirst = resolve; else finishSecond = resolve; }));
+  const gitSync = vi.spyOn(ProjectGitWatchSet.prototype, 'sync').mockResolvedValue();
+  try {
+    const watch = (projectId: string) => handlers.get('projectFiles:watch')!(null, { projectId, directories: [''] });
+    const first = watch(firstId);
+    const second = watch(secondId);
+    finishSecond();
+    expect(await second).toMatchObject({ ok: true, data: true });
+    finishFirst();
+    expect(await first).toMatchObject({ ok: true, data: false });
+    expect(gitSync).toHaveBeenCalledOnce();
+    expect(gitSync).toHaveBeenCalledWith(secondId);
+  } finally {
+    fileSync.mockRestore();
+    gitSync.mockRestore();
+  }
 });
 
 /** The whole settings object the renderer sends, with the parts a test cares about set. */
@@ -322,6 +588,7 @@ function settings(over: { record: boolean; multiAgent: boolean }) {
   return {
     capabilities: base.capabilities,
     readOnly: base.readOnly,
+    commandAllowlist: base.commandAllowlist,
     tunnel: base.tunnel,
     ui: base.ui,
     sessions: { ...base.sessions, record: over.record },
@@ -363,6 +630,7 @@ afterAll(async () => {
 beforeEach(async () => {
   currentWindow = null;
   vi.mocked(dialog.showOpenDialog).mockResolvedValue({ canceled: true, filePaths: [] });
+  vi.mocked(dialog.showMessageBox).mockReset().mockResolvedValue({ response: 0 } as never);
   nativeTheme.themeSource = 'system';
   vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockResolvedValue(true);
   vi.mocked(shell.openPath).mockReset().mockResolvedValue('');
@@ -381,6 +649,26 @@ beforeEach(async () => {
   });
 });
 
+it('keeps origin history navigation separate from live revision cursors over IPC', async () => {
+  const session = await createSession({ title: 'History cursors' });
+  const message = { kind: 'assistant_message' as const, source: 'extension' as const, time: 10,
+    messageId: 'review', message: { text: 'Detailed review', truncated: false, chars: 15 }, final: true };
+  const first = await upsertMessageEvent(session.id, message);
+  await appendEvent(session.id, { kind: 'note', source: 'app', time: 20, message: { text: 'Later work', truncated: false, chars: 10 } });
+  const revision = await upsertMessageEvent(session.id, { ...message, renderedHtml: { text: '<p>Detailed review</p>', truncated: false, chars: 22 } });
+  const read = (options: object) => handlers.get('sessions:events')!(null, { id: session.id, ...options }) as Promise<any>;
+  const tail = await read({ limit: 1 });
+  expect(tail.ok).toBe(true);
+  expect(tail.data.events[0].kind).toBe('note');
+  const older = await read({ before: tail.data.events[0].seq, limit: 1 });
+  expect(older.data.events[0]).toMatchObject({ kind: 'assistant_message', origin: first.event.seq, seq: revision.event.seq });
+  const newer = await read({ after: first.event.seq, limit: 1 });
+  expect(newer.data.events[0].kind).toBe('note');
+  const delta = await read({ from: revision.event.seq, limit: 1 });
+  expect(delta.data.events[0].messageId).toBe('review');
+  expect(delta.data.nextFrom).toBe(revision.event.seq + 1);
+});
+
 describe('explicit settings replace the published tool contract', () => {
   it.each(['finish', 'command'] as const)('withdraws %s from real endpoint publication after its setting is disabled', async kind => {
     const { startMcpServer } = await import('../src/main/mcp/server.js');
@@ -395,6 +683,9 @@ describe('explicit settings replace the published tool contract', () => {
     };
     try {
       const before = snapshot();
+      const beforeState = await handlers.get('state:get')!(null, undefined) as any;
+      expect(beforeState.data.connectorSchemas.core).toBe(before.schemaId);
+      expect(beforeState.data.connectorRefresh.core).toEqual({ schemaId: before.schemaId, state: 'unknown' });
       const tool = kind === 'finish' ? 'session_finish' : 'exec_command';
       expect(before.tools.map(row => row.name)).toContain(tool);
       expect(before.tools.map(row => row.name)).not.toContain('session');
@@ -404,6 +695,8 @@ describe('explicit settings replace the published tool contract', () => {
         : { capabilities: { ...current.capabilities, command: false } }) };
       expect((await save(patch)).ok).toBe(true);
       const after = snapshot();
+      const afterState = await handlers.get('state:get')!(null, undefined) as any;
+      expect(afterState.data.connectorSchemas.core).toBe(after.schemaId);
       expect(after.tools.map(row => row.name)).not.toContain(tool);
       expect(after.tools.map(row => row.name)).not.toContain('session');
       expect(after.schemaId).not.toBe(before.schemaId);
@@ -458,7 +751,7 @@ describe('turning multi-agent mode off', () => {
     const reply = await save(settings({ record: false, multiAgent: false }));
     expect(reply.ok, reply.error).toBe(true);
     expect(await readDurable<any>('ipc-swarm')).toMatchObject({
-      version: 6,
+      version: 7,
       runId: null,
       primeConversationId: null,
       agents: [],
@@ -627,6 +920,18 @@ describe('ChatGPT browser settings', () => {
 });
 
 describe('settings writes from more than one UI', () => {
+  it("keeps the version whose What's New was seen when a setting changes", async () => {
+    // Every settings save rebuilt \`ui\` without it, so What's New came back at the next start after
+    // any changed setting (2.1.41 pass, Windows VM).
+    const base = defaultConfig(); await saveConfig({ ...base, ui: { ...base.ui, lastSeenVersion: '2.1.40' } });
+    const current = getConfig();
+    const { lastSeenVersion: _seen, ...formUi } = current.ui;
+    expect((await save({ ...current, ui: { ...formUi, theme: 'dark' } }, { ...current, ui: formUi })).ok).toBe(true);
+    expect(getConfig().ui.theme).toBe('dark');
+    expect(getConfig().ui.lastSeenVersion).toBe('2.1.40');
+    expect(JSON.parse(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).ui.lastSeenVersion).toBe('2.1.40');
+  });
+
   it('validates and persists the Plugins tunnel id through Settings, including explicit clearing', async () => {
     const base = defaultConfig(); await saveConfig(base);
     const tunnelId = `tunnel_${'a'.repeat(32)}`;
@@ -697,19 +1002,86 @@ describe('settings writes from more than one UI', () => {
     const base = defaultConfig(); await saveConfig(base);
     const wanted = { ...base, mcp: { instructions: 'Use the approved project only.' }, ui: { ...base.ui, browserOnly: true } };
     expect((await save(wanted, base)).ok).toBe(true);
-    expect(JSON.parse(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).mcp).toEqual(wanted.mcp);
+    expect(JSON.parse(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).mcp).toEqual({ ...wanted.mcp, persistentUrls: false });
     expect(getConfig().ui.browserOnly).toBe(true);
     expect((await save({ ...base, ui: { ...base.ui, minimizeToTray: !base.ui.minimizeToTray } }, base)).ok).toBe(true);
-    expect(getConfig().mcp).toEqual(wanted.mcp);
+    expect(getConfig().mcp).toEqual({ ...wanted.mcp, persistentUrls: false });
     expect(getConfig().ui.browserOnly).toBe(true);
     const legacy = { ...base } as any; delete legacy.mcp;
     expect((await save(legacy, legacy)).ok).toBe(true);
-    expect(getConfig().mcp).toEqual(wanted.mcp);
+    expect(getConfig().mcp).toEqual({ ...wanted.mcp, persistentUrls: false });
     const current = getConfig();
     expect((await save({ ...current, mcp: { instructions: '' } }, current)).ok).toBe(true);
     expect(getConfig().mcp.instructions).toBe('');
     expect((await save({ ...current, mcp: { instructions: 'x'.repeat(4001) } }, current)).ok).toBe(false);
     expect(getConfig().mcp.instructions).toBe('');
+  });
+  it('starts and stops the local control API only when its switch changes, and keeps it through stale saves', async () => {
+    const controlApi = await import('../src/main/control-api.js');
+    controlApi.initControlApiPath(dir);
+    const endpoint = path.join(dir, 'control-api', 'endpoint.json');
+    try {
+      const base = defaultConfig(); await saveConfig(base);
+      expect((await save({ ...base, controlApi: { enabled: true } }, base)).ok).toBe(true);
+      expect(JSON.parse(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).controlApi).toEqual({ enabled: true, allowActions: false });
+      const { port } = JSON.parse(await fs.readFile(endpoint, 'utf8'));
+      expect(controlApi.controlApiPort()).toBe(port);
+      // A save from a form that still shows the old value, and one from a build that has no
+      // such field, both leave the switch and the running listener alone.
+      expect((await save({ ...base, ui: { ...base.ui, minimizeToTray: !base.ui.minimizeToTray } }, base)).ok).toBe(true);
+      const legacy = { ...base } as Partial<typeof base>; delete legacy.controlApi;
+      expect((await save(legacy, legacy)).ok).toBe(true);
+      expect(getConfig().controlApi.enabled).toBe(true);
+      expect(controlApi.controlApiPort()).toBe(port);
+      const current = getConfig();
+      expect((await save({ ...current, controlApi: { enabled: false } }, current)).ok).toBe(true);
+      expect(controlApi.controlApiPort()).toBeNull();
+      await expect(fs.access(endpoint)).rejects.toThrow();
+      // Switched off means nothing listens any more, not merely that requests are refused.
+      await expect(fetch(`http://127.0.0.1:${port}/v1/health`)).rejects.toThrow();
+    } finally {
+      await controlApi.stopControlApi();
+    }
+  });
+  it('keeps message actions behind the API switch and merges the two switches independently', async () => {
+    const controlApi = await import('../src/main/control-api.js');
+    controlApi.initControlApiPath(dir);
+    try {
+      const base = defaultConfig(); await saveConfig(base);
+      // Actions cannot be granted while the API is off.
+      expect((await save({ ...base, controlApi: { enabled: false, allowActions: true } }, base)).ok).toBe(true);
+      expect(getConfig().controlApi).toEqual({ enabled: false, allowActions: false });
+      const off = getConfig();
+      expect((await save({ ...off, controlApi: { enabled: true, allowActions: true } }, off)).ok).toBe(true);
+      expect(getConfig().controlApi).toEqual({ enabled: true, allowActions: true });
+      expect(controlApi.controlApiPort()).not.toBeNull();
+      // A form from a build with no allowActions field, and a stale form still showing it off,
+      // both leave a grant that was made after they were loaded.
+      const granted = getConfig();
+      expect((await save({ ...granted, controlApi: { enabled: true } }, granted)).ok).toBe(true);
+      expect(getConfig().controlApi.allowActions).toBe(true);
+      const stale = { ...granted, controlApi: { enabled: true, allowActions: false } };
+      expect((await save(stale, stale)).ok).toBe(true);
+      expect(getConfig().controlApi.allowActions).toBe(true);
+      // Turning the API off revokes the grant and stops the listener; turning it back on does
+      // not bring the grant back.
+      const running = getConfig();
+      expect((await save({ ...running, controlApi: { enabled: false, allowActions: true } }, running)).ok).toBe(true);
+      expect(getConfig().controlApi).toEqual({ enabled: false, allowActions: false });
+      expect(controlApi.controlApiPort()).toBeNull();
+      const stopped = getConfig();
+      expect((await save({ ...stopped, controlApi: { enabled: true } }, stopped)).ok).toBe(true);
+      expect(getConfig().controlApi).toEqual({ enabled: true, allowActions: false });
+      // The grant can be withdrawn on its own without stopping the listener.
+      const again = getConfig();
+      expect((await save({ ...again, controlApi: { enabled: true, allowActions: true } }, again)).ok).toBe(true);
+      const withdraw = getConfig();
+      expect((await save({ ...withdraw, controlApi: { enabled: true, allowActions: false } }, withdraw)).ok).toBe(true);
+      expect(getConfig().controlApi).toEqual({ enabled: true, allowActions: false });
+      expect(controlApi.controlApiPort()).not.toBeNull();
+    } finally {
+      await controlApi.stopControlApi();
+    }
   });
   it('saves helper settings and tab retention through the renderer schema and merge boundary', async () => {
     const base = defaultConfig();
@@ -721,6 +1093,25 @@ describe('settings writes from more than one UI', () => {
     expect(result.ok, result.error).toBe(true);
     expect(getConfig().ui.tabsToKeepOpen).toBe(6);
     expect(getConfig().goal).toMatchObject({ helperModel: 'account-helper', helperReasoning: 'medium', model: base.goal.model });
+  });
+  it('persists and clears ordinary new-chat defaults independently through settings merge', async () => {
+    const base = defaultConfig();
+    await saveConfig(base);
+    const configured = { ...base, ui: { ...base.ui, defaultChatModel: 'gpt-5.6-sol', defaultChatReasoning: 'xhigh' as const } };
+    expect((await save(configured, base)).ok).toBe(true);
+    expect(getConfig().ui).toMatchObject({ defaultChatModel: 'gpt-5.6-sol', defaultChatReasoning: 'xhigh' });
+
+    const withBoth = getConfig();
+    expect((await save({ ...withBoth, ui: { ...withBoth.ui, defaultChatModel: undefined } }, withBoth)).ok).toBe(true);
+    expect(getConfig().ui.defaultChatModel).toBeUndefined();
+    expect(getConfig().ui.defaultChatReasoning).toBe('xhigh');
+
+    const reasoningOnly = getConfig();
+    expect((await save({ ...reasoningOnly, ui: { ...reasoningOnly.ui, defaultChatReasoning: undefined } }, reasoningOnly)).ok).toBe(true);
+    expect(getConfig().ui.defaultChatReasoning).toBeUndefined();
+    const stored = JSON.parse(await fs.readFile(path.join(dir, 'config.json'), 'utf8'));
+    expect(stored.ui).not.toHaveProperty('defaultChatModel');
+    expect(stored.ui).not.toHaveProperty('defaultChatReasoning');
   });
   it('persists the planner backend and preserves it across an unrelated stale settings save', async () => {
     const base = defaultConfig();
@@ -761,11 +1152,33 @@ describe('settings writes from more than one UI', () => {
     expect(reply.ok, reply.error).toBe(true);
     expect(getConfig().ui.theme).toBe('dark');
     expect(nativeTheme.themeSource).toBe('dark');
-    expect(currentWindow.setBackgroundColor).toHaveBeenCalledWith('#0e0e11');
+    expect(currentWindow.setBackgroundColor).toHaveBeenCalledWith('#181818');
     if (process.platform === 'win32') expect(currentWindow.setTitleBarOverlay).toHaveBeenCalledWith({
-      height: 36, color: '#1a2129', symbolColor: '#b8c0c5'
+      height: 36, color: '#00000000', symbolColor: '#ffffff'
     });
     expect(getConfig().goal.enabled).toBe(false);
+  });
+
+  it('persists command policy fields independently across stale renderer saves', async () => {
+    const base = defaultConfig();
+    await saveConfig(base);
+    const enabled = await save({
+      ...base, commandAllowlist: { enabled: true, mode: 'deny', rules: ['git status', 'git diff *'] }
+    }, base);
+    expect(enabled.ok, enabled.error).toBe(true);
+
+    const stale = await save({ ...base, ui: { ...base.ui, minimizeToTray: !base.ui.minimizeToTray } }, base);
+    expect(stale.ok, stale.error).toBe(true);
+    expect(getConfig().commandAllowlist).toEqual({ enabled: true, mode: 'deny', rules: ['git status', 'git diff *'] });
+
+    const current = getConfig();
+    expect((await save({
+      ...current, commandAllowlist: { ...current.commandAllowlist, enabled: false }
+    }, current)).ok).toBe(true);
+    expect(getConfig().commandAllowlist).toEqual({ enabled: false, mode: 'deny', rules: ['git status', 'git diff *'] });
+    expect((await save({
+      ...getConfig(), commandAllowlist: { enabled: true, mode: 'allow', rules: ['git status; whoami'] }
+    }, getConfig())).ok).toBe(false);
   });
 
   it('preserves a newer unattributed-call choice across an unrelated stale renderer save', async () => {
@@ -907,6 +1320,63 @@ describe('every link the window offers', () => {
     expect(vi.mocked(shell.openExternal).mock.calls.length).toBe(before);
   });
 
+  it("opens Setup's ChatGPT and OpenAI pages in the CoS browser when it is the chosen browser", async () => {
+    const original = getConfig();
+    const url = 'https://platform.openai.com/settings/organization/tunnels';
+    try {
+      await saveConfig({ ...original, ui: { ...original.ui, chatBrowser: 'cos' } });
+      vi.mocked(openInPreferredBrowser).mockClear();
+      vi.mocked(shell.openExternal).mockClear();
+      expect(await handlers.get('link:open')!(null, { url })).toEqual({ ok: true, data: true });
+      expect(openInPreferredBrowser).toHaveBeenCalledWith(url, { reveal: true });
+      expect(shell.openExternal).not.toHaveBeenCalled();
+      // "Open in another browser" beside it: the same page in the system's own browser.
+      vi.mocked(openInPreferredBrowser).mockClear();
+      expect(await handlers.get('link:open')!(null, { url, external: true })).toEqual({ ok: true, data: true });
+      expect(shell.openExternal).toHaveBeenLastCalledWith(url);
+      expect(openInPreferredBrowser).not.toHaveBeenCalled();
+      // Every other site still leaves for the system browser.
+      await handlers.get('link:open')!(null, { url: 'https://openrouter.ai/settings/keys' });
+      expect(shell.openExternal).toHaveBeenCalledWith('https://openrouter.ai/settings/keys');
+
+      await saveConfig({ ...original, ui: { ...original.ui, chatBrowser: 'chrome' } });
+      vi.mocked(openInPreferredBrowser).mockClear();
+      await handlers.get('link:open')!(null, { url });
+      expect(shell.openExternal).toHaveBeenLastCalledWith(url);
+      expect(openInPreferredBrowser).not.toHaveBeenCalled();
+    } finally {
+      await saveConfig(original);
+    }
+  });
+
+  it("hands Setup's extensions address over by clipboard, because browsers ignore their own pages from outside", async () => {
+    const { clipboard } = await import('electron');
+    const write = vi.spyOn(clipboard, 'writeText');
+    try {
+      for (const browser of ['chrome', 'edge', 'brave'] as const) {
+        write.mockClear();
+        vi.mocked(openInPreferredBrowser).mockClear();
+        expect(await handlers.get('browser:setupOpen')!(null, { browser, page: 'extensions' })).toEqual({ ok: true, data: true });
+        expect(write).toHaveBeenCalledWith(`${browser}://extensions`);
+        // Only a blank tab to paste into: the browser would open its internal page as a new tab instead.
+        expect(openInPreferredBrowser).toHaveBeenCalledWith('about:blank', { browser, reveal: true });
+      }
+      // A copy that fails is reported, and no browser comes up for an address that is not there.
+      write.mockClear();
+      vi.mocked(openInPreferredBrowser).mockClear();
+      write.mockRejectedValueOnce(new Error('clipboard unavailable') as never);
+      expect(await handlers.get('browser:setupOpen')!(null, { browser: 'chrome', page: 'extensions' })).toMatchObject({ ok: false });
+      expect(openInPreferredBrowser).not.toHaveBeenCalled();
+      write.mockClear();
+      vi.mocked(openInPreferredBrowser).mockClear();
+      await handlers.get('browser:setupOpen')!(null, { browser: 'edge', page: 'chatgpt' });
+      expect(openInPreferredBrowser).toHaveBeenCalledWith('https://chatgpt.com/', { browser: 'edge', reveal: true });
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+    }
+  });
+
   it('serializes non-Error throws into a real IPC error string', async () => {
     vi.mocked(shell.openExternal).mockRejectedValueOnce('Windows shell refused the request');
     const reply = (await handlers.get('link:open')!(null, {
@@ -924,6 +1394,53 @@ describe('every link the window offers', () => {
  * press that closed the window and installed nothing would be worse than no button at all.
  */
 describe('installing a downloaded update on request', () => {
+  it('reports the failed app check after requesting the running connectors without quitting or changing settings', async () => {
+    const updater = await import('../src/main/update.js');
+    const connections = await import('../src/main/connection.js');
+    const refresh = await import('../src/main/plugin-refresh.js');
+    const connected = vi.spyOn(connections, 'connect').mockResolvedValue(undefined);
+    const requested = vi.spyOn(refresh, 'requestPluginRefreshes').mockResolvedValue(undefined);
+    const checked = vi.spyOn(updater, 'checkForUpdates').mockResolvedValue(undefined);
+    const status = vi.spyOn(updater, 'updateStatus').mockReturnValue({ current: '2.1.31', latest: null, stage: 'failed', checkedAt: null, error: 'Network unavailable' });
+    const before = structuredClone(getConfig()), quits = quitToInstallCalls;
+    try {
+      const reply = await handlers.get('update:all')!(null, undefined);
+      expect(reply).toEqual({ ok: false, error: 'Network unavailable' });
+      expect(checked).toHaveBeenCalledTimes(1);
+      expect(connected).toHaveBeenCalledTimes(1);
+      expect(requested).toHaveBeenCalledWith('2.1.31', expect.arrayContaining(['core']));
+      expect(quitToInstallCalls).toBe(quits); expect(getConfig()).toEqual(before);
+    } finally { checked.mockRestore(); status.mockRestore(); connected.mockRestore(); requested.mockRestore(); }
+  });
+  it.each([
+    ['unapproved', undefined], ['other-version', '98.0.0'], ['approve', '99.0.0'], ['changed-installer', '99.0.0']
+  ] as const)('restarts only for the version the app approved: %s', async (outcome, approved) => {
+    // The question is asked in the app's own dialog; the window calls again with that version.
+    const updater = await import('../src/main/update.js');
+    const refresh = await import('../src/main/plugin-refresh.js');
+    const checked = vi.spyOn(updater, 'checkForUpdates').mockResolvedValue(undefined);
+    const status = vi.spyOn(updater, 'updateStatus').mockReturnValue({ current: '2.1.35', latest: '99.0.0', stage: 'ready', checkedAt: 1, error: null });
+    const marked = vi.spyOn(updater, 'markInstallOnQuit').mockReturnValue(outcome !== 'changed-installer');
+    const requested = vi.spyOn(refresh, 'requestPluginRefreshes').mockResolvedValue(undefined);
+    const quits = quitToInstallCalls;
+    try {
+      const reply = await handlers.get('update:all')!(null, approved);
+      expect(dialog.showMessageBox).not.toHaveBeenCalled();
+      if (outcome === 'unapproved' || outcome === 'other-version') {
+        expect(reply).toEqual({ ok: true, data: 'confirm' });
+        expect(requested).not.toHaveBeenCalled(); expect(marked).not.toHaveBeenCalled(); expect(quitToInstallCalls).toBe(quits);
+      } else {
+        expect(marked).toHaveBeenCalledExactlyOnceWith('99.0.0');
+        if (outcome === 'approve') {
+          expect(reply).toEqual({ ok: true, data: 'restarting' }); expect(quitToInstallCalls).toBe(quits + 1);
+        } else {
+          expect(reply).toMatchObject({ ok: false }); expect(quitToInstallCalls).toBe(quits);
+        }
+      }
+    } finally {
+      checked.mockRestore(); status.mockRestore(); marked.mockRestore(); requested.mockRestore();
+    }
+  });
   it('refuses, and does not quit, when nothing has been downloaded', async () => {
     const before = quitToInstallCalls;
     const reply = (await handlers.get('update:install')!(null, undefined)) as { ok: boolean; error: string };
@@ -1148,6 +1665,218 @@ describe('session IPC contracts', () => {
     resetBlockedChatsForTests();
   });
 
+  it('trusts and untrusts only the stored conversation for strict allowlisting', async () => {
+    const { isChatTrusted, resetTrustedChatsForTests } = await import('../src/main/session/trusted-chats.js');
+    resetTrustedChatsForTests();
+    const conversationId = 'dddddddd-1111-2222-3333-444444444444';
+    const session = await createSession({ title: 'trusted chat', conversationId });
+
+    const trusted = (await handlers.get('sessions:trust')!(null, {
+      id: session.id, expectedConversationId: conversationId, trusted: true
+    })) as any;
+    expect(trusted.ok, trusted.error).toBe(true);
+    expect(trusted.data).toEqual([conversationId]);
+    expect(isChatTrusted(conversationId)).toBe(true);
+
+    const untrusted = (await handlers.get('sessions:trust')!(null, {
+      id: session.id, expectedConversationId: conversationId, trusted: false
+    })) as any;
+    expect(untrusted.ok, untrusted.error).toBe(true);
+    expect(untrusted.data).toEqual([]);
+    expect(isChatTrusted(conversationId)).toBe(false);
+
+    const unattributed = await createSession({ title: 'no conversation to trust', conversationId: null });
+    const refused = (await handlers.get('sessions:trust')!(null, {
+      id: unattributed.id, expectedConversationId: conversationId, trusted: true
+    })) as any;
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toMatch(/no valid ChatGPT conversation/i);
+    resetTrustedChatsForTests();
+  });
+
+  it('refuses direct worker Trust while allowing its prime and stale worker Untrust cleanup', async () => {
+    const { isChatTrusted, resetTrustedChatsForTests, setChatTrusted } = await import('../src/main/session/trusted-chats.js');
+    resetTrustedChatsForTests();
+    const primeConversationId = 'strict-prime-ipc-owner';
+    const workerConversationId = 'strict-worker-ipc-owned';
+    const primeSession = await createSession({ title: 'strict prime owner', conversationId: primeConversationId });
+    const run = spawn({ caller: { conversationId: primeConversationId }, workers: [{ task: 'owned work' }] });
+    expect(bindConversation('worker-1', workerConversationId, run.runId)).toBe(true);
+    const workerSession = await createSession({
+      title: 'strict owned worker',
+      conversationId: workerConversationId,
+      origin: { kind: 'worker', fromSessionId: primeSession.id, agentId: 'worker-1', task: 'owned work' }
+    });
+
+    try {
+      const workerTrust = (await handlers.get('sessions:trust')!(null, {
+        id: workerSession.id, expectedConversationId: workerConversationId, trusted: true
+      })) as any;
+      expect(workerTrust.ok).toBe(false);
+      expect(workerTrust.error).toMatch(/worker chats cannot be trusted directly/i);
+      expect(isChatTrusted(workerConversationId)).toBe(false);
+
+      const primeTrust = (await handlers.get('sessions:trust')!(null, {
+        id: primeSession.id, expectedConversationId: primeConversationId, trusted: true
+      })) as any;
+      expect(primeTrust.ok, primeTrust.error).toBe(true);
+      expect(isChatTrusted(primeConversationId)).toBe(true);
+
+      // A pre-fix durable worker bit is not authority anymore, but Untrust must remain usable to
+      // clean it up rather than trapping stale state behind the new guard.
+      await setChatTrusted(workerConversationId, true);
+      const cleanup = (await handlers.get('sessions:trust')!(null, {
+        id: workerSession.id, expectedConversationId: workerConversationId, trusted: false
+      })) as any;
+      expect(cleanup.ok, cleanup.error).toBe(true);
+      expect(isChatTrusted(workerConversationId)).toBe(false);
+    } finally {
+      resetTrustedChatsForTests();
+    }
+  });
+
+  it('refuses direct Trust for durable worker identity after broker ownership is gone', async () => {
+    const { isChatTrusted, resetTrustedChatsForTests } = await import('../src/main/session/trusted-chats.js');
+    resetTrustedChatsForTests();
+    const workerConversationId = 'strict-worker-durable-only';
+    const workerSession = await createSession({
+      title: 'durable worker without retained broker owner',
+      conversationId: workerConversationId,
+      origin: { kind: 'worker', fromSessionId: null, agentId: 'worker-7', task: 'old retained work' }
+    });
+
+    const refused = (await handlers.get('sessions:trust')!(null, {
+      id: workerSession.id, expectedConversationId: workerConversationId, trusted: true
+    })) as any;
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toMatch(/worker chats cannot be trusted directly/i);
+    expect(isChatTrusted(workerConversationId)).toBe(false);
+    resetTrustedChatsForTests();
+  });
+
+  it('refuses stale trust intent after Compact & Resume rebinds the same session to a new chat', async () => {
+    const { isChatTrusted, resetTrustedChatsForTests } = await import('../src/main/session/trusted-chats.js');
+    resetTrustedChatsForTests();
+    const chatA = '11111111-aaaa-bbbb-cccc-111111111111';
+    const chatB = '22222222-aaaa-bbbb-cccc-222222222222';
+    const session = await createSession({ title: 'rebound trust', conversationId: chatA });
+    expect(await rebindSession(session.id, chatA, chatB)).toBe(true);
+
+    const stale = (await handlers.get('sessions:trust')!(null, {
+      id: session.id, expectedConversationId: chatA, trusted: true
+    })) as any;
+    expect(stale.ok).toBe(false);
+    expect(stale.error).toMatch(/moved to another ChatGPT conversation/i);
+    expect(isChatTrusted(chatA)).toBe(false);
+    expect(isChatTrusted(chatB)).toBe(false);
+
+    const current = (await handlers.get('sessions:trust')!(null, {
+      id: session.id, expectedConversationId: chatB, trusted: true
+    })) as any;
+    expect(current.ok, current.error).toBe(true);
+    expect(isChatTrusted(chatB)).toBe(true);
+    resetTrustedChatsForTests();
+  });
+
+  it('serializes Trust with Compact & Resume so an in-flight stale A action cannot authorize B', async () => {
+    const { isChatTrusted, resetTrustedChatsForTests } = await import('../src/main/session/trusted-chats.js');
+    resetTrustedChatsForTests();
+    const chatA = '12121212-aaaa-bbbb-cccc-121212121212';
+    const chatB = '34343434-aaaa-bbbb-cccc-343434343434';
+    const session = await createSession({ title: 'trust raced with resume', conversationId: chatA });
+    const gate = faultGate();
+    const originalRename = fs.rename.bind(fs);
+    const rename = vi.spyOn(fs, 'rename').mockImplementationOnce(async (...args: Parameters<typeof fs.rename>) => {
+      await gate.hold();
+      return originalRename(...args);
+    });
+    try {
+      const moving = rebindSession(session.id, chatA, chatB, 'handoff-trust-race-0001');
+      await gate.entered;
+      let trustSettled = false;
+      const trusting = (handlers.get('sessions:trust')!(null, {
+        id: session.id, expectedConversationId: chatA, trusted: true
+      }) as Promise<any>).then((result) => { trustSettled = true; return result; });
+      await Promise.resolve();
+      expect(trustSettled).toBe(false);
+
+      gate.release();
+      expect(await moving).toBe(true);
+      const stale = await trusting;
+      expect(stale.ok).toBe(false);
+      expect(stale.error).toMatch(/moved to another ChatGPT conversation/i);
+      expect(isChatTrusted(chatA)).toBe(false);
+      expect(isChatTrusted(chatB)).toBe(false);
+    } finally {
+      gate.release();
+      rename.mockRestore();
+      resetTrustedChatsForTests();
+    }
+  });
+
+  it('Untrust on the current resumed row revokes the explicit source instead of leaving inherited authority', async () => {
+    const { isChatTrusted, resetTrustedChatsForTests } = await import('../src/main/session/trusted-chats.js');
+    const { conversationAccessRefusal } = await import('../src/main/session/conversation-access.js');
+    resetTrustedChatsForTests();
+    const chatA = '33333333-aaaa-bbbb-cccc-333333333333';
+    const chatB = '44444444-aaaa-bbbb-cccc-444444444444';
+    const session = await createSession({ title: 'inherited resumed trust', conversationId: chatA });
+    getConfig().multiAgent.strictChatAllowlist = true;
+    try {
+      const trustA = (await handlers.get('sessions:trust')!(null, {
+        id: session.id, expectedConversationId: chatA, trusted: true
+      })) as any;
+      expect(trustA.ok, trustA.error).toBe(true);
+      expect(await rebindSession(session.id, chatA, chatB, 'handoff-resume-trust-0001')).toBe(true);
+      expect(await conversationAccessRefusal(chatB)).toBeNull();
+      expect(isChatTrusted(chatA)).toBe(true);
+      expect(isChatTrusted(chatB)).toBe(false);
+
+      const untrustB = (await handlers.get('sessions:trust')!(null, {
+        id: session.id, expectedConversationId: chatB, trusted: false
+      })) as any;
+      expect(untrustB.ok, untrustB.error).toBe(true);
+      expect(untrustB.data).toEqual([]);
+      expect(isChatTrusted(chatA)).toBe(false);
+      expect(isChatTrusted(chatB)).toBe(false);
+      expect(await conversationAccessRefusal(chatB)).toMatch(/^CHAT_NOT_TRUSTED:/);
+    } finally {
+      getConfig().multiAgent.strictChatAllowlist = false;
+      resetTrustedChatsForTests();
+    }
+  });
+
+  it('Release on the current resumed row clears a blocking source without removing its Trust', async () => {
+    const { isChatBlocked, resetBlockedChatsForTests } = await import('../src/main/session/blocked-chats.js');
+    const { isChatTrusted, resetTrustedChatsForTests } = await import('../src/main/session/trusted-chats.js');
+    const { conversationAccessRefusal } = await import('../src/main/session/conversation-access.js');
+    resetBlockedChatsForTests();
+    resetTrustedChatsForTests();
+    const chatA = '77777777-aaaa-bbbb-cccc-777777777777';
+    const chatB = '88888888-aaaa-bbbb-cccc-888888888888';
+    const session = await createSession({ title: 'blocked resumed source', conversationId: chatA });
+    getConfig().multiAgent.strictChatAllowlist = true;
+    try {
+      expect(((await handlers.get('sessions:trust')!(null, {
+        id: session.id, expectedConversationId: chatA, trusted: true
+      })) as any).ok).toBe(true);
+      expect(((await handlers.get('sessions:block')!(null, { id: session.id, blocked: true })) as any).ok).toBe(true);
+      expect(await rebindSession(session.id, chatA, chatB, 'handoff-release-block-0001')).toBe(true);
+      expect(await conversationAccessRefusal(chatB)).toMatch(/^CHAT_NOT_TRUSTED:/);
+
+      const released = (await handlers.get('sessions:block')!(null, { id: session.id, blocked: false })) as any;
+      expect(released.ok, released.error).toBe(true);
+      expect(isChatBlocked(chatA)).toBe(false);
+      expect(isChatBlocked(chatB)).toBe(false);
+      expect(isChatTrusted(chatA)).toBe(true);
+      expect(await conversationAccessRefusal(chatB)).toBeNull();
+    } finally {
+      getConfig().multiAgent.strictChatAllowlist = false;
+      resetBlockedChatsForTests();
+      resetTrustedChatsForTests();
+    }
+  });
+
   it('releases a block when the row that carries its button is deleted', async () => {
     const { isChatBlocked, resetBlockedChatsForTests } = await import('../src/main/session/blocked-chats.js');
     resetBlockedChatsForTests();
@@ -1162,6 +1891,187 @@ describe('session IPC contracts', () => {
     expect(isChatBlocked(conversationId)).toBe(false);
   });
 
+  it('removes trust when the row that carries its button is deleted', async () => {
+    const { isChatTrusted, resetTrustedChatsForTests } = await import('../src/main/session/trusted-chats.js');
+    resetTrustedChatsForTests();
+    const conversationId = 'eeeeeeee-1111-2222-3333-444444444444';
+    const session = await createSession({ title: 'trusted then deleted', conversationId });
+    await handlers.get('sessions:trust')!(null, {
+      id: session.id, expectedConversationId: conversationId, trusted: true
+    });
+    expect(isChatTrusted(conversationId)).toBe(true);
+
+    const deleted = (await handlers.get('sessions:delete')!(null, { id: session.id })) as any;
+    expect(deleted.ok, deleted.error).toBe(true);
+    expect(isChatTrusted(conversationId)).toBe(false);
+    resetTrustedChatsForTests();
+  });
+
+  it('deleting a resumed row atomically revokes hidden explicit source trust', async () => {
+    const { isChatTrusted, resetTrustedChatsForTests } = await import('../src/main/session/trusted-chats.js');
+    const { conversationAccessRefusal } = await import('../src/main/session/conversation-access.js');
+    resetTrustedChatsForTests();
+    const chatA = '55555555-aaaa-bbbb-cccc-555555555555';
+    const chatB = '66666666-aaaa-bbbb-cccc-666666666666';
+    const session = await createSession({ title: 'resumed trust deleted', conversationId: chatA });
+    getConfig().multiAgent.strictChatAllowlist = true;
+    try {
+      const trusted = (await handlers.get('sessions:trust')!(null, {
+        id: session.id, expectedConversationId: chatA, trusted: true
+      })) as any;
+      expect(trusted.ok, trusted.error).toBe(true);
+      expect(await rebindSession(session.id, chatA, chatB, 'handoff-delete-trust-0001')).toBe(true);
+      expect(await conversationAccessRefusal(chatB)).toBeNull();
+
+      const deleted = (await handlers.get('sessions:delete')!(null, { id: session.id })) as any;
+      expect(deleted.ok, deleted.error).toBe(true);
+      expect(isChatTrusted(chatA)).toBe(false);
+      expect(isChatTrusted(chatB)).toBe(false);
+
+      await createSession({ title: 'old source returned', conversationId: chatA });
+      expect(await conversationAccessRefusal(chatA)).toMatch(/^CHAT_NOT_TRUSTED:/);
+    } finally {
+      getConfig().multiAgent.strictChatAllowlist = false;
+      resetTrustedChatsForTests();
+    }
+  });
+
+  it('deleting a resumed row releases a hidden committed source Block', async () => {
+    const { isChatBlocked, resetBlockedChatsForTests } = await import('../src/main/session/blocked-chats.js');
+    resetBlockedChatsForTests();
+    const chatA = '99999999-aaaa-bbbb-cccc-999999999999';
+    const chatB = 'aaaaaaaa-aaaa-bbbb-cccc-aaaaaaaaaaaa';
+    const session = await createSession({ title: 'resumed source block deleted', conversationId: chatA });
+    try {
+      expect(((await handlers.get('sessions:block')!(null, { id: session.id, blocked: true })) as any).ok).toBe(true);
+      expect(isChatBlocked(chatA)).toBe(true);
+      expect(await rebindSession(session.id, chatA, chatB, 'handoff-delete-block-0001')).toBe(true);
+
+      const deleted = (await handlers.get('sessions:delete')!(null, { id: session.id })) as any;
+      expect(deleted.ok, deleted.error).toBe(true);
+      expect(isChatBlocked(chatA)).toBe(false);
+      expect(isChatBlocked(chatB)).toBe(false);
+    } finally {
+      resetBlockedChatsForTests();
+    }
+  });
+
+  it('preserves the session, Block and Trust when durable trust revocation fails during delete', async () => {
+    const { isChatBlocked, resetBlockedChatsForTests } = await import('../src/main/session/blocked-chats.js');
+    const { isChatTrusted, resetTrustedChatsForTests } = await import('../src/main/session/trusted-chats.js');
+    resetBlockedChatsForTests();
+    resetTrustedChatsForTests();
+    const conversationId = 'abababab-1111-2222-3333-444444444444';
+    const session = await createSession({ title: 'policy survives failed delete', conversationId });
+    await handlers.get('sessions:trust')!(null, {
+      id: session.id, expectedConversationId: conversationId, trusted: true
+    });
+    await handlers.get('sessions:block')!(null, { id: session.id, blocked: true });
+    expect(isChatTrusted(conversationId)).toBe(true);
+    expect(isChatBlocked(conversationId)).toBe(true);
+
+    // Block saves on a short delay. Settle it first, and fail only the trust file's save: a
+    // one-shot failure on whatever renames next went to a late Block save on slow runners.
+    await flushDurable();
+    const realRename = fs.rename.bind(fs);
+    let failed = false;
+    const rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (!failed && String(to).includes('trusted-chats')) {
+        failed = true;
+        throw Object.assign(new Error('simulated trust revoke failure'), { code: 'EIO' });
+      }
+      return realRename(from, to);
+    });
+    try {
+      const deleted = (await handlers.get('sessions:delete')!(null, { id: session.id })) as any;
+      expect(deleted.ok).toBe(false);
+      expect(deleted.error).toMatch(/simulated trust revoke failure/i);
+      expect(isChatTrusted(conversationId)).toBe(true);
+      expect(isChatBlocked(conversationId)).toBe(true);
+      expect(await getSession(session.id)).not.toBeNull();
+      await flushDurable();
+    } finally {
+      rename.mockRestore();
+      resetBlockedChatsForTests();
+      resetTrustedChatsForTests();
+    }
+  });
+
+  it('fences concurrent Trust while session deletion is waiting on its durable revoke', async () => {
+    const { isChatTrusted, resetTrustedChatsForTests } = await import('../src/main/session/trusted-chats.js');
+    resetTrustedChatsForTests();
+    const conversationId = 'cdcdcdcd-1111-2222-3333-444444444444';
+    const session = await createSession({ title: 'trust raced with delete', conversationId });
+    await handlers.get('sessions:trust')!(null, {
+      id: session.id, expectedConversationId: conversationId, trusted: true
+    });
+    expect(isChatTrusted(conversationId)).toBe(true);
+
+    const gate = faultGate();
+    const originalRename = fs.rename.bind(fs);
+    const rename = vi.spyOn(fs, 'rename').mockImplementationOnce(async (...args: Parameters<typeof fs.rename>) => {
+      await gate.hold();
+      return originalRename(...args);
+    });
+    try {
+      const deleting = handlers.get('sessions:delete')!(null, { id: session.id }) as Promise<any>;
+      await gate.entered;
+
+      const racedTrust = (await handlers.get('sessions:trust')!(null, {
+        id: session.id, expectedConversationId: conversationId, trusted: true
+      })) as any;
+      expect(racedTrust.ok).toBe(false);
+      expect(racedTrust.error).toMatch(/being deleted/i);
+
+      gate.release();
+      const deleted = await deleting;
+      expect(deleted.ok, deleted.error).toBe(true);
+      expect(await getSession(session.id)).toBeNull();
+      expect(isChatTrusted(conversationId)).toBe(false);
+    } finally {
+      gate.release();
+      rename.mockRestore();
+      resetTrustedChatsForTests();
+    }
+  });
+
+  it('fences concurrent Block while session deletion is waiting on filesystem removal', async () => {
+    const { isChatBlocked, resetBlockedChatsForTests } = await import('../src/main/session/blocked-chats.js');
+    resetBlockedChatsForTests();
+    const conversationId = 'efefefef-1111-2222-3333-444444444444';
+    const session = await createSession({ title: 'block raced with delete', conversationId });
+    await handlers.get('sessions:block')!(null, { id: session.id, blocked: true });
+    expect(isChatBlocked(conversationId)).toBe(true);
+
+    const gate = faultGate();
+    const originalRm = fs.rm.bind(fs);
+    const rm = vi.spyOn(fs, 'rm').mockImplementationOnce(async (...args: Parameters<typeof fs.rm>) => {
+      await gate.hold();
+      return originalRm(...args);
+    });
+    try {
+      const deleting = handlers.get('sessions:delete')!(null, { id: session.id }) as Promise<any>;
+      await gate.entered;
+      expect(isChatBlocked(conversationId)).toBe(false);
+
+      const racedBlock = (await handlers.get('sessions:block')!(null, {
+        id: session.id, blocked: true
+      })) as any;
+      expect(racedBlock.ok).toBe(false);
+      expect(racedBlock.error).toMatch(/being deleted/i);
+
+      gate.release();
+      const deleted = await deleting;
+      expect(deleted.ok, deleted.error).toBe(true);
+      expect(await getSession(session.id)).toBeNull();
+      expect(isChatBlocked(conversationId)).toBe(false);
+    } finally {
+      gate.release();
+      rm.mockRestore();
+      resetBlockedChatsForTests();
+    }
+  });
+
   it('reports the blocked set with every session list, so one paint marks every row', async () => {
     const { resetBlockedChatsForTests } = await import('../src/main/session/blocked-chats.js');
     resetBlockedChatsForTests();
@@ -1174,6 +2084,20 @@ describe('session IPC contracts', () => {
     resetBlockedChatsForTests();
   });
 
+  it('reports the trusted set with every session list as live access policy', async () => {
+    const { resetTrustedChatsForTests } = await import('../src/main/session/trusted-chats.js');
+    resetTrustedChatsForTests();
+    const conversationId = 'ffffffff-1111-2222-3333-444444444444';
+    const session = await createSession({ title: 'listed while trusted', conversationId });
+
+    expect((await sessionList()).data.trusted).toEqual([]);
+    await handlers.get('sessions:trust')!(null, {
+      id: session.id, expectedConversationId: conversationId, trusted: true
+    });
+    expect((await sessionList()).data.trusted).toEqual([conversationId]);
+    resetTrustedChatsForTests();
+  });
+
   it('opens only the stored conversation URL in Chrome', async () => {
     const session = await createSession({
       title: 'open me',
@@ -1181,8 +2105,10 @@ describe('session IPC contracts', () => {
     });
     const reply = await handlers.get('sessions:openChat')!(null, { id: session.id }) as any;
     expect(reply.ok, reply.error).toBe(true);
+    // An explicit user action: only the CoS browser uses `reveal`, to bring its window forward.
     expect(openInPreferredBrowser).toHaveBeenCalledWith(
-      'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+      'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      { reveal: true }
     );
 
     const unattributed = await createSession({ title: 'no conversation', conversationId: null });
@@ -1190,6 +2116,100 @@ describe('session IPC contracts', () => {
     expect(refused.ok).toBe(false);
     expect(refused.error).toMatch(/no valid ChatGPT conversation/i);
   });
+
+  it.each([
+    ['cos', true],
+    ['cos', false],
+    ['chrome', true],
+    ['chrome', false],
+    ['edge', true],
+    ['edge', false],
+    ['brave', true],
+    ['brave', false]
+  ] as const)(
+    'routes history chat with preference %s when extension claim is %s',
+    async (browser, extensionClaimsChat) => {
+      const original = getConfig();
+      const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+      const session = await createSession({ title: 'route by browser preference', conversationId });
+      const reveal = vi.spyOn(bridgeModule, 'revealChatInBrowser').mockResolvedValue(extensionClaimsChat);
+      try {
+        await saveConfig({ ...original, ui: { ...original.ui, chatBrowser: browser } });
+        vi.mocked(openInPreferredBrowser).mockClear();
+
+        const reply = await handlers.get('sessions:openChat')!(null, { id: session.id }) as any;
+
+        expect(reply.ok, reply.error).toBe(true);
+        const url = `https://chatgpt.com/c/${conversationId}`;
+        if (browser === 'cos') {
+          expect(reveal).not.toHaveBeenCalled();
+          expect(openInPreferredBrowser).toHaveBeenCalledWith(url, { reveal: true });
+        } else if (extensionClaimsChat) {
+          expect(reveal).toHaveBeenCalledWith(conversationId);
+          expect(openInPreferredBrowser).not.toHaveBeenCalled();
+        } else {
+          expect(reveal).toHaveBeenCalledWith(conversationId);
+          expect(openInPreferredBrowser).toHaveBeenCalledWith(url, { reveal: true });
+        }
+      } finally {
+        reveal.mockRestore();
+        await saveConfig(original);
+      }
+    }
+  );
+});
+
+it('follows only the newest chat selection when an earlier lookup finishes last (#1249, #1267)', async () => {
+  const bridge = await import('../src/main/bridge.js');
+  const store = await import('../src/main/session/store.js');
+  const first = await createSession({ title: 'first', conversationId: 'aaaaaaaa-1111-4222-8333-444444444444' });
+  const second = await createSession({ title: 'second', conversationId: 'bbbbbbbb-1111-4222-8333-444444444444' });
+  const followed = vi.spyOn(bridge, 'followChatInBackground').mockImplementation(() => undefined);
+  const lookup = store.getSession;
+  let releaseFirst: () => void = () => undefined;
+  const firstHeld = new Promise<void>(resolve => { releaseFirst = resolve; });
+  const slow = vi.spyOn(store, 'getSession').mockImplementation(async (id, ...rest) => {
+    if (id === first.id) await firstHeld;
+    return lookup(id, ...rest);
+  });
+  try {
+    const earlier = handlers.get('sessions:followTab')!(null, { id: first.id });
+    const later = await handlers.get('sessions:followTab')!(null, { id: second.id }) as any;
+    expect(later.ok, later.error).toBe(true);
+    releaseFirst();
+    expect(((await earlier) as any).ok).toBe(true);
+    expect(followed.mock.calls).toEqual([['bbbbbbbb-1111-4222-8333-444444444444']]);
+  } finally { slow.mockRestore(); followed.mockRestore(); }
+});
+
+it('saves this computer\'s connector suffix normalized, refuses an invalid one, and keeps a newer one through an older form', async () => {
+  // The saves below change the theme, which repaints the window.
+  currentWindow = { setBackgroundColor: vi.fn(), setTitleBarOverlay: vi.fn(), isDestroyed: () => false, webContents: { send: vi.fn() } };
+  const base = getConfig();
+  expect(await save({ ...base, connectorSuffix: '  Windows   VM ' }, base)).toMatchObject({ ok: true });
+  expect(getConfig().connectorSuffix).toBe('Windows VM');
+
+  // Invalid characters are refused, and nothing in that save is written.
+  const before = getConfig();
+  expect(await save({ ...before, connectorSuffix: 'Win/VM', ui: { ...before.ui, theme: before.ui.theme === 'light' ? 'dark' : 'light' } }, before))
+    .toMatchObject({ ok: false });
+  expect(getConfig().connectorSuffix).toBe('Windows VM');
+  expect(getConfig().ui.theme).toBe(before.ui.theme);
+
+  // A form opened before another writer changed the suffix, saving something else, keeps the newer suffix.
+  const stale = getConfig();
+  await saveConfig({ ...getConfig(), connectorSuffix: 'Mac' });
+  expect(await save({ ...stale, ui: { ...stale.ui, theme: stale.ui.theme === 'light' ? 'dark' : 'light' } }, stale)).toMatchObject({ ok: true });
+  expect(getConfig().connectorSuffix).toBe('Mac');
+
+  // A caller that does not carry the field at all (the Plugins page) leaves it alone.
+  const { connectorSuffix: _omitted, ...withoutSuffix } = getConfig();
+  expect(await save(withoutSuffix, withoutSuffix)).toMatchObject({ ok: true });
+  expect(getConfig().connectorSuffix).toBe('Mac');
+
+  const clear = getConfig();
+  expect(await save({ ...clear, connectorSuffix: '' }, clear)).toMatchObject({ ok: true });
+  expect(getConfig().connectorSuffix).toBe('');
 });
 
 describe('renderer pushes after the window is gone', () => {
@@ -1233,4 +2253,357 @@ describe('Stop IPC exact session and turn authority', () => {
     const missing = await createSession({ title: 'No browser ownership', conversationId: null });
     expect(await invoke({ id: missing.id, expectedTurnId: 'ipc-stop-one' })).toMatchObject({ ok: false, error: 'session_not_recorded' });
   });
+});
+
+it('saves a diagnostics report through the renderer channel without personal details', async () => {
+  const { flushLogFile, initLogFile, logInfo } = await import('../src/main/logger.js');
+  const home = path.join(dir, 'home-jane');
+  const clients = path.join(home, 'Acme Clients');
+  await fs.mkdir(clients, { recursive: true });
+  initLogFile(path.join(dir, 'app.log'));
+  logInfo(`tool read rejected: ENOENT, open '${path.join(clients, 'invoice 7.xlsx')}' for jane@example.com`);
+  logInfo('bridge: gave up on worker:run-1:worker-2 — the chat this app opened did not report back in time');
+  await flushLogFile();
+  await createSession({ title: 'Quarterly tax return draft', conversationId: 'diagnostics-report-session' });
+  const getPath = app.getPath;
+  const target = path.join(dir, 'report.txt');
+  (app as { getPath: (name: string) => string }).getPath = (name: string) => name === 'home' ? home : dir;
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: target } as never);
+  try {
+    expect(await handlers.get('diagnostics:saveReport')!(null, undefined)).toEqual({ ok: true, data: { saved: true, name: 'report.txt' } });
+  } finally {
+    (app as { getPath: typeof getPath }).getPath = getPath;
+  }
+  const report = await fs.readFile(target, 'utf8');
+  expect(report).toContain('# Chat On Steroids diagnostics report');
+  expect(report).toContain('did not report back in time');
+  expect(report).toMatch(/open '~[\\/]<p:[0-9a-f]{4}>[\\/]<p:[0-9a-f]{4}>\.xlsx'/);
+  for (const personal of ['home-jane', 'Acme', 'invoice', 'jane@example.com', 'Quarterly tax return']) expect(report).not.toContain(personal);
+  expect(shell.showItemInFolder).toHaveBeenCalledWith(target);
+});
+
+it('saves a code block where the save dialog says, offering only its bare name in Downloads', async () => {
+  const save = (payload: unknown) => handlers.get('code:save')!(null, payload);
+  const getPath = app.getPath;
+  const target = path.join(dir, 'chosen.ts');
+  (app as { getPath: (name: string) => string }).getPath = (name: string) => path.join(dir, name);
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: target } as never);
+  try {
+    expect(await save({ text: 'const answer = 42;\n', name: 'snippet.ts' })).toEqual({ ok: true, data: { done: 'saved', name: 'chosen.ts' } });
+  } finally {
+    (app as { getPath: typeof getPath }).getPath = getPath;
+  }
+  expect(vi.mocked(dialog.showSaveDialog).mock.lastCall!.at(-1)).toMatchObject({
+    defaultPath: path.join(dir, 'downloads', 'snippet.ts'),
+    filters: [{ name: 'Text files', extensions: ['ts'] }]
+  });
+  expect(await fs.readFile(target, 'utf8')).toBe('const answer = 42;\n');
+  // The renderer suggests a name, never a place: anything but a bare `name.ext` is refused before any dialog.
+  vi.mocked(dialog.showSaveDialog).mockClear();
+  for (const name of ['../snippet.ts', 'C:\\Users\\you\\snippet.ts', '/home/you/snippet.ts', 'snippet']) {
+    expect(await save({ text: 'x', name })).toMatchObject({ ok: false });
+  }
+  expect(dialog.showSaveDialog).not.toHaveBeenCalled();
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: true } as never);
+  expect(await save({ text: 'x', name: 'snippet.txt' })).toEqual({ ok: true, data: { done: 'cancelled' } });
+});
+
+it('leaves a code file the person chose to replace whole when writing the new one fails', async () => {
+  const folder = path.join(dir, 'code-replace');
+  const target = path.join(folder, 'kept.ts');
+  await fs.mkdir(folder, { recursive: true });
+  await fs.writeFile(target, 'const kept = true;\n', 'utf8');
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: target } as never);
+  const writeFile = fs.writeFile.bind(fs);
+  // The disk fills up partway: whatever file is being written ends up cut short.
+  const write = vi.spyOn(fs, 'writeFile').mockImplementationOnce(async (file) => {
+    await writeFile(file, 'const half', 'utf8');
+    throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+  });
+  try {
+    expect(await handlers.get('code:save')!(null, { text: 'const replaced = true;\n', name: 'snippet.ts' })).toMatchObject({ ok: false });
+  } finally {
+    write.mockRestore();
+  }
+  expect(await fs.readFile(target, 'utf8')).toBe('const kept = true;\n');
+  expect(await fs.readdir(folder)).toEqual(['kept.ts']);
+  const { getLog } = await import('../src/main/logger.js');
+  expect(getLog().at(-1)).toMatchObject({ level: 'warn', message: 'code save: refused, the file could not be written or replaced (ENOSPC)' });
+});
+
+it.runIf(process.platform !== 'win32')('keeps a replaced script runnable when a code block is saved over it', async () => {
+  const target = path.join(dir, 'run.sh');
+  await fs.writeFile(target, 'echo old\n', 'utf8');
+  await fs.chmod(target, 0o750);
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: target } as never);
+  expect(await handlers.get('code:save')!(null, { text: 'echo new\n', name: 'snippet.sh' })).toEqual({ ok: true, data: { done: 'saved', name: 'run.sh' } });
+  expect(await fs.readFile(target, 'utf8')).toBe('echo new\n');
+  expect((await fs.stat(target)).mode & 0o777).toBe(0o750);
+});
+
+it.runIf(process.platform !== 'win32')('never leaves the new text of a private file readable to others while a code block is saved over it', async () => {
+  const target = path.join(dir, 'private.env');
+  await fs.writeFile(target, 'TOKEN=old\n', 'utf8');
+  await fs.chmod(target, 0o600);
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: target } as never);
+  const writeFile = fs.writeFile.bind(fs);
+  let modeWhileWriting: number | undefined;
+  const write = vi.spyOn(fs, 'writeFile').mockImplementationOnce(async (file, data, options) => {
+    await writeFile(file, data, options);
+    modeWhileWriting = (await fs.stat(String(file))).mode & 0o777;
+  });
+  try {
+    expect(await handlers.get('code:save')!(null, { text: 'TOKEN=new\n', name: 'snippet.env' })).toMatchObject({ ok: true });
+  } finally {
+    write.mockRestore();
+  }
+  expect(modeWhileWriting).toBe(0o600);
+  expect((await fs.stat(target)).mode & 0o777).toBe(0o600);
+});
+
+it.runIf(process.platform !== 'win32')('leaves a code file alone when its permissions cannot be read', async () => {
+  const folder = path.join(dir, 'code-unreadable-mode');
+  const target = path.join(folder, 'run.sh');
+  await fs.mkdir(folder, { recursive: true });
+  await fs.writeFile(target, 'echo old\n', 'utf8');
+  await fs.chmod(target, 0o750);
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: target } as never);
+  const stat = vi.spyOn(fs, 'stat').mockRejectedValueOnce(Object.assign(new Error('i/o error'), { code: 'EIO' }));
+  try {
+    expect(await handlers.get('code:save')!(null, { text: 'echo new\n', name: 'snippet.sh' })).toMatchObject({ ok: false });
+  } finally {
+    stat.mockRestore();
+  }
+  expect(await fs.readFile(target, 'utf8')).toBe('echo old\n');
+  expect((await fs.stat(target)).mode & 0o777).toBe(0o750);
+  expect(await fs.readdir(folder)).toEqual(['run.sh']);
+  const { getLog } = await import('../src/main/logger.js');
+  expect(getLog().at(-1)).toMatchObject({ level: 'warn', message: "code save: refused, the chosen file's permissions could not be read (EIO)" });
+});
+
+it.runIf(process.platform !== 'win32')('writes through a symlink chosen in the save dialog instead of replacing the link', async () => {
+  const folder = path.join(dir, 'code-symlink');
+  const real = path.join(folder, 'real.ts');
+  const link = path.join(folder, 'link.ts');
+  await fs.mkdir(folder, { recursive: true });
+  await fs.writeFile(real, 'const old = true;\n', 'utf8');
+  await fs.symlink('real.ts', link);
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: link } as never);
+  expect(await handlers.get('code:save')!(null, { text: 'const fresh = true;\n', name: 'snippet.ts' })).toEqual({ ok: true, data: { done: 'saved', name: 'link.ts' } });
+  expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+  expect(await fs.readFile(real, 'utf8')).toBe('const fresh = true;\n');
+  expect((await fs.readdir(folder)).sort()).toEqual(['link.ts', 'real.ts']);
+  // A link to nothing has no file to keep whole: the save stops and says why.
+  const dangling = path.join(folder, 'dangling.ts');
+  await fs.symlink('missing.ts', dangling);
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: dangling } as never);
+  expect(await handlers.get('code:save')!(null, { text: 'x', name: 'snippet.ts' })).toMatchObject({ ok: false });
+  expect((await fs.lstat(dangling)).isSymbolicLink()).toBe(true);
+  expect((await fs.readdir(folder)).sort()).toEqual(['dangling.ts', 'link.ts', 'real.ts']);
+  const { getLog } = await import('../src/main/logger.js');
+  expect(getLog().at(-1)).toMatchObject({ level: 'warn', message: 'code save: refused, the chosen file could not be resolved (ENOENT)' });
+});
+
+it('refuses a usage export without a positive, finite divisor, and logs why', async () => {
+  const { getLog } = await import('../src/main/logger.js');
+  const dialogs = vi.mocked(dialog.showSaveDialog).mock.calls.length;
+  for (const payload of [null, {}, { divisor: 0 }, { divisor: -2 }, { divisor: Number.POSITIVE_INFINITY }, { divisor: '2' }]) {
+    const before = getLog().length;
+    expect(await handlers.get('usage:export')!(null, payload)).toMatchObject({ ok: false });
+    expect(getLog().slice(before)).toEqual([expect.objectContaining({ level: 'warn', message: 'usage export: refused, the page sent no positive, finite token divisor' })]);
+  }
+  expect(vi.mocked(dialog.showSaveDialog).mock.calls.length).toBe(dialogs);
+});
+
+describe('native worker checkout cleanup confirmation', () => {
+  const offer = {
+    runId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    agentId: 'worker-1',
+    createdAt: 1723456789000,
+    reason: 'cleared' as const,
+    label: 'Review API'
+  };
+  const preview = {
+    ...offer,
+    workspace: '/approved/.chat-on-steroids-worktrees/owned/checkout',
+    branch: 'cos/worker-1',
+    headOid: 'a'.repeat(40),
+    dirty: true,
+    ignoredFiles: false,
+    uniqueCommits: false,
+    changes: ['M tracked.txt'],
+    blockers: ['tracked-changes'],
+    canOfferRemoval: false,
+    hasWorkerCommits: false,
+    branchIntegratedIntoSource: true,
+    trackedChangesCount: 1,
+    untrackedFilesCount: 0,
+    ignoredFilesCount: 0,
+    changesTruncated: false,
+    contentFingerprint: 'f'.repeat(64)
+  };
+  const invoke = (channel: string, payload?: unknown) => handlers.get(channel)!(null, payload) as Promise<any>;
+
+  async function withPreview(run: (spies: {
+    list: ReturnType<typeof vi.spyOn>;
+    dispose: ReturnType<typeof vi.spyOn>;
+  }) => Promise<void>): Promise<void> {
+    const agents = await import('../src/main/agents.js');
+    const worktrees = await import('../src/main/worktrees/index.js');
+    const offers = vi.spyOn(agents, 'managedWorktreeCleanupOffers').mockReturnValue([offer]);
+    const acknowledge = vi.spyOn(agents, 'acknowledgeManagedWorktreeCleanupOffer').mockReturnValue(true);
+    const list = vi.spyOn(worktrees, 'listOfferedWorkerWorktrees').mockResolvedValue([preview] as never);
+    const dispose = vi.spyOn(worktrees, 'disposeOfferedWorkerWorktree').mockResolvedValue({
+      removed: true, branchRemoved: false, branch: preview.branch, changes: []
+    });
+    try { await run({ list, dispose }); }
+    finally {
+      dispose.mockRestore();
+      list.mockRestore();
+      acknowledge.mockRestore();
+      offers.mockRestore();
+    }
+  }
+
+  it('sends only UI-safe summary data and defaults to keeping the checkout', async () => {
+    await withPreview(async ({ dispose }) => {
+      const listing = await invoke('swarm:worktreeCleanupList');
+      expect(listing).toMatchObject({ ok: true, data: [expect.objectContaining({ agentId: offer.agentId, dirty: true })] });
+      expect(JSON.stringify(listing)).not.toContain(preview.contentFingerprint);
+      expect(JSON.stringify(listing)).not.toContain(preview.headOid);
+      expect(JSON.stringify(listing)).not.toContain(preview.changes[0]);
+      expect(await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId }))
+        .toEqual({ ok: true, data: { removed: false, branchPreserved: true } });
+      expect(dialog.showMessageBox).toHaveBeenCalledWith(expect.objectContaining({
+        defaultId: 0, cancelId: 0, buttons: ['Keep checkout', 'Remove checkout; preserve Git branch']
+      }));
+      expect(dispose).not.toHaveBeenCalled();
+    });
+  });
+
+  it('accepts the renderer\'s whole set of main-process texts', async () => {
+    // The channel's size bound once stayed at 32 while the set grew past it, and a refused set
+    // left the tray, notices and dialogs English in every language.
+    const { MAIN_TEXTS } = await import('../src/shared/main-texts.js');
+    const { mainText, setMainTextTranslations } = await import('../src/main/main-texts.js');
+    try {
+      expect(await invoke('ui:mainTexts', Object.fromEntries(MAIN_TEXTS.map(source => [source, `«${source}»`]))))
+        .toMatchObject({ ok: true });
+      expect(mainText('Quit')).toBe('«Quit»');
+      expect(mainText('Attach files')).toBe('«Attach files»');
+    } finally { setMainTextTranslations({}); }
+  });
+
+  it('asks in the interface language before removing a worker checkout', async () => {
+    const { setMainTextTranslations } = await import('../src/main/main-texts.js');
+    setMainTextTranslations({
+      'Remove worker Git checkout?': 'Worker-Git-Checkout entfernen?',
+      'Keep checkout': 'Checkout behalten',
+      'Checkout: {0}': 'Checkout: {0}',
+      'Uncommitted or ignored paths that would be discarded ({0}):': 'Nicht committete oder ignorierte Pfade, die verworfen würden ({0}):'
+    });
+    try {
+      await withPreview(async ({ dispose }) => {
+        await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId });
+        const options = vi.mocked(dialog.showMessageBox).mock.calls.at(-1)?.at(-1) as Electron.MessageBoxOptions;
+        expect(options.title).toBe('Worker-Git-Checkout entfernen?');
+        expect(options.buttons).toEqual(['Checkout behalten', 'Remove checkout; preserve Git branch']);
+        expect(options.detail).toContain(`Checkout: ${preview.workspace}`);
+        expect(options.detail).toContain('Nicht committete oder ignorierte Pfade, die verworfen würden (1):');
+        expect(dispose).not.toHaveBeenCalled();
+      });
+    } finally { setMainTextTranslations({}); }
+  });
+
+  it('rejects a same-path, same-status and same-size content edit made while the dialog is open', async () => {
+    await withPreview(async ({ list, dispose }) => {
+      // A fingerprint is the sole differing field; Git status/path/count and file sizes
+      // would all still look the same to the existing IPC comparison.
+      list.mockResolvedValueOnce([preview] as never)
+        .mockResolvedValueOnce([{ ...preview, contentFingerprint: 'e'.repeat(64) }] as never);
+      vi.mocked(dialog.showMessageBox).mockResolvedValueOnce({ response: 1 } as never);
+      const result = await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId });
+      expect(result).toEqual({ ok: false, error: 'The checkout changed while you were reviewing it. No files were removed.' });
+      expect(list).toHaveBeenCalledTimes(2);
+      expect(dispose).not.toHaveBeenCalled();
+    });
+  });
+
+  it('refuses missing/truncated fingerprints and unreadable post-dialog inspections', async () => {
+    await withPreview(async ({ list, dispose }) => {
+      list.mockResolvedValueOnce([{ ...preview, contentFingerprint: null }] as never);
+      expect((await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId })).ok).toBe(false);
+      expect(dialog.showMessageBox).not.toHaveBeenCalled();
+      list.mockResolvedValueOnce([{ ...preview, changesTruncated: true }] as never);
+      expect((await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId })).ok).toBe(false);
+      expect(dialog.showMessageBox).not.toHaveBeenCalled();
+      list.mockResolvedValueOnce([preview] as never).mockResolvedValueOnce([] as never);
+      vi.mocked(dialog.showMessageBox).mockResolvedValueOnce({ response: 1 } as never);
+      expect((await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId })).error)
+        .toBe('The checkout changed while you were reviewing it. No files were removed.');
+      expect(dispose).not.toHaveBeenCalled();
+    });
+  });
+
+  it('passes the approved fingerprint to the manager, including its last-moment mismatch guard', async () => {
+    const { WorkerWorktreeError } = await import('../src/main/worktrees/index.js');
+    await withPreview(async ({ dispose }) => {
+      vi.mocked(dialog.showMessageBox).mockResolvedValueOnce({ response: 1 } as never);
+      const accepted = await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId });
+      expect(accepted).toEqual({ ok: true, data: { removed: true, branchPreserved: true } });
+      expect(dispose).toHaveBeenCalledWith(expect.any(Array), expect.objectContaining({
+        runId: offer.runId, agentId: offer.agentId
+      }), expect.any(Array), preview.contentFingerprint);
+
+      dispose.mockRejectedValueOnce(new WorkerWorktreeError('WORKTREE_CONTENT_CHANGED', 'file bytes changed after approval'));
+      vi.mocked(dialog.showMessageBox).mockResolvedValueOnce({ response: 1 } as never);
+      const refused = await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId });
+      expect(refused).toEqual({ ok: false, error: 'The checkout changed while you were reviewing it. No files were removed.' });
+    });
+  });
+});
+
+it('projects reloaded unreadable ledger health through state:get and recovers only through explicit reset', async () => {
+  const file = path.join(dir, 'state', 'plugin-refresh.json');
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, '{broken');
+  initDurableStore(dir);
+  const broken: any = await handlers.get('state:get')!(null, undefined);
+  expect(broken).toMatchObject({ ok: true, data: { pluginRefreshUnreadable: true } });
+  expect(await fs.readFile(file, 'utf8')).toBe('{broken');
+  const reset: any = await handlers.get('plugin-refresh:reset')!(null, undefined);
+  expect(reset).toMatchObject({ ok: true, data: { pluginRefreshUnreadable: false } });
+  expect(await readDurable('plugin-refresh')).toEqual([]);
+  const backups = (await fs.readdir(path.dirname(file))).filter(name => name.startsWith('plugin-refresh.recovery-'));
+  expect(await fs.readFile(path.join(path.dirname(file), backups.at(-1)!), 'utf8')).toBe('{broken');
+});
+
+// #1406: the recording store held a fixed 2 GB. Settings now offers larger sizes, applied at once.
+it('saves the recording storage size and applies it to the store', async () => {
+  const store = await import('../src/main/session/store.js');
+  await save({ ...getConfig(), sessions: { ...getConfig().sessions, storageLimitGiB: 10 } });
+  expect(getConfig().sessions.storageLimitGiB).toBe(10);
+  expect(await store.getImageStorage()).toMatchObject({ limitBytes: 10 * 2 ** 30 });
+  // Only offered sizes are accepted.
+  expect(await save({ ...getConfig(), sessions: { ...getConfig().sessions, storageLimitGiB: 3 } })).toMatchObject({ ok: false, error: 'Invalid input' });
+  expect(getConfig().sessions.storageLimitGiB).toBe(10);
+  await save({ ...getConfig(), sessions: { ...getConfig().sessions, storageLimitGiB: 2 } });
+  expect(await store.getImageStorage()).toMatchObject({ limitBytes: 2 * 2 ** 30 });
+});
+
+// Most installs from before Automatic plugin refresh existed have it saved as off without ever
+// choosing that. The app asks once; the answer is kept either way, and a settings save keeps it.
+it('records the one-time answer to the automatic plugin refresh offer', async () => {
+  await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: false } });
+  expect(getConfig().ui.autoRefreshPluginsAsked).toBe(false);
+  const declined: any = await handlers.get('pluginRefresh:offer')!(null, { turnOn: false });
+  expect(declined).toMatchObject({ ok: true, data: { config: { ui: { autoRefreshPlugins: false, autoRefreshPluginsAsked: true } } } });
+  // A later settings save from the window does not bring the question back.
+  await save({ ...getConfig(), ui: { ...getConfig().ui, theme: 'light' } });
+  expect(getConfig().ui.autoRefreshPluginsAsked).toBe(true);
+
+  await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: false } });
+  const accepted: any = await handlers.get('pluginRefresh:offer')!(null, { turnOn: true });
+  expect(accepted).toMatchObject({ ok: true, data: { config: { ui: { autoRefreshPlugins: true, autoRefreshPluginsAsked: true } } } });
+  expect(await handlers.get('pluginRefresh:offer')!(null, { turnOn: 'yes' })).toMatchObject({ ok: false });
 });

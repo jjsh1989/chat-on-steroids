@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ToolSchema } from '@modelcontextprotocol/core';
-import { Client, StreamableHTTPClientTransport, UnauthorizedError, type Tool, type CallToolResult } from '@modelcontextprotocol/client';
+import { Client, ProtocolError, SdkError, SdkErrorCode, StreamableHTTPClientTransport, UnauthorizedError, type Tool, type CallToolResult } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { getMcpConfigForManifest, vAny } from '@anthropic-ai/mcpb/browser';
 import { getSecret, setSecret, clearSecret } from '../secrets.js';
@@ -10,13 +10,34 @@ import { readDurable, writeDurableNow } from '../durable.js';
 import { setEnvValue } from '../env.js';
 import { redactCredentialText } from '../redaction.js';
 import type { PluginConfigPatch, PluginInstallRequest, PluginSnapshot, PluginView } from '../../shared/plugins.js';
+import { DEFAULT_PLUGIN_LONGEST_CALL_SECONDS, MAX_PLUGIN_LONGEST_CALL_SECONDS } from '../../shared/plugins.js';
 import { installSource, pluginEnvironment, resolveGithub, stopInstallers, type InstalledLaunch } from './installer.js';
 import { terminateProcessTree } from '../exec.js';
 import { pluginCatalog, reviewedPluginLicense } from './catalog.js';
 import sharp from 'sharp';
 import { pluginExposure } from './exposure.js';
+import { logWarn } from '../logger.js';
+import { SURFACES, surfaceDefinition } from '../mcp/surfaces.js';
+
+/**
+ * How long a local (stdio) plugin may take to start and answer MCP initialize. A Python server's
+ * first start after install compiles its bytecode, and on Windows antivirus scans every new file:
+ * 20 s was not always enough (Unity on a hosted Windows runner, 2026-10-10), and a timed-out start
+ * leaves the plugin in an error state until the user restarts it. Starts run in the background.
+ */
+export const STDIO_START_TIMEOUT_MS = 60_000;
+
+/**
+ * Removes a plugin's folder. On Windows a server's process tree can keep its folder locked for a
+ * few seconds after it was killed, and a single attempt then fails with EBUSY. Node retries
+ * EBUSY/EPERM/ENOTEMPTY with a linear back-off: 10 retries of 200 ms add up to about 11 s.
+ */
+function removePluginFolder(directory: string): Promise<void> {
+  return fs.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+}
 import { PluginOAuth, PluginNeedsAuth, PluginOAuthSetupError, clearPluginOAuth } from './oauth.js';
 export { PLUGIN_MAX_TOOLS, PLUGIN_MAX_SCHEMA_BYTES } from './exposure.js';
+import { PLUGIN_DISCOVERY_MAX_BYTES, PLUGIN_DISCOVERY_MAX_TOOLS } from './exposure.js';
 
 interface RecordEntry extends Omit<PluginView, 'tools'> {
   /** Validated discovery belongs to the installation, not a replaceable connection. */
@@ -32,6 +53,25 @@ interface Live {
   users: number;
   oauth?: PluginOAuth;
 }
+
+function validLongestCallSeconds(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= MAX_PLUGIN_LONGEST_CALL_SECONDS;
+}
+function longestCallSeconds(value: unknown): number {
+  if (!validLongestCallSeconds(value)) throw new Error(`Longest call must be an integer from 1 to ${MAX_PLUGIN_LONGEST_CALL_SECONDS} seconds.`);
+  return value;
+}
+
+/** Protocol errors created locally after a successful tool response still mean the server broke its declared contract. */
+function isLocalToolOutputValidationError(error: unknown): boolean {
+  if (!(error instanceof ProtocolError)) return false;
+  return (
+    (error.message.startsWith('Tool ') && error.message.includes(' has an output schema but did not return structured content')) ||
+    error.message.startsWith("Structured content does not match the tool's output schema:") ||
+    error.message.startsWith('Failed to validate structured content:')
+  );
+}
+
 const boundedFetch: typeof fetch = async (input, init) => {
   const response = await fetch(input, { ...init, redirect: 'error' });
   if (!response.body) return response;
@@ -95,7 +135,7 @@ export class PluginManager {
       ? stored.filter(p => this.validRecord(p)).map(p => {
         const { tools: _legacyTools, ...record } = p as RecordEntry & { tools?: unknown };
         const catalog = this.validCatalog(record.catalog);
-        return { ...record, catalog, status: record.enabled ? 'connecting' : 'disabled' };
+        return { ...record, catalog, longestCallSeconds: validLongestCallSeconds(record.longestCallSeconds) ? record.longestCallSeconds : DEFAULT_PLUGIN_LONGEST_CALL_SECONDS, status: record.enabled ? 'connecting' : 'disabled' };
       })
       : [];
     this.changed();
@@ -108,6 +148,10 @@ export class PluginManager {
       id: row.id, name: row.name, enabled: row.enabled && !['error', 'needs-auth', 'authenticating'].includes(row.status) && (row.source.auth !== 'oauth' || this.live.has(row.id)),
       tools: row.catalog, disabledTools: row.disabledTools,
     })));
+  }
+  /** Remote plugin addresses, so the app's proxy can leave the ones the system reaches directly alone. */
+  remoteEndpoints(): string[] {
+    return this.records.flatMap(row => row.source.kind === 'remote' && row.source.url ? [row.source.url] : []);
   }
   snapshot(): PluginSnapshot {
     const exposure = this.exposure();
@@ -270,6 +314,7 @@ export class PluginManager {
       if (source.kind === 'github') source = resolveGithub(source);
       if (source.kind === 'remote') this.remoteUrl(source.url);
       this.validateConfig(request.config ?? {});
+      const callLimit = request.longestCallSeconds === undefined ? DEFAULT_PLUGIN_LONGEST_CALL_SECONDS : longestCallSeconds(request.longestCallSeconds);
       const id = randomUUID(),
         directory = await this.createGeneration(id);
       let row: RecordEntry | undefined;
@@ -282,6 +327,7 @@ export class PluginManager {
           catalogId: catalog?.id,
           source,
           config: request.config ?? {},
+          longestCallSeconds: callLimit,
           credentialKeys: [],
           version: launch.version,
           license: launch.license,
@@ -315,7 +361,7 @@ export class PluginManager {
         return this.snapshot();
       } catch (e) {
         if (!row || !this.records.includes(row)) {
-          await fs.rm(directory, { recursive: true, force: true });
+          await removePluginFolder(directory);
           for (const key of row?.credentialKeys ?? []) await clearSecret(`plugin:${id}:${key}`);
         }
         throw new Error(String(this.redact((e as Error).message)));
@@ -323,23 +369,34 @@ export class PluginManager {
     });
   }
   configure(id: string, patch: PluginConfigPatch): Promise<PluginSnapshot> {
-    this.authenticating.get(id)?.controller.abort();
+    const limitOnly = patch.longestCallSeconds !== undefined && patch.source === undefined && patch.config === undefined && patch.credentials === undefined && patch.name === undefined;
+    if (!limitOnly) this.authenticating.get(id)?.controller.abort();
     return this.serial(id, async () => {
       const row = this.row(id);
+      const callLimit = patch.longestCallSeconds === undefined ? undefined : longestCallSeconds(patch.longestCallSeconds);
+      if (limitOnly) {
+        const previous = row.longestCallSeconds;
+        row.longestCallSeconds = callLimit!;
+        try { await this.save(); } catch (error) { row.longestCallSeconds = previous; throw error; }
+        this.changed();
+        return this.snapshot();
+      }
       this.validateConfig(patch.config ?? row.config);
       if (row.fields?.some((f) => f.secret && f.key in (patch.config ?? row.config)))
         throw new Error('Store sensitive bundle fields in secure credentials');
       const oldKeys = [...row.credentialKeys],
         oldConfig = row.config,
-        oldName = row.name;
+        oldName = row.name,
+        oldCallLimit = row.longestCallSeconds;
       const oldSecrets = await this.credentials(row);
       try {
         await this.storeCredentials(row, patch.credentials);
         if (patch.source) {
-          await this.replace(row, patch.source, patch.config ?? row.config);
+          await this.replace(row, patch.source, patch.config ?? row.config, callLimit ?? row.longestCallSeconds);
         } else {
           await this.disconnect(row);
           row.config = patch.config ?? row.config;
+          if (callLimit !== undefined) row.longestCallSeconds = callLimit;
           if (patch.name) row.name = patch.name.slice(0, 100);
           await this.save();
           if (row.enabled) await this.connect(row);
@@ -350,6 +407,7 @@ export class PluginManager {
         row.credentialKeys = oldKeys;
         row.config = oldConfig;
         row.name = oldName;
+        row.longestCallSeconds = oldCallLimit;
         await this.disconnect(row);
         if (row.enabled) await this.connect(row);
         throw e;
@@ -382,6 +440,7 @@ export class PluginManager {
     row: RecordEntry,
     source: RecordEntry['source'],
     config: Record<string, string>,
+    longestCallSeconds = row.longestCallSeconds,
   ): Promise<void> {
     if (this.closing) throw new Error('Plugins are shutting down');
     if (source.auth && source.kind !== 'remote') throw new Error('OAuth requires a remote source.');
@@ -397,7 +456,7 @@ export class PluginManager {
       if (metadata.fields?.some((f) => f.secret && f.key in config))
         throw new Error('Store sensitive bundle fields in secure credentials');
       await this.disconnect(row);
-      Object.assign(row, { source, directory, launch, version: launch.version, license: launch.license, config, catalogId, ...metadata });
+      Object.assign(row, { source, directory, launch, version: launch.version, license: launch.license, config, longestCallSeconds, catalogId, ...metadata });
       if (row.enabled) {
         await this.connect(row);
         if (row.status !== 'ready' && row.status !== 'needs-auth') throw new Error(row.error ?? 'New server did not become ready');
@@ -408,12 +467,12 @@ export class PluginManager {
       // Installation rollback must not undo a newer user policy request.
       Object.assign(row, old, { enabled: row.enabled, disabledTools: row.disabledTools });
       this.exposureCache = null;
-      await fs.rm(directory, { recursive: true, force: true });
+      await removePluginFolder(directory);
       if (row.enabled) await this.connect(row);
       throw new Error(`Update rolled back: ${String(this.redact((e as Error).message))}`);
     }
     // Cleanup after the commit is best-effort: an old-directory deletion failure must never undo durable publication.
-    await fs.rm(old.directory, { recursive: true, force: true }).catch(() => undefined);
+    await removePluginFolder(old.directory).catch(() => undefined);
   }
   setEnabled(id: string, enabled: boolean): Promise<PluginSnapshot> {
     const row = this.row(id);
@@ -464,7 +523,11 @@ export class PluginManager {
       }
       for (const key of row.credentialKeys) await clearSecret(`plugin:${id}:${key}`);
       await clearPluginOAuth(id);
-      await fs.rm(path.join(this.root, id), { recursive: true, force: true });
+      // The plugin is already gone from the list and its credentials are cleared. A folder that a
+      // just-killed server still holds must not turn that finished removal into an error.
+      await removePluginFolder(path.join(this.root, id)).catch((error: unknown) => {
+        logWarn(`Plugin ${id} was removed, but its folder is still in use and stays on disk: ${error instanceof Error ? error.message : String(error)}`);
+      });
       this.changed();
       return this.snapshot();
     });
@@ -556,8 +619,8 @@ export class PluginManager {
       // SDK listTools() without a cursor aggregates every page before returning.
       const page = await client.request({ method: 'tools/list', ...(cursor === undefined ? {} : { params: { cursor } }) }, { timeout: Math.max(1, Math.min(15000, deadline - Date.now())) });
       tools.push(...page.tools);
-      if (tools.length > 256 || Buffer.byteLength(JSON.stringify(tools)) > 1000000)
-        throw new Error('Server discovery exceeds 256 tools or 1 MB; configure a smaller server toolset');
+      if (tools.length > PLUGIN_DISCOVERY_MAX_TOOLS || Buffer.byteLength(JSON.stringify(tools)) > PLUGIN_DISCOVERY_MAX_BYTES)
+        throw new Error(`Server discovery exceeds ${PLUGIN_DISCOVERY_MAX_TOOLS} tools or ${PLUGIN_DISCOVERY_MAX_BYTES / 1024 / 1024} MB; configure a smaller server toolset`);
       cursor = page.nextCursor;
       if (cursor && cursors.has(cursor)) throw new Error('Server returned a repeated tool cursor');
       if (cursor) cursors.add(cursor);
@@ -699,7 +762,7 @@ export class PluginManager {
           maxBufferSize: 16 * 1024 * 1024,
         });
         this.connecting.set(client, transport);
-        await client.connect(transport, { timeout: 20000 });
+        await client.connect(transport, { timeout: STDIO_START_TIMEOUT_MS });
       }
       const tools = await this.discover(client);
       signal.throwIfAborted();
@@ -818,16 +881,21 @@ export class PluginManager {
         return refused('PLUGIN_START_FAILED: The plugin server could not start. Check its settings and application.');
       // Explain refusal from the same retained catalog/exposure projection that owns
       // publication. Diagnostics never reconnect, authenticate, refresh, or choose a
-      // claimant; they only describe why this exact call was not admitted.
+      // claimant; they only describe why this exact call was not admitted. A name no
+      // retained catalog claims, and that only Core declares, names this install's Core
+      // connector. Static membership is not permission, connectivity, or a replay.
       const candidates = this.records.filter(row => row.catalog.some(tool => tool.name === name));
       const exposure = this.exposure();
       const issue = candidates.map(row => exposure.issues.get(row.id)?.get(name)).find((value): value is string => !!value);
       const row = candidates.length === 1 ? candidates[0] : undefined;
       let reason: string;
       if (issue) reason = `PLUGIN_NOT_EXPOSED: ${issue}`;
-      else if (!candidates.length)
+      else if (!candidates.length) {
         reason = 'UNKNOWN_TOOL: This tool name is not in the current Plugins catalog. It may be stale or belong to another connector. Check the current Plugins tool list.';
-      else if (row) {
+        // Plugins also owns shared names, notably exec. Case must match the Core declaration.
+        if (!SURFACES.plugins.tools.includes(name) && SURFACES.core.tools.includes(name))
+          reason += ` This name belongs to ${surfaceDefinition('core').connectorName}. Discover or select that connector.`;
+      } else if (row) {
         if (!row.enabled || row.disabledTools.includes(name)) reason = 'PLUGIN_DISABLED: Enable this plugin and tool in Plugins before calling it.';
         else if (row.status === 'needs-auth') reason = 'PLUGIN_NEEDS_AUTH: Sign in to this plugin in Plugins before calling it.';
         else if (row.status === 'authenticating') reason = 'PLUGIN_AUTHENTICATING: Finish the current sign-in for this plugin before calling it.';
@@ -840,7 +908,13 @@ export class PluginManager {
     try {
       // Supply our bounded discovery result: SDK validates output against it without
       // rediscovery or the modern header-mismatch retry path for ambiguous mutations.
-      const result = await live.client.callTool({ name: tool.name, arguments: args }, { timeout: 120000, toolDefinition: tool });
+      const callTimeout = row.longestCallSeconds * 1000;
+      const result = await live.client.callTool({ name: tool.name, arguments: args }, {
+        timeout: callTimeout, maxTotalTimeout: callTimeout, resetTimeoutOnProgress: true,
+        // SDK 2.1.0 resets its sole timer on progress; maxTotalTimeout is checked
+        // only on progress. An independent signal enforces the absolute deadline.
+        signal: AbortSignal.timeout(callTimeout), onprogress: () => {}, toolDefinition: tool,
+      });
       if (Buffer.byteLength(JSON.stringify(result)) > 16 * 1024 * 1024)
         return errorResult('PLUGIN_RESULT_TOO_LARGE: Result exceeds 16 MiB. Request a smaller result.');
       for (const block of result.content)
@@ -855,6 +929,16 @@ export class PluginManager {
       if (result.isError) onOutcome?.('tool_execution_error');
       return this.redactResult(result);
     } catch (error) {
+      // A JSON-RPC error response proves the server is still speaking MCP. Treat it
+      // as a tool execution failure, not as a broken transport that needs restart.
+      // Keep client-side output-schema failures fatal: those mean the server returned
+      // a successful response that violated the contract CoS discovered for the tool.
+      if (error instanceof ProtocolError && !isLocalToolOutputValidationError(error))
+        return errorResult(`PLUGIN_TOOL_ERROR: ${error.message}`);
+      // An SDK request deadline/abort cancels only this call. The transport
+      // remains usable; actual disconnects are handled by client.onclose.
+      if (error instanceof SdkError && error.code === SdkErrorCode.RequestTimeout)
+        return errorResult('PLUGIN_CALL_TIMEOUT: The call timed out or was cancelled. The operation may have completed; inspect its state before retrying. CoS did not retry.');
       // A failed/ambiguous call must not leave a broken process running idle.
       if (this.live.get(row.id) === live && this.records.includes(row)) {
         const needsAuth = error instanceof PluginNeedsAuth || error instanceof UnauthorizedError;

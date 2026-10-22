@@ -27,6 +27,10 @@ notices.push('='.repeat(80), 'OpenAI Codex — adapted coding instructions and u
 for (const file of ['LICENSE', 'NOTICE']) {
   notices.push(`--- Codex ${file} ---`, await fs.readFile(path.join(root, 'docs/licenses/codex', file), 'utf8'), '');
 }
+notices.push('='.repeat(80), 'Phosphor Icons — interface icons (Regular and Fill weights)',
+  'Source: https://www.npmjs.com/package/@phosphor-icons/core/v/2.1.1',
+  'CoS embeds the SVG paths of the icons it uses in its renderer sprite, scaled to a 24-unit grid.', '');
+notices.push('--- Phosphor LICENSE ---', await fs.readFile(path.join(root, 'docs/licenses/phosphor/LICENSE'), 'utf8'), '');
 let count = 0;
 for (const [relative, entry] of Object.entries(lock.packages).sort(([a], [b]) => a.localeCompare(b))) {
   if (!relative || entry.dev === true) continue;
@@ -45,7 +49,18 @@ for (const [relative, entry] of Object.entries(lock.packages).sort(([a], [b]) =>
     }
   }
   await walk(directory);
+  if (manifest.name.startsWith('@koromix/koffi-') && !files.length) {
+    // Optional binaries omit the license file; the same-version parent carries it.
+    const parent = JSON.parse(await fs.readFile(path.join(root, 'node_modules/koffi/package.json'), 'utf8'));
+    if (parent.version !== manifest.version || parent.license !== manifest.license) throw new Error(`Koffi binary license/version mismatch: ${relative}`);
+    files.push(path.join(root, 'node_modules/koffi/LICENSE.txt'));
+  }
   if (manifest.name === 'flora-colossus' && !files.length) files.push(path.join(root, 'docs/licenses/flora-colossus-LICENSE'));
+  if (manifest.name.startsWith('@napi-rs/canvas-') && !files.length) {
+    // Platform binary packages are published from the @napi-rs/canvas repository but omit the
+    // repository's MIT LICENSE from the npm tarball. Preserve the upstream license explicitly.
+    files.push(path.join(root, 'docs/licenses/napi-rs-canvas-LICENSE'));
+  }
   if (manifest.name.startsWith('@img/')) {
     // libvips distributions publish their composite attribution in README.md.
     try { await fs.access(path.join(directory, 'README.md')); files.push(path.join(directory, 'README.md')); } catch { /* package has separate licenses */ }
@@ -53,7 +68,7 @@ for (const [relative, entry] of Object.entries(lock.packages).sort(([a], [b]) =>
   if (!files.length) missing.push(`${manifest.name}@${manifest.version}`);
   const license = typeof manifest.license === 'string' ? manifest.license : JSON.stringify(manifest.license ?? manifest.licenses ?? 'Not declared');
   notices.push('='.repeat(80), `${manifest.name}@${manifest.version}`, `Declared license: ${license}`, `Package: https://www.npmjs.com/package/${manifest.name}/v/${manifest.version}`, '');
-  for (const file of files.sort()) notices.push(`--- ${file.startsWith(directory + path.sep) ? path.relative(directory, file).replaceAll('\\', '/') : 'Upstream license supplement (see docs/licenses/README.md)'} ---`, await fs.readFile(file, 'utf8'), '');
+  for (const file of files.sort()) notices.push(`--- ${file.startsWith(directory + path.sep) ? path.relative(directory, file).replaceAll('\\', '/') : manifest.name.startsWith('@koromix/koffi-') ? 'koffi/LICENSE.txt (same-version binary distribution)' : 'Upstream license supplement (see docs/licenses/README.md)'} ---`, await fs.readFile(file, 'utf8'), '');
   count++;
 }
 if (missing.length) throw new Error(`Missing license texts for production packages: ${missing.join(', ')}`);

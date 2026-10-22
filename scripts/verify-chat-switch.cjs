@@ -1,22 +1,25 @@
 // Isolated real Electron renderer; no production userData, bridge or provider calls.
+const { withoutScripts } = require('./ui-check-page.cjs');
 const { app, BrowserWindow } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
+const { fixtureConfigSource } = require('./fixtures/app-defaults.cjs');
 const output = path.join(root, 'outputs/chat-switch');
 app.setPath('userData', path.join(output, 'runtime'));
 app.whenReady().then(async () => {
   const deadline=setTimeout(()=>{console.error('Renderer probe exceeded 45 seconds');app.exit(1)},45000);
   const { createServer } = await import('vite');
   const fixture = `
-    const config = {
+    ${fixtureConfigSource()}
+    const config = fixtureConfig({
       roots:[{name:'fixture',path:'C:/fixture'}], readOnly:true, capabilities:{read:true,browse:true},
       tunnel:{kind:'openai',tunnelId:'',desktopTunnelId:'',binaryPath:''},
       ui:{theme:'dark',autoConnect:false}, sessions:{record:true,retainDays:30,advisoryTokens:300000,limitTokens:400000},
       compaction:{auto:true,autoTokens:300000}, multiAgent:{enabled:false,maxWorkers:2},
       goal:{enabled:false,model:'fixture',reasoning:'default',prompt:'Fixture'}
-    };
+    });
     const state = {config,hasApiKey:false,hasGoalKey:false,resolvedBinary:null,
       status:{state:'disconnected',surfaces:[]},bridge:{running:false,paired:false,present:false},
       update:{current:'fixture',latest:null,stage:'idle'}};
@@ -34,7 +37,7 @@ app.whenReady().then(async () => {
       listSessions:()=>ok({sessions,total:2,nextCursor:null,activeId:null,pressure:[],blocked:[]}),
       getSession:id=>window.hold?new Promise(resolve=>window.pending.push({id,resolve})):ok(detail(id)),
       getSessionControls:()=>ok({automation:'off',objective:'',blocked:'',job:null}),
-      listInputs:()=>ok(structuredClone(window.inputs)),listPausedHelpers:()=>ok([]),
+      listInputs:()=>ok(structuredClone(window.inputs)),runningTools:()=>ok([]),listPausedHelpers:()=>ok([]),
       onSessionChanged:listener=>{window.changed=listener;return ()=>{}},
       getSwarm:()=>ok({running:false,agents:[],pendingReports:0}),
       getChatModels:()=>ok({state:'unknown',models:[]})
@@ -46,8 +49,7 @@ app.whenReady().then(async () => {
   const server = await createServer({configFile:false,root:path.join(root,'src/renderer'),
     server:{host:'127.0.0.1',port:0,hmr:false},plugins:[{name:'chat-switch-fixture',configureServer(vite) {
       vite.middlewares.use('/fixture.html',async (_request,response)=>{
-        const html=fs.readFileSync(path.join(root,'src/renderer/index.html'),'utf8')
-          .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi,'')
+        const html=withoutScripts(fs.readFileSync(path.join(root,'src/renderer/index.html'),'utf8'))
           .replace('</body>','<script type="module">'+fixture+'</script></body>');
         response.setHeader('Content-Type','text/html');
         response.end(await vite.transformIndexHtml('/fixture.html',html));
@@ -90,8 +92,8 @@ app.whenReady().then(async () => {
     const deliveryFrames=await js(`new Promise(resolve=>{const frames=[];let n=0;function frame(){
       frames.push({count:[...document.querySelectorAll('#timeline .said.is-user,#inputQueue .pending-message')].filter(el=>el.textContent.includes('Exactly one follow-up')).length,
         previous:document.getElementById('timeline').textContent.includes('Transcript b'),welcome:!document.getElementById('timelineEmpty').hidden});
-      if(++n===8){window.inputs[0]={...window.inputs[0],state:'sent',messageId:'native-followup',deliveredAt:4,historyAnchored:true};window.changed()}
-      if(n===48){window.extra=[{seq:2,time:4,source:'app',kind:'user_message',messageId:'native-followup',inputId:'delivery',message:{text:'Exactly one follow-up',chars:21,truncated:false}}];window.changed()}
+      if(++n===8){window.inputs[0]={...window.inputs[0],state:'sent',messageId:'native-followup',deliveredAt:4,historyAnchored:true,historySeq:2};window.changed()}
+      if(n===48){window.extra=[{seq:2,time:4,source:'app',kind:'user_message',messageId:'native-followup',inputId:'delivery',message:{text:'Exactly one follow-up',chars:21,truncated:false}}];window.changed({sessionIds:['b']})}
       if(n===100)resolve(frames);else requestAnimationFrame(frame);
     }requestAnimationFrame(frame)})`);
     assert.ok(deliveryFrames.every(f=>f.count===1 && f.previous && !f.welcome),JSON.stringify(deliveryFrames));

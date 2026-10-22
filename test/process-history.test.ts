@@ -6,7 +6,7 @@ import { emptyEvidence } from '../src/main/mcp/call-context.js';
 import { flushRecorder, recordToolCall, resetRecorderForTests } from '../src/main/session/recorder.js';
 import { appendEvent, completeProcessCall, createSession, flushSessions, getSession, initSessionStore,
   readActivityEvents, readEvents, readHydratedActivityCall, readRecentEvents, recordProcessCall,
-  rebindSession, resetSessionStoreForTests, turnHasMcpCall } from '../src/main/session/store.js';
+  rebindSession, resetSessionStoreForTests, turnHasMcpCall, questionHasMcpCall } from '../src/main/session/store.js';
 import { foldProgress, toolCallSummary, workSequence, type SessionEvent } from '../src/shared/session.js';
 import { UnifiedExecProcessManager, type ProcessCompletion } from '../src/main/codex/unified-exec.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
@@ -56,6 +56,16 @@ it('revises the exact launch once, preserves chronology and survives a cold hist
   expect((await getSession(session.id))!.toolCalls).toBe(count);
 });
 
+it('keeps a proven benign non-zero completion green without changing its raw exit code', async () => {
+  const session = await createSession({ conversationId: 'benign-owner', title: 'process' });
+  await recordProcessCall(session.id, launch('benign-call', 'benign-owner'));
+  await completeProcessCall(session.id, 'benign-call', { completedAt: 200, durationMs: 100,
+    exitCode: 4294967295, benignExit: true });
+  const row = (await readEvents(session.id)).find(event => event.kind === 'tool_call');
+  expect(row).toMatchObject({ call: { process: { exitCode: 4294967295 },
+    summary: { title: 'Completed fixture', tone: 'good', metric: '✓ finished' } } });
+});
+
 it('does not cross sessions or reused numeric process ids', async () => {
   const a = await createSession({ conversationId: 'a', title: 'a' });
   const b = await createSession({ conversationId: 'b', title: 'b' });
@@ -79,19 +89,24 @@ it('reads only an exact already-hydrated call revision without opening or scanni
   const projected = await readActivityEvents(a.id, 0);
   const ordinary = projected.events.find(event => event.kind === 'tool_call' && event.call.callId === 'ordinary-a')!;
   const processLaunch = projected.events.find(event => event.kind === 'tool_call' && event.call.callId === 'process-a')!;
+  // Presentation adds a derived turn position; details return the unchanged stored record.
+  const ordinaryRecord = { ...ordinary };
+  delete ordinaryRecord.turnOrigin;
 
   const openFile = vi.spyOn(fs, 'open');
   const readFile = vi.spyOn(fs, 'readFile');
   try {
-    await expect(readHydratedActivityCall(a.id, 'owner-a', 'ordinary-a', ordinary.seq)).resolves.toEqual(ordinary);
+    await expect(readHydratedActivityCall(a.id, 'owner-a', 'ordinary-a', ordinary.seq)).resolves.toEqual(ordinaryRecord);
     await expect(readHydratedActivityCall(a.id, 'owner-b', 'ordinary-a', ordinary.seq)).resolves.toBeNull();
     await expect(readHydratedActivityCall(a.id, 'owner-a', 'missing', ordinary.seq)).resolves.toBeNull();
 
     await completeProcessCall(a.id, 'process-a', { completedAt: 200, durationMs: 100, exitCode: 9 });
     const completed = (await readActivityEvents(a.id, processLaunch.seq + 1)).events
       .find(event => event.kind === 'tool_call' && event.call.callId === 'process-a')!;
+    const completedRecord = { ...completed };
+    delete completedRecord.turnOrigin;
     await expect(readHydratedActivityCall(a.id, 'owner-a', 'process-a', processLaunch.seq)).resolves.toBeNull();
-    await expect(readHydratedActivityCall(a.id, 'owner-a', 'process-a', completed.seq)).resolves.toEqual(completed);
+    await expect(readHydratedActivityCall(a.id, 'owner-a', 'process-a', completed.seq)).resolves.toEqual(completedRecord);
     expect(openFile).not.toHaveBeenCalled();
     expect(readFile).not.toHaveBeenCalled();
 
@@ -183,4 +198,21 @@ it('real process exit updates history while all output remains available to its 
     expect((await readEvents(session.id)).find(e => e.kind === 'tool_call')).toMatchObject({ call: { process: { exitCode: 7 } } });
     await expect.poll(async () => manager.offerCompletedOutput(new Set([id]), { completedAt: null, failed: false }, 1000)).toMatchObject({ exitCode: 7, output: 'retained\n' });
   } finally { await manager.terminateAllProcesses(); }
+});
+
+it('credits the work of any turn that answered the same question', async () => {
+  // 2026-09-26: reloads reopened a prime's question as turns with no work of their own, and the
+  // automatic restart judged only the newest of them.
+  const session = await createSession({ conversationId: 'owner', title: 'question' });
+  const user = (messageId: string, time: number) => appendEvent(session.id, { kind: 'user_message', source: 'extension', time, messageId,
+    message: { text: messageId, chars: messageId.length, truncated: false } } as any);
+  const start = (turnId: string, time: number) => appendEvent(session.id, { kind: 'turn_start', source: 'extension', time, turnId } as any);
+  const end = (turnId: string, time: number) => appendEvent(session.id, { kind: 'turn_end', source: 'extension', time, turnId, outcome: 'stalled' } as any);
+  await user('question-one', 90); await start('turn', 95);
+  await recordProcessCall(session.id, launch('call-one', 'owner'));
+  await end('turn', 200); await start('phantom', 210); await end('phantom', 800);
+  expect(await turnHasMcpCall(session.id, 'owner', 'phantom')).toBe(false);
+  expect(await questionHasMcpCall(session.id, 'owner', 'phantom')).toBe(true);
+  await user('question-two', 900); await start('other', 910);
+  expect(await questionHasMcpCall(session.id, 'owner', 'other')).toBe(false);
 });

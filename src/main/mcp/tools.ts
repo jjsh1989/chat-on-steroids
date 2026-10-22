@@ -27,6 +27,19 @@ import { APP_VERSION } from './../version.js';
 import { toVirtualPath } from '../sandbox.js';
 import { logWarn } from '../logger.js';
 import { withManagedSkills } from '../skill-access.js';
+import { withDirectorWriteInterlock } from './director-write-interlock.js';
+
+/**
+ * The resource and prompt catalogs, which no surface has, answered as empty lists (#1557).
+ * ChatGPT enrolls a new connector with MCP revision 2026-07-28 and asks for resources as well.
+ * In that revision the SDK answers a method that has no handler with HTTP 404 (-32601), and
+ * ChatGPT then fails the whole enrollment with HTTP 424, so the connector could not be added.
+ */
+function answerEmptyCatalogs(server: McpServer): void {
+  server.server.setRequestHandler('resources/list', async () => ({ resources: [] }));
+  server.server.setRequestHandler('resources/templates/list', async () => ({ resourceTemplates: [] }));
+  server.server.setRequestHandler('prompts/list', async () => ({ prompts: [] }));
+}
 
 export function buildServer(ctx: ToolContext, surface: SurfaceId, observe?: (connectorName: string, version: string, instructions: string, tools: PluginToolSchema[]) => void, liveContext: () => ToolContext = () => ctx): McpServer {
   if (surface === 'core') ctx = withManagedSkills(ctx);
@@ -34,31 +47,34 @@ export function buildServer(ctx: ToolContext, surface: SurfaceId, observe?: (con
   const instructions = serverInstructions(ctx, surface);
   const server = new McpServer(
     { name: definition.serverName, version: APP_VERSION },
-    { capabilities: { tools: {} }, instructions }
+    { capabilities: { tools: {}, resources: {}, prompts: {} }, instructions }
   );
+  answerEmptyCatalogs(server);
 
   const tools: PluginToolSchema[] = [];
   if (surface === 'plugins') {
-    const declarations = registerPluginTools(server);
+    const declarations = registerPluginTools(server, ctx.setupProfileId ?? null);
     observe?.(definition.connectorName, APP_VERSION, instructions, declarations);
     return server;
   }
-  const registrar = createRegistrar(server, ctx, surface, observe ? (name, config) => {
+  const registrar = withDirectorWriteInterlock(createRegistrar(server, ctx, surface, observe ? (name, config) => {
     // Match the SDK's Standard Schema conversion target and object-root normalization.
     const schema = toolSchemaJson(config.inputSchema);
     tools.push({ name, description: config.description, inputSchema: { type: 'object', ...schema }, ...(config.annotations ? { annotations: { ...config.annotations } } : {}) });
-  } : undefined);
+  } : undefined));
   if (surface === 'core') registerCoreTools(registrar);
   else registerDesktopTools(registrar);
   registerCodeMode(registrar, (name, args, parent) => {
     // Reuse the same registration/validation/handler authority, refreshed for every child
     // so a permission or approved-root change during an awaited script takes effect.
     const live = liveContext();
-    const nested = createRegistrar(null, surface === 'core' ? withManagedSkills(live) : live, surface);
+    const nested = withDirectorWriteInterlock(
+      createRegistrar(null, surface === 'core' ? withManagedSkills(live) : live, surface)
+    );
     if (surface === 'core') registerCoreTools(nested);
     else registerDesktopTools(nested);
     return nested.invokeNested(name, args, parent);
-  }, { windowsDesktop: surface === 'desktop' && process.platform === 'win32' });
+  }, { windowsDesktop: surface === 'desktop' && process.platform === 'win32', surface });
 
   // Cheap self-check on a property the tests assert and the design depends on: a surface
   // may register fewer tools than it declares — permissions decide that — but it may never

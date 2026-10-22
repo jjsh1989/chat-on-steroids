@@ -17,15 +17,17 @@
  * protected-resource metadata request properly and never emits a non-JSON body.
  */
 
+import { noteConnectorUse } from '../connector-proof.js';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createInboundTiming, formatInboundTiming, requestIdFromHeader, withInboundRequestId } from './inbound.js';
 import http from 'node:http';
+import type { Socket } from 'node:net';
 import { createMcpHandler } from '@modelcontextprotocol/server';
 import { localhostHostValidation, localhostOriginValidation, toNodeHandler } from '@modelcontextprotocol/node';
 import { getConfig } from '../config.js';
 import { logError, logInfo, logWarn } from '../logger.js';
 import { buildServer, resetToolClock, type ToolContext } from './tools.js';
-import { SURFACE_IDS, surfaceDefinition, type SurfaceId } from './surfaces.js';
+import { SURFACE_IDS, configuredConnectorName, type SurfaceId } from './surfaces.js';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
@@ -87,7 +89,7 @@ function jsonError(res: http.ServerResponse, status: number, error: string): voi
 }
 
 /**
- * Buffers an HTTP body only when its size is not already bounded by Content-Length.
+ * Buffers an HTTP body before adapter admission, irrespective of Content-Length.
  *
  * The MCP Node adapter otherwise concatenates a chunked/missing-length request to an
  * unbounded JS string before parsing it. Stop retaining bytes at the same 8 MiB limit the
@@ -125,7 +127,7 @@ function readBoundedJsonBody(
     const onEnd = (): void => {
       try {
         const text = Buffer.concat(chunks, total).toString('utf8');
-        finish({ body: text.length === 0 ? undefined : JSON.parse(text) });
+        finish({ body: text.length === 0 ? null : JSON.parse(text) });
       } catch {
         finish({ error: 'invalid_json' });
       }
@@ -258,9 +260,15 @@ export function forgetExposedSurface(): void {
   surfaceExposure.clear();
 }
 
-export async function startMcpServer(getContext: () => ToolContext): Promise<McpEndpoint> {
+export async function startMcpServer(
+  getContext: () => ToolContext,
+  kept: Partial<Record<SurfaceId, string>> = {},
+  options: { port?: number } = {}
+): Promise<McpEndpoint> {
   // A per-session token in the path is what authorises callers. It is regenerated on
-  // every app start, so a URL that leaks stops working when the app restarts.
+  // every app start, so a URL that leaks stops working when the app restarts, unless the
+  // user opted into keeping it (`mcp.persistentUrls`, see persistent-paths.ts): then the
+  // caller passes each surface's stored token, and only a well-formed one is used.
   requestSeenAt = null;
   surfaceRequestAt.clear();
   resetToolClock();
@@ -272,7 +280,7 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
   // Desktop" and "give me everything" the same act.
   const surfacePaths = SURFACE_IDS.map((id) => ({
     id,
-    basePath: `/mcp/${id}/${randomBytes(32).toString('base64url')}`
+    basePath: `/mcp/${id}/${kept[id] && /^[A-Za-z0-9_-]{43}$/.test(kept[id]!) ? kept[id] : randomBytes(32).toString('base64url')}`
   }));
 
   // ChatGPT can keep a cached tools/list snapshot for the lifetime of a connector
@@ -330,7 +338,19 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
   const checkHost = localhostHostValidation();
   const checkOrigin = localhostOriginValidation();
 
+  // A TCP connection or incomplete body is not an accepted MCP operation. Only
+  // requests handed to the adapter own a response that must survive Disconnect.
+  const sockets = new Map<Socket, Set<http.ServerResponse>>();
+  let stopping: Promise<void> | null = null;
+  let forceTimer: ReturnType<typeof setTimeout> | null = null;
+  let forceDeadline = Infinity;
+  let stopped = false;
   const server = http.createServer((req, res) => {
+    if (stopping) {
+      res.setHeader('connection', 'close');
+      jsonError(res, 503, 'server_stopping');
+      return;
+    }
     const timing = createInboundTiming();
     const url = req.url ?? '';
     const pathOnly = url.split('?')[0] ?? '';
@@ -344,6 +364,8 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
     const prmRoute = routes.find((candidate) => safeEqual(pathOnly, candidate.prmPath)) ?? null;
 
     const startedAt = Date.now();
+    // The JSON-RPC method a failed request named, so the log says which call ChatGPT made (#1557).
+    let rpcMethod: string | null = null;
     const publication = { completedAt: null as number | null, failed: false };
     res.once('close', () => { if (publication.completedAt === null) publication.failed = true; });
     res.on('finish', () => {
@@ -367,14 +389,14 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
       const expectedTunnelProbe = tunnelProbe && res.statusCode === 415 && route !== null && method === 'POST';
       if (optional) logInfo(`request ${line} (stream/session not offered — normal)`);
       else if (expectedTunnelProbe) logInfo(`request ${line} (probe compatibility check — normal)`);
-      else if (res.statusCode >= 400) logWarn(`request ${line}`);
+      else if (res.statusCode >= 400) logWarn(`request ${line}${rpcMethod ? ` (method ${rpcMethod})` : ''}`);
       else logInfo(`request ${line}`);
     });
 
     if (prmRoute) {
       if (!checkHost(req, res)) return;
       if (!checkOrigin(req, res)) return;
-      const body = protectedResourceMetadata(prmRoute.url, surfaceDefinition(prmRoute.id).connectorName);
+      const body = protectedResourceMetadata(prmRoute.url, configuredConnectorName(prmRoute.id));
       res.writeHead(200, {
         'content-type': 'application/json',
         'cache-control': 'no-store',
@@ -397,6 +419,7 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
     if (!selfTest && !tunnelProbe) {
       requestSeenAt = Date.now();
       surfaceRequestAt.set(route.id, requestSeenAt);
+      noteConnectorUse(route.id, 'request', requestSeenAt);
     }
 
     const declaredHeader = req.headers['content-length'];
@@ -409,8 +432,30 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
     // The tool dispatch reads this back to join the call to the page request that issued
     // it; see inbound.ts for why it cannot be taken from the MCP call context.
     const requestId = requestIdFromHeader(req.headers['x-request-id']);
-    if (req.method === 'POST' && declaredHeader === undefined) {
+    const dispatch = (body?: unknown): void => {
+      if (stopping || res.destroyed) {
+        if (!res.destroyed) {
+          res.setHeader('connection', 'close');
+          jsonError(res, 503, 'server_stopping');
+        }
+        return;
+      }
+      const socket = req.socket;
+      const responses = sockets.get(socket)!;
+      responses.add(res);
+      const release = (): void => {
+        responses.delete(res);
+        // Flush the completed response without waiting for the peer to close its
+        // half of the connection. Immediate destroy() could lose buffered bytes.
+        if (stopping && responses.size === 0) socket.destroySoon();
+      };
+      res.once('finish', release);
+      res.once('close', release);
+      withInboundRequestId(requestId, () => void route.handler(req, res, body), timing, publication, !selfTest && !tunnelProbe);
+    };
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
       void readBoundedJsonBody(req).then((parsed) => {
+        if (res.destroyed) return;
         if (parsed.error === 'payload_too_large') {
           jsonError(res, 413, 'payload_too_large');
           return;
@@ -419,11 +464,18 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
           jsonError(res, 400, 'invalid_json');
           return;
         }
-        withInboundRequestId(requestId, () => void route.handler(req, res, parsed.body), timing, publication);
+        const named = (parsed.body as { method?: unknown } | undefined)?.method;
+        if (typeof named === 'string' && /^[A-Za-z0-9_/.-]{1,80}$/.test(named)) rpcMethod = named;
+        dispatch(parsed.body);
       });
       return;
     }
-    withInboundRequestId(requestId, () => void route.handler(req, res), timing, publication);
+    dispatch();
+  });
+  server.on('connection', (socket) => {
+    sockets.set(socket, new Set());
+    socket.once('close', () => sockets.delete(socket));
+    if (stopping) socket.destroy();
   });
 
   // Reject slow or oversized bodies rather than holding sockets open indefinitely.
@@ -431,13 +483,26 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
   server.requestTimeout = 300_000;
   server.maxRequestsPerSocket = 0;
 
-  await new Promise<void>((resolve, reject) => {
+  const listen = (port: number) => new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
+    server.listen(port, '127.0.0.1', () => {
       server.removeListener('error', reject);
       resolve();
     });
   });
+  // A kept port (a tunnel of the user's own points at it, #1550) when it is free; else any port.
+  // Retried briefly first: on a restart the previous instance may still be letting go of it.
+  let listening = false;
+  for (let tries = 1; options.port && !listening; tries += 1) {
+    try { await listen(options.port); listening = true; }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EADDRINUSE' && tries < 5) { await new Promise(resolve => setTimeout(resolve, 200)); continue; }
+      logWarn(`Local port ${options.port} is not available (${code ?? (error as Error).message}); using another one, so a tunnel pointing at it needs the new port`);
+      break;
+    }
+  }
+  if (!listening) await listen(0);
 
   const address = server.address();
   if (address === null || typeof address === 'string') {
@@ -457,36 +522,36 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
     url: urls.core,
     urls,
     publication: (surface, observe) => { void buildServer(stableContext(surface), surface, observe).close(); },
-    stop: (options = {}) =>
-      new Promise<void>((resolve) => {
-        // Stop accepting new work, but let requests already accepted by the MCP adapter
-        // finish and deliver their result. Destroying active sockets here created ambiguous
-        // commits: the caller saw `fetch failed` and could retry while the original mutation
-        // continued in this process. `server.close()` drains active connections. There is no
-        // force deadline for an ordinary disconnect/reconnect; only final process shutdown
-        // opts into one explicitly, where remaining work cannot outlive the app anyway.
-        let settled = false;
-        const forceAfterMs = options.forceAfterMs;
-        const force =
-          forceAfterMs === undefined
-            ? null
-            : setTimeout(() => {
-                if (settled) return;
-                // Force first, report second. This timer is the only thing between a wedged
-                // peer and a shutdown that never ends, so nothing it depends on may sit behind
-                // a call that could throw — and logging reaches the renderer, which by this
-                // point in a quit is already gone.
-                server.closeAllConnections();
-                logWarn(`server drain timed out after ${forceAfterMs}ms during final shutdown; forcing remaining connections closed`);
-              }, Math.max(0, forceAfterMs));
-        force?.unref?.();
-        server.closeIdleConnections?.();
+    stop: (options = {}) => {
+      if (!stopping) {
+        // Publish the admission fence before closing any sockets or receiving late bodies.
+        let resolveStop!: () => void;
+        stopping = new Promise<void>((resolve) => { resolveStop = resolve; });
+        const accepted = [...sockets.values()].reduce((count, responses) => count + responses.size, 0);
+        logInfo(`server stopping: draining ${accepted} accepted response(s)`);
         server.close(() => {
-          settled = true;
-          if (force) clearTimeout(force);
+          stopped = true;
+          if (forceTimer) clearTimeout(forceTimer);
           logInfo('server stopped');
-          resolve();
+          resolveStop();
         });
-      })
+        for (const [socket, responses] of sockets) {
+          if (responses.size === 0) socket.destroy();
+        }
+      }
+      // Final shutdown can escalate an ordinary drain already in progress. Repeated
+      // calls share custody and may shorten, but never extend, its force deadline.
+      const forceAfterMs = options.forceAfterMs;
+      if (!stopped && forceAfterMs !== undefined && Date.now() + forceAfterMs < forceDeadline) {
+        if (forceTimer) clearTimeout(forceTimer);
+        forceDeadline = Date.now() + Math.max(0, forceAfterMs);
+        forceTimer = setTimeout(() => {
+          server.closeAllConnections();
+          logWarn(`server drain timed out after ${forceAfterMs}ms during final shutdown; forcing remaining connections closed`);
+        }, Math.max(0, forceAfterMs));
+        forceTimer.unref?.();
+      }
+      return stopping;
+    }
   };
 }

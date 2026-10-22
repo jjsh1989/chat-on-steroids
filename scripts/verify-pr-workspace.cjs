@@ -1,0 +1,337 @@
+// Real Chromium acceptance of the current renderer source through Vite. Backend responses are
+// synthetic, and the isolated window never opens a provider, tunnel or the user's app state.
+const { withoutScripts } = require('./ui-check-page.cjs');
+const { app, BrowserWindow } = require('electron');
+const fs = require('node:fs');
+const path = require('node:path');
+const assert = require('node:assert/strict');
+const root = path.resolve(__dirname, '..');
+const { fixtureConfigSource, BENIGN_RENDERER_ERRORS } = require('./fixtures/app-defaults.cjs');
+const output = path.join(root, 'outputs/pr-workspace');
+app.setPath('userData', path.join(output, 'runtime'));
+fs.mkdirSync(output, { recursive: true });
+
+app.whenReady().then(async () => {
+  const { createServer } = await import('vite');
+  let win;
+  let server;
+  const results = [];
+  try {
+    win = new BrowserWindow({ show: false, width: 1500, height: 1000,
+      webPreferences: { sandbox: true, contextIsolation: true, backgroundThrottling: false } });
+    await win.loadURL('data:text/html,' + encodeURIComponent('<h1>Project preview</h1><p>Local synthetic PDF fixture.</p>'));
+    const pdf = await win.webContents.printToPDF({ pageSize: 'A5' });
+    const fixture = `
+      localStorage.clear();
+      window.fixtureErrors=[];
+      window.addEventListener('error', event => { if (!${JSON.stringify(BENIGN_RENDERER_ERRORS)}.includes(event.message)) window.fixtureErrors.push(event.message); });
+      window.addEventListener('unhandledrejection', event => window.fixtureErrors.push(String(event.reason)));
+      ${fixtureConfigSource()}
+    const config = fixtureConfig({roots:[{name:'demo',path:'C:/demo'}],readOnly:false,
+        commandAllowlist:{enabled:false,mode:'allow',rules:[]},
+        capabilities:{browse:true,search:true,read:true,metadata:true,create:true,edit:true,move:true,deleteFile:true,command:true,screen:false,control:false,clipboardRead:false,clipboardWrite:false},
+        tunnel:{kind:'openai',tunnelId:'',desktopTunnelId:'',binaryPath:''},
+        ui:{minimizeToTray:true,autoConnect:false,privacyScreenshots:false,theme:'dark'},
+        sessions:{record:true,retainDays:30,advisoryTokens:300000,limitTokens:400000},compaction:{auto:true,autoTokens:300000},
+        multiAgent:{enabled:false,maxWorkers:2,allowUnattributedCalls:false,recoverAgentTabs:false},
+        goal:{enabled:false,model:'fixture',reasoning:'default',prompt:'Fixture'}});
+      const state={config,hasApiKey:false,hasGoalKey:false,resolvedBinary:null,bundledTunnelVersion:null,
+        status:{state:'disconnected',detail:'',publicUrl:null,localUrl:null,handshakeAt:null,lastRequestAt:null,lastToolCallAt:null,health:null,surfaces:[]},
+        bridge:{running:true,port:8765,paired:true,present:true,lastSeenAt:Date.now(),extensionVersion:'2.1.13'},
+        update:{current:'2.1.13',latest:null,stage:'idle',error:null,checkedAt:null}};
+      const projects=[{id:'project-a',name:'Demo workspace',path:'C:/demo',createdAt:1},{id:'project-b',name:'Second project',path:'C:/demo-b',createdAt:1}];
+      const rows=projects.map((p,i)=>({id:'task-'+i,title:i?'Second conversation':'Project review',projectId:p.id,
+        conversationId:null,chatIds:[],startedAt:1,updatedAt:10-i,endedAt:2,events:2,userMessages:1,toolCalls:0,
+        lastToolCallAt:null,processExitNonzero:0,toolRejected:0,toolInternalErrors:0,errors:0,estimatedTokens:0,contextTokens:0,
+        lastHandoffId:null,lastHandoffAt:null,lastTurnOutcome:'completed',activeTurnId:null,agents:[],origin:{kind:'desktop'}}));
+      rows.push({...rows[0],id:'standalone',title:'Standalone chat',projectId:undefined});
+      const monitorNow=Date.now();
+      const monitorWorker={...rows[0],id:'worker-monitor',title:'worker-2 · Backend',conversationId:'chat-worker-monitor',
+        chatIds:['chat-worker-monitor'],startedAt:monitorNow-90_000,updatedAt:monitorNow,endedAt:null,events:1205,userMessages:2,toolCalls:1200,
+        lastToolCallAt:monitorNow-1000,lastToolActivity:{kind:'read',title:'Read src/main/agents.ts'},lastTurnOutcome:null,activeTurnId:'turn-monitor',
+        origin:{kind:'worker',fromSessionId:'task-0',agentId:'worker-2',task:'Inspect worker activity'}};
+      const monitorAgent={runId:'fixture-run',primeConversationId:'prime-fixture',id:'worker-2',role:'worker',label:'Backend',
+        task:'Inspect worker activity',reasoningEffort:null,model:null,state:'active',createdAt:monitorNow-90_000,activatedAt:monitorNow-89_000,
+        finishedAt:null,result:null,pending:0,awaitingAck:0,delivered:0,conversationId:'chat-worker-monitor',detachedAt:null,lastSeenAt:monitorNow,revivable:true};
+      const files={'README.md':'# Demo workspace\\n\\nProject files, local drafts and bounded previews.\\n','example.ts':'export const value = 1;\\r\\n'};
+      const ok=data=>Promise.resolve({ok:true,data});
+      const info=(projectId,name)=>({projectId,projectName:projects.find(p=>p.id===projectId).name,path:name,name,
+        bytes:files[name]?.length??${pdf.length},modifiedAt:new Date(0).toISOString(),revision:'a'.repeat(64),
+        binary:name.endsWith('.pdf'),text:files[name]??null,truncated:false,
+        ...(name.endsWith('.pdf')?{pdfDataBase64:${JSON.stringify(pdf.toString('base64'))}}:{})});
+      window.fixtureSaves=[]; window.fixtureAttached=[];
+      const personal={id:'review',name:'Code review',description:'Read the complete change, check behavior and preserve existing work.',path:'/skills/review/SKILL.md',managed:true,scope:'managed',source:'managed',allowImplicitInvocation:true};
+      const projectSkill={id:'project-check--repo-fixture',name:'Project checks',description:'Use this project’s build, conventions and verification routes.',path:'/demo/.agents/skills/check/SKILL.md',managed:false,scope:'repo',source:'repo-agents',allowImplicitInvocation:true};
+      window.api=new Proxy({getState:()=>ok(state),getLog:()=>ok([]),getZoom:()=>ok(1),setZoom:factor=>ok(Math.round(factor*100)/100),petsOverlayState:()=>ok({visible:false,ready:true,activeCount:0,activityCount:0}),listProjects:()=>ok(projects),
+        listSessions:()=>ok({sessions:rows,total:rows.length,nextCursor:null,activeId:null,pressure:[],blocked:[]}),
+        getSession:id=>ok({events:[{seq:1,time:1,source:'extension',kind:'user_message',messageId:'question',message:{text:'Review this project',chars:19,truncated:false}},
+          {seq:2,time:2,source:'extension',kind:'assistant_message',messageId:'answer',final:true,state:'final',message:{text:'The project workspace is ready for inspection.',chars:47,truncated:false}}],total:2,nextFrom:3}),
+        getSwarm:()=>ok({enabled:true,running:true,agents:[monitorAgent]}),getChatModels:()=>ok({state:'unknown',models:[]}),
+        skillLibrary:()=>ok({skills:[personal,projectSkill],roots:[],errors:[],includeInstructions:true}),
+        listSkills:()=>ok([personal]),listInputs:()=>ok([]),getSessionPlan:()=>ok(null),browserPreferences:()=>ok({overwrite:true,durations:false}),
+        listProjectFiles:(id,directory='')=>ok({projectId:id,projectName:'Demo workspace',directory,truncated:false,
+          entries:['README.md','example.ts','preview.pdf'].map(name=>({name,path:name,kind:'file',bytes:files[name]?.length??${pdf.length}}))}),
+        watchProjectFiles:()=>ok(true),previewProjectFile:(id,name)=>ok(info(id,name)),
+        getProjectGitSnapshot:(id,baseRef)=>ok({projectId:id,state:'ready',truncated:false,revision:baseRef?'fixture-compared':'fixture-dirty',
+          currentBranch:'feature',branches:[{ref:'refs/remotes/origin/main',label:'origin/main'},{ref:'refs/heads/feature',label:'feature'}],
+          ...(baseRef?{comparison:{ref:baseRef,label:'origin/main',baseOid:'a'.repeat(40),headOid:'b'.repeat(40)}}:{}),changes:baseRef?[
+          {status:'M',path:'README.md',additions:2,deletions:1,binary:false}
+        ]:[
+          {status:'M',path:'README.md',additions:2,deletions:1,binary:false},
+          {status:'U',path:'notes.txt',additions:3,deletions:0,binary:false}
+        ]}),
+        getProjectGitDiff:(id,name)=>ok({projectId:id,status:'M',path:name,additions:2,deletions:1,binary:false,tooLarge:false,
+          baseText:'# Demo workspace\\n',currentText:'# Demo workspace\\n\\nUpdated in the working tree.\\n'}),
+        attachProjectFile:(id,name)=>{window.fixtureAttached.push({id,name});return ok({id:'file-1',name,size:12,mimeType:'text/plain'});},
+        saveProjectFile:(id,name,text)=>{files[name]=text;window.fixtureSaves.push({id,name,text});return ok({preview:info(id,name)});},
+        writeClipboard:()=>ok(true),connect:()=>{state.status.state='connected';return ok(state)},disconnect:()=>{state.status.state='disconnected';return ok(state)}
+      },{get:(target,key)=>key in target?target[key]:String(key).startsWith('on')?()=>()=>{}:()=>ok(null)});
+      await import('/main.ts');
+      const {setLanguage,t}=await import('/i18n.ts');
+      const {EditorView}=await import('@codemirror/view');
+      window.fixture={setLanguage,t,readyConnection(){state.hasApiKey=true;config.tunnel.tunnelId='tunnel_'+'1'.repeat(32);},
+        addMonitorWorker(){if(!rows.some(row=>row.id===monitorWorker.id))rows.push(monitorWorker);},
+        edit(text){const view=EditorView.findFromDOM(document.querySelector('.file-preview .cm-editor'));
+        if(!view)throw new Error('Editor not ready');view.dispatch({changes:{from:0,to:view.state.doc.length,insert:text}});}};
+      window.fixtureReady=true;
+    `;
+    server = await createServer({ configFile: false, root: path.join(root, 'src/renderer'),
+      server: { host: '127.0.0.1', port: 0 }, plugins: [{ name: 'pr-workspace-fixture', configureServer(vite) {
+        vite.middlewares.use('/fixture.html', async (_request, response) => {
+          const source = withoutScripts(fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8'))
+            .replace('</body>', '<script type="module">' + fixture + '</script></body>');
+          response.setHeader('Content-Type', 'text/html');
+          response.end(await vite.transformIndexHtml('/fixture.html', source));
+        });
+      } }] });
+    await server.listen();
+    const js = async code => {
+      try { return await win.webContents.executeJavaScript(code); }
+      catch (error) {
+        const detail = await win.webContents.executeJavaScript('({errors:window.fixtureErrors,buttons:[...document.querySelectorAll(".file-preview button")].map(b=>({title:b.title,text:b.textContent})),preview:document.querySelector(".file-preview")?.textContent.slice(0,1000)})').catch(() => null);
+        throw new Error(`Renderer script failed: ${code}\n${JSON.stringify(detail)}\n${error.message}`);
+      }
+    };
+    const until = async expression => {
+      const deadline = Date.now() + 12_000;
+      while (Date.now() < deadline) { if (await js(expression)) return; await new Promise(resolve => setTimeout(resolve, 30)); }
+      throw new Error('Renderer condition timed out: ' + expression + ' ' + JSON.stringify(await js('window.fixtureErrors')));
+    };
+    const screenshot = async name => {
+      await js('document.getAnimations().forEach(animation => { if (animation.effect.getTiming().iterations !== Infinity) animation.finish(); })');
+      await win.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true });
+      await new Promise(resolve => setTimeout(resolve, 120));
+      fs.writeFileSync(path.join(output, name + '.png'), (await win.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true })).toPNG());
+    };
+    await win.loadURL(server.resolvedUrls.local[0] + 'fixture.html');
+    await until('window.fixtureReady && document.querySelectorAll(".sess[data-id]").length===3');
+    assert.ok(await js(`(()=>{const button=document.getElementById('chatRefresh');const heading=button.closest('.sidebar-session-heading');const a=button.getBoundingClientRect(),b=heading.getBoundingClientRect();return button.children.length===1&&Math.abs((a.top+a.bottom-b.top-b.bottom)/2)<1})()`));
+    assert.equal(await js('document.querySelectorAll("#projectList .sess[data-id]").length'),2);
+    assert.equal(await js('document.querySelectorAll("#chatList .sess[data-id]").length'),1);
+    await js(`document.querySelector('.sess[data-id="task-0"]').click()`);
+    await until('!document.querySelector("#workDockRight .work-dock-quick[data-view=files]").disabled');
+    await js(`document.getElementById('rightDockToggle').click()`);
+    assert.ok(await js(`['review','terminal','files','agents'].every(kind=>!document.querySelector('#workDockRight .work-dock-quick[data-view='+kind+']').disabled)`));
+    await screenshot('dock-shortcuts');
+    await js(`document.querySelector('#workDockRight .work-dock-quick[data-view=review]').click()`);
+    await until('!!document.querySelector("#workDockRight .review-panel:not([hidden])")');
+    await js(`window.fixture.addMonitorWorker();document.getElementById('chatRefresh').click()`);
+    await js(`new Promise(resolve=>setTimeout(resolve,300))`);
+    await js(`document.querySelector('#workDockRight .work-dock-tab.is-selected .btn-icon').click();document.querySelector('#workDockRight .work-dock-quick[data-view=agents]').click()`);
+    await until('!!document.querySelector("#workDockRight .agent-panel:not([hidden]) .agent-panel-row")');
+    assert.equal(await js(`document.querySelector('.agent-panel-row .agent-card-activity')?.textContent`),'Read src/main/agents.ts');
+    assert.match(await js(`document.querySelector('.agent-panel-row .agent-card-meta')?.textContent||''`),/1\.2k actions/);
+    await screenshot('agent-monitor-activity');
+    await js(`document.querySelector('#workDockRight .work-dock-tab.is-selected .btn-icon').click();document.querySelector('#workDockRight .work-dock-quick[data-view=files]').click()`);
+    await until('document.querySelectorAll(".file-tree-row[data-path]").length>=3');
+    await until('document.querySelector(".file-panel-changes-badge")?.textContent==="2"');
+    await js(`document.querySelector('.file-panel-changes-toggle').click()`);
+    await until('!document.querySelector("#workDockRight .review-panel .file-changes-view").hidden && document.querySelectorAll("#workDockRight .review-panel .file-change-row").length===2');
+    await screenshot('git-changes');
+    assert.equal(await js('document.querySelector(".review-panel .file-changes-header-title").textContent'),'feature');
+    await js(`document.querySelector('.review-panel .file-branch-trigger').click()`);
+    await until('!!document.querySelector(".file-branch-menu .file-branch-search")');
+    await js(`{const input=document.querySelector('.file-branch-search');input.value='origin';input.dispatchEvent(new Event('input',{bubbles:true}));}`);
+    assert.equal(await js(`document.querySelectorAll('.file-branch-option').length`),1);
+    await screenshot('review-branch-search');
+    await js(`document.querySelector('.file-branch-option').click()`);
+    await until(`document.querySelector('.review-panel .file-branch-trigger')?.textContent.includes('origin/main') && document.querySelectorAll('.review-panel .file-change-row').length===1`);
+    await screenshot('review-branch-compare');
+    await js(`document.querySelector('.review-panel .file-branch-trigger').click();document.querySelector('.file-branch-option').click()`);
+    await until(`document.querySelectorAll('.review-panel .file-change-row').length===2`);
+    assert.equal(await js('document.querySelector(".review-panel .file-change-row[data-path=\\"README.md\\"] .file-change-status").textContent'),'M');
+    assert.ok(await js(`!document.querySelector('.review-panel .file-panel-toolbar') && !!document.querySelector('.review-panel .file-changes-header .file-panel-refresh')`));
+    assert.deepEqual(await js(`[...document.querySelectorAll('.header-dock-controls > button')].map(button=>button.id)`),
+      ['rightDockExpand','terminalToggle','rightDockToggle']);
+    assert.equal(await js(`document.querySelector('#workDockRight .work-dock-bar > .btn-icon')`),null);
+    assert.ok(await js(`(()=>{const tab=document.querySelector('#workDockRight .work-dock-tab:last-child').getBoundingClientRect();const plus=document.querySelector('#workDockRight .work-dock-add summary').getBoundingClientRect();return plus.left-tab.right<=12&&plus.left>=tab.right})()`));
+    assert.equal(await js(`document.getElementById('rightDockExpand').hidden`),false);
+    await js(`document.getElementById('rightDockExpand').click()`);
+    assert.ok(await js(`document.querySelector('[data-panel=chat]').classList.contains('is-work-dock-expanded') && document.getElementById('workDockBottom').hidden`));
+    await screenshot('review-expanded');
+    await js(`document.getElementById('rightDockExpand').click();document.querySelector('#workDockRight .work-dock-tab [role=tab][aria-selected=false]').click()`);
+    await js(`document.querySelector('#workDockRight .work-dock-add summary').click();document.querySelector('#workDockRight .work-dock-menu-item[data-view=review]').click()`);
+    await until('!!document.querySelector("#workDockRight .review-panel:not([hidden])")');
+    await js(`document.querySelector('.review-panel .file-change-row[data-path="README.md"]').click()`);
+    await until('!!document.querySelector(".review-panel .file-diff-viewer-host .cm-editor")');
+    await screenshot('git-diff');
+    assert.equal(await js('document.querySelector(".review-panel .file-changes-header-title").textContent'),'Diff');
+    assert.ok(await js('document.querySelector(".review-panel .file-preview-meta").textContent.includes("README.md")'));
+    await js(`document.querySelector('.review-panel .file-changes-back').click()`);
+    await until('document.querySelector(".review-panel .file-changes-header-title").textContent==="feature"');
+    await js(`document.querySelector('#workDockRight .work-dock-tab [role=tab][aria-selected=false]').click()`);
+    await until('!document.querySelector(".file-tree").hidden');
+    await js(`document.querySelector('.file-tree-row[data-path="README.md"]').click()`);
+    await until('!!document.querySelector(".file-preview-markdown h1")');
+    for (const [width, height, zoom, language] of [[1500,1000,1.17,'en'],[1100,850,1,'es'],[820,740,1.17,'es'],[1100,850,1.17,'zh-TW']]) {
+      win.setSize(width,height); win.webContents.setZoomFactor(zoom);
+      await js(`window.fixture.setLanguage(${JSON.stringify(language)}); new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))`);
+      const measured = await js(`(()=>{const r=document.querySelector('.file-panel').getBoundingClientRect();return {
+        fits:r.left>=0&&r.right<=innerWidth+1&&r.bottom<=innerHeight+1,width:r.width,height:r.height,
+        title:document.querySelector('.file-panel').getAttribute('aria-label'),overflow:document.documentElement.scrollWidth>innerWidth};})()`);
+      assert.ok(measured.fits && !measured.overflow && measured.width>200,JSON.stringify({width,zoom,measured}));
+      if (width === 820) assert.ok(await js(`(()=>{
+        const bar=document.querySelector('.file-panel:not([hidden]) .file-panel-toolbar');
+        const actions=bar.querySelector('.file-panel-toolbar-actions');
+        const refresh=bar.querySelector('.file-panel-refresh');
+        const tabs=document.querySelector('#workDockRight .work-dock-tabs');
+        const before=refresh.getBoundingClientRect().right;
+        // Labels that do not fit turn into icons, so every action stays on screen (2.1.41);
+        // sideways scrolling with a pinned refresh remains only as the last resort.
+        const shown=actions.classList.contains('is-compact')&&actions.scrollWidth<=actions.clientWidth+1
+          &&[...actions.querySelectorAll('.file-panel-action')].every(button=>button.getAttribute('aria-label')
+            &&button.getBoundingClientRect().right<=actions.getBoundingClientRect().right+1);
+        actions.scrollLeft=actions.scrollWidth;
+        const fixed=Math.abs(refresh.getBoundingClientRect().right-before)<1
+          &&Math.abs(refresh.getBoundingClientRect().right-(bar.getBoundingClientRect().right-10))<2;
+        actions.scrollLeft=0;
+        return shown&&fixed&&getComputedStyle(actions).flexWrap==='nowrap'
+          &&getComputedStyle(actions).scrollbarWidth==='none'
+          &&getComputedStyle(tabs).overflowX==='auto'
+          &&getComputedStyle(tabs).scrollbarWidth==='none';
+      })()`));
+      results.push({width,height,zoom,language,...measured});
+      await screenshot(`files-${language}-${width}`);
+    }
+    win.setSize(1500,1000); win.webContents.setZoomFactor(1.17);
+    await js(`window.fixture.setLanguage('en');document.querySelector('.file-tree-row[data-path="example.ts"]').click()`);
+    await until('!!document.querySelector(".file-preview .cm-editor")');
+    await js(`document.querySelector('.file-preview [title="Edit"]').click()`);
+    await until('!!document.querySelector(".file-editor-save") && !!document.querySelector(".file-preview.is-editing .cm-editor")');
+    await js(`window.fixture.edit('export const value = 2;')`);
+    await js(`document.querySelector('.sess[data-id="task-1"]').click();document.querySelector('.sess[data-id="task-0"]').click()`);
+    await until('!!document.querySelector(".file-editor-save") && document.querySelector(".file-preview .cm-content")?.textContent.includes("value = 2")');
+    await js(`document.querySelector('.file-editor-save').click()`);
+    await until('window.fixtureSaves.length===1');
+    assert.equal(await js('window.fixtureSaves[0].text'),'export const value = 2;');
+    await until('!document.querySelector(".file-editor-save")');
+    await screenshot('editor-saved');
+    await js(`document.querySelector('.file-tree-row[data-path="preview.pdf"]').click()`);
+    await until('!!document.querySelector(".file-pdf-canvas:not([hidden])")');
+    assert.ok(await js(`(()=>{const c=document.querySelector('.file-pdf-canvas');return c.width*c.height>100&&c.width*c.height<=16*1024*1024;})()`));
+    await screenshot('pdf-rendered');
+    // Disconnected, a click on the capsule connects; its details are one right click away.
+    await js(`document.getElementById('sidebarConnection').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}))`);
+    assert.equal(await js('document.getElementById("connectionPopoverTitle").textContent'), 'Not connected');
+    assert.equal(await js('document.querySelector("#connectionPopover details")'), null);
+    const bounds=await js(`(()=>{const r=document.getElementById('connectionPopover').getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,fits:r.x>=0&&r.y>=0&&r.right<=innerWidth&&r.bottom<=innerHeight};})()`);
+    assert.equal(bounds.fits,true,JSON.stringify(bounds));
+    await screenshot('connection-status');
+    await js(`document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))`);
+    assert.equal(await js('document.getElementById("connectionPopover").hidden'),true);
+    assert.equal(await js('document.activeElement.id'),'sidebarConnection');
+    await js(`document.getElementById('rightDockToggle').click();document.getElementById('sidebarPlugins').click()`);
+    assert.equal(await js('document.querySelector(".app").dataset.screen'),'library');
+    assert.equal(await js('document.getElementById("sidebarPrimary").hidden'),false);
+    await js(`document.querySelector('.project-group[data-project-id="project-b"] .project-heading > [data-new-project="project-b"]').click()`);
+    await until('document.querySelector(".app").dataset.screen==="chat"');
+    assert.ok(await js('document.getElementById("chatInput").placeholder.includes("Second project")'));
+    await js(`document.querySelector('.sess[data-id="task-0"]').click()`);
+    await until('document.querySelector(".app").dataset.screen==="chat"');
+    await js(`(()=>{const input=document.getElementById('chatInput');input.value='/re\\nCheck all changes and keep my draft.';input.setSelectionRange(3,3);input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+    await until('!document.getElementById("skillPicker").hidden && document.querySelector(".skill-choice[data-skill-id=review]")');
+    await screenshot('skills-library');
+    await js(`document.querySelector('.skill-choice[data-skill-id="review"]').click()`);
+    assert.equal(await js('document.querySelectorAll(".composer-selected-skill").length'),1);
+    assert.equal(await js('document.getElementById("chatInput").value'),'Check all changes and keep my draft.');
+    await js(`document.querySelector('.sess[data-id="task-1"]').click()`);
+    await until('document.querySelectorAll(".composer-selected-skill").length===0');
+    await js(`document.querySelector('.sess[data-id="task-0"]').click()`);
+    await until('document.querySelectorAll(".composer-selected-skill").length===1');
+    await js(`(()=>{const i=document.getElementById('chatInput');i.value='/project\\n'+i.value;i.setSelectionRange(8,8);i.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+    await until('!document.getElementById("skillPicker").hidden');
+    await js(`document.querySelector('.skill-choice[data-skill-id="project-check--repo-fixture"]').click()`);
+    assert.equal(await js('document.querySelectorAll(".composer-selected-skill").length'),2);
+    const composer = await js(`(()=>{const chip=document.getElementById('composerSelectedSkills').getBoundingClientRect(),input=document.getElementById('chatInput').getBoundingClientRect(),send=document.querySelector('.send-control').getBoundingClientRect();return {chipBottom:chip.bottom,inputTop:input.top,inputBottom:input.bottom,sendTop:send.top,fits:chip.bottom<=input.top+1&&input.bottom<=send.top+1};})()`);
+    assert.equal(composer.fits,true,JSON.stringify(composer));
+    await screenshot('skills-selected-sidebar');
+    for (const language of ['es','zh-TW']) {
+      win.setSize(820,740); win.webContents.setZoomFactor(1.17);
+      await js(`window.fixture.setLanguage(${JSON.stringify(language)});(()=>{const i=document.getElementById('chatInput');i.value='/';i.setSelectionRange(1,1);i.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+      await until('!document.getElementById("skillPicker").hidden');
+      const bounds=await js(`(()=>{const r=document.getElementById('skillPicker').getBoundingClientRect();return {fits:r.x>=0&&r.y>=0&&r.right<=innerWidth+1&&r.bottom<=innerHeight+1,overflow:document.documentElement.scrollWidth>innerWidth};})()`);
+      assert.ok(bounds.fits && !bounds.overflow,JSON.stringify(bounds));
+      await screenshot(`skills-${language}-narrow`);
+      await js(`document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))`);
+    }
+    win.setSize(1500,1000); win.webContents.setZoomFactor(1.17);
+    await js(`document.querySelector('[data-tab=appearance]').click();window.fixture.setLanguage('es');document.getElementById('uiLanguage').scrollIntoView({block:'center'})`);
+    assert.equal(await js('document.getElementById("uiLanguage").value'),'es');
+    await screenshot('spanish-settings');
+    await js(`window.fixture.setLanguage('zh-TW')`);
+    assert.equal(await js('document.getElementById("uiLanguage").value'),'zh-TW');
+    await screenshot('traditional-chinese-settings');
+    // Every opening is compact, including when translucency creates a sidebar stacking context.
+    await js(`document.documentElement.dataset.translucentSidebar='true';document.getElementById('sidebarConnection').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}))`);
+    assert.equal(await js('document.getElementById("connectionAdvanced")'),null);
+    assert.equal(await js('document.getElementById("connectionPopoverSettings")'),null);
+    assert.equal(await js('document.getElementById("connectionAdvancedOverwrite")'),null);
+    await js(`document.getElementById('sidebarConnection').click();document.getElementById('sidebarConnection').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}))`);
+    assert.equal(await js('document.querySelector("#connectionPopover details")'),null);
+    assert.equal(await js('document.getElementById("connectionPopover").hidden'),false);
+    await screenshot('connection-compact');
+    // The View menu: one icon button, the row menus' menu, each action with this keyboard's shortcut,
+    // above everything; a zoom step keeps it open.
+    await js(`document.getElementById('sidebarConnection').click();document.getElementById('viewMenu').click()`);
+    const viewItem=action=>`document.querySelector('.row-menu [data-row-action="${action}"]')`;
+    assert.ok(await js(`(()=>{const n=${viewItem('zoom-in')},r=n.getBoundingClientRect();return n.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))})()`));
+    assert.deepEqual(await js(`(()=>{const mac=/^Mac/.test(navigator.platform);return [${viewItem('search')}.querySelector('.row-menu-shortcut').textContent===(mac?'⌘K':'Ctrl+K'),!${viewItem('sidebar')}]})()`),[true,true]);
+    await screenshot('view-menu');
+    await js(`${viewItem('zoom-in')}.click()`);
+    await until(`${viewItem('zoom-reset')}?.querySelector('.row-menu-hint').textContent==='110%'`);
+    await js(`${viewItem('zoom-reset')}.click()`);
+    await until(`${viewItem('zoom-reset')}?.querySelector('.row-menu-hint').textContent==='100%'`);
+    await js(`document.getElementById('viewMenu').click()`);
+    await until(`!document.querySelector('.row-menu')`);
+    await js(`document.querySelector('[data-tab=appearance]').click();window.fixture.setLanguage('en')`);
+    const heights=await js(`['appearanceFont','appearanceSize','setupProfile'].map(id=>{const n=document.getElementById(id).closest('.setting');return n.getBoundingClientRect().height})`);
+    assert.ok(Math.max(...heights)-Math.min(...heights)<2,JSON.stringify(heights));
+    await screenshot('appearance-aligned');
+    await js(`document.querySelector('[data-tab=setup]').click();window.fixture.setLanguage('es')`);
+    // Title and language flags share a row only while both fit; the flags never cover the title.
+    const setup=await js(`(()=>{const h=document.querySelector('.setup-heading'),t=h.querySelector('h1').getBoundingClientRect(),f=h.querySelector('.language-tabs').getBoundingClientRect();return {overlap:!(f.left>=t.right||f.top>=t.bottom),titleClipped:h.querySelector('h1').scrollWidth>h.querySelector('h1').clientWidth+1,flagsInside:f.right<=h.getBoundingClientRect().right+1}})()`);
+    assert.deepEqual(setup,{overlap:false,titleClipped:false,flagsInside:true}); await screenshot('setup-spanish-aligned');
+    // A laptop-sized window: the twelve flags no longer fit beside the title and must move below it.
+    win.setSize(1100,800); await new Promise(resolve=>setTimeout(resolve,300));
+    const narrowSetup=await js(`(()=>{const h=document.querySelector('.setup-heading'),t=h.querySelector('h1').getBoundingClientRect(),f=h.querySelector('.language-tabs').getBoundingClientRect();return {overlap:!(f.left>=t.right||f.top>=t.bottom),titleClipped:h.querySelector('h1').scrollWidth>h.querySelector('h1').clientWidth+1,flagsInside:f.right<=h.getBoundingClientRect().right+1}})()`);
+    assert.deepEqual(narrowSetup,{overlap:false,titleClipped:false,flagsInside:true}); await screenshot('setup-spanish-laptop');
+    win.setSize(1500,1000); await new Promise(resolve=>setTimeout(resolve,300));
+    await js(`document.getElementById('backToChat').click();const input=document.getElementById('chatInput');input.value='/';input.setSelectionRange(1,1);input.dispatchEvent(new Event('input',{bubbles:true}));`);
+    await until('!document.getElementById("skillPicker").hidden && document.querySelector(".skill-choice")');
+    // The Skills library has its own sidebar entry since 2026-09-27; slash commands still work beside it.
+    assert.ok(await js('!!document.getElementById("sidebarSkills")'));
+    assert.equal(await js('document.querySelector(".skill-add")'),null);
+    await screenshot('slash-commands-skills');
+    await js(`document.getElementById('composerAddSkill').closest('details').open=true`);
+    assert.ok(await js(`(()=>{const n=document.getElementById('composerAddSkill'),r=n.getBoundingClientRect();return r.width>0&&r.height>0&&n.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))})()`));
+    await js(`document.getElementById('composerAddSkill').click()`);
+    assert.ok(await js('document.getElementById("chatInput").value.startsWith("Please add the following skills to my COS skills:")'));
+    await js(`window.fixture.readyConnection();document.getElementById('sidebarConnection').click()`);
+    await until('!document.getElementById("sidebarConnection").classList.contains("has-label") && document.getElementById("sidebarConnection").classList.contains("is-connected")');
+    const errors=await js('window.fixtureErrors');
+    assert.deepEqual(errors,[]);
+    fs.writeFileSync(path.join(output,'results.json'),JSON.stringify({renderer:'current source in Chromium; synthetic backend',results,save:true,draftRoundTrip:true,gitChanges:true,pdf:true,connection:bounds,skillsDraftRoundTrip:true,sharedLibrary:true,sidebar:true,composer,agentMonitor:{latestActivity:true,actionCount:true},errors},null,2));
+    console.log('PASS: current renderer Files layouts, Agent Monitor activity/count, read-only Git Changes/diff, real editor draft navigation, PDF rendering, connection status, Skills chips/shared library, Projects/Chats, Spanish and Traditional Chinese. '+output);
+  } finally { win?.destroy(); await server?.close(); }
+  app.exit(0);
+}).catch(error=>{console.error(error);app.exit(1)});

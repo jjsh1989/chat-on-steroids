@@ -28,6 +28,7 @@ vi.mock('electron', () => ({
 const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath, setSecret } = await import('../src/main/secrets.js');
 const { initDurableStore } = await import('../src/main/durable.js');
+const { takeAutomaticReply } = await import('../src/main/session/automatic-replies.js');
 const { appendEvent, createSession, observeSessionModel, initSessionStore, resetSessionStoreForTests, readRecentEvents } = await import(
   '../src/main/session/store.js'
 );
@@ -102,7 +103,9 @@ afterEach(() => {
   globalThis.fetch = realFetch;
 });
 
-it('persists Pro Loop delivery across toggles and restart without granting Goal browser continuation', async () => {
+it('preserves the Astra delivery preference across Goal/Loop, restart and finish-setting changes', async () => {
+  const config = (await import('../src/main/config.js')).getConfig();
+  await saveConfig({ ...config, ui: { ...config.ui, finishTool: true } });
   const id = 'pro-loop-delivery-test';
   const session = await createSession({ conversationId: id });
   await observeSessionModel(session.id, id, 'gpt-6-pro', Date.now(), 'pro');
@@ -118,6 +121,14 @@ it('persists Pro Loop delivery across toggles and restart without granting Goal 
   await goal.setGoalSwitchNow(id, 'loop', true);
   expect(goal.loopAfterTurnFor(id)).toBe(true);
   await goal.setGoalSwitchNow(id, 'goal', true);
+  expect(await goal.astraFinishOnly(session.id, id)).toBe(false);
+  await goal.setGoalSwitchNow(id, 'goal', true, false);
+  expect(await goal.astraFinishOnly(session.id, id)).toBe(true);
+  await saveConfig({ ...config, ui: { ...config.ui, finishTool: false } });
+  expect(await goal.astraFinishOnly(session.id, id)).toBe(false);
+  expect(goal.loopAfterTurnFor(id)).toBe(true);
+  expect(goal.goalSwitchFor(id).afterTurn).toBe(false);
+  await saveConfig({ ...config, ui: { ...config.ui, finishTool: true } });
   expect(await goal.astraFinishOnly(session.id, id)).toBe(true);
 });
 
@@ -219,6 +230,68 @@ describe('what leaves this machine', () => {
     expect(sent.includes('Inspecting the project')).toBe(true);
     expect(sent.includes('tool-result-evidence')).toBe(false);
     expect(sent.includes('/project/example')).toBe(false);
+  });
+
+  it('tells the helper how many CoS calls a turn made, and nothing about them', async () => {
+    // Live 2026-09-28: the helper saw only "goal-ok" and asked five more times to "actually run"
+    // a command that had run every time.
+    const session = await createSession({ title: 'tool count', conversationId: 'tool-count' });
+    await appendEvent(session.id, { time: 100, source: 'extension', kind: 'user_message', message: { text: 'Run echo goal-ok', chars: 16, truncated: false } });
+    for (const [index, [turnId, tool]] of ([['count-turn', 'exec_command'], ['count-turn', 'exec_command'], ['count-turn', 'session_finish'], ['other-turn', 'exec_command']] as const).entries()) {
+      await appendEvent(session.id, { time: 110 + index, source: 'mcp', kind: 'tool_call', turnId, call: {
+        callId: `count-call-${index}`, tool, attribution: 'request_id', requestId: `count-request-${index}`, conversationId: session.conversationId,
+        attributionMethod: 'request_id', outcome: 'ok', durationMs: 1,
+        args: { text: '{"cmd":"echo SECRET_ARGUMENT"}', chars: 30, truncated: false },
+        result: { text: 'SECRET_RESULT', chars: 13, truncated: false },
+        summary: { kind: 'run', tone: 'neutral', title: 'Ran a command' }
+      } });
+    }
+    await appendEvent(session.id, { time: 120, source: 'extension', kind: 'assistant_message', turnId: 'count-turn', messageId: 'count-final', final: true,
+      message: { text: 'goal-ok', chars: 7, truncated: false } });
+    const projected = await goal.conversationMessages(session.id);
+    expect(projected).toEqual([
+      { role: 'user', content: 'Run echo goal-ok' },
+      { role: 'assistant', content: 'goal-ok\n\n[Chat On Steroids: 2 tool calls ran in this turn. Arguments and results are not shown.]' }
+    ]);
+    expect(JSON.stringify(projected)).not.toMatch(/exec_command|SECRET_ARGUMENT|SECRET_RESULT/);
+  });
+
+  // 2.1.43, live on Windows: a Goal step split by two fresh turns ran its five commands as 2 + 2 + 1.
+  // The rotated turns have no answer, so the helper saw "1 tool call" and asked three more times.
+  it('counts the calls of the turns a fresh turn continued into the answer that finished them', async () => {
+    const { rotationMessage } = await import('../src/shared/recovery.js');
+    const session = await createSession({ title: 'rotated count', conversationId: 'rotated-count' });
+    await appendEvent(session.id, { time: 100, source: 'extension', kind: 'user_message', message: { text: 'Run five commands', chars: 17, truncated: false } });
+    let time = 110, index = 0;
+    const call = async (turnId: string) => appendEvent(session.id, { time: time++, source: 'mcp', kind: 'tool_call', turnId, call: {
+      callId: `rot-call-${index}`, tool: 'exec_command', attribution: 'request_id', requestId: `rot-request-${index++}`, conversationId: session.conversationId,
+      attributionMethod: 'request_id', outcome: 'ok', durationMs: 1, args: { text: '{}', chars: 2, truncated: false },
+      result: { text: 'ok', chars: 2, truncated: false }, summary: { kind: 'run', tone: 'neutral', title: 'Ran a command' } } });
+    const rotation = async () => appendEvent(session.id, { time: time++, source: 'extension', kind: 'user_message', authoredText: '',
+      message: { text: rotationMessage(), chars: rotationMessage().length, truncated: false } });
+    await call('rot-1'); await call('rot-1'); await rotation();
+    await call('rot-2'); await call('rot-2'); await rotation();
+    await call('rot-3');
+    await appendEvent(session.id, { time: time++, source: 'extension', kind: 'assistant_message', turnId: 'rot-3', messageId: 'rot-final', final: true,
+      message: { text: 'rotation-goal-done', chars: 18, truncated: false } });
+    const projected = await goal.conversationMessages(session.id);
+    expect(projected).toEqual([
+      { role: 'user', content: 'Run five commands' },
+      { role: 'assistant', content: 'rotation-goal-done\n\n[Chat On Steroids: 5 tool calls ran in this turn, 4 of them before Chat On Steroids continued it in a fresh turn. Arguments and results are not shown.]' }
+    ]);
+  });
+
+  it('gives the helper the reply a content-reference pointer stands for, not the pointer (#574)', async () => {
+    const session = await createSession({ title: 'pointer replies', conversationId: 'pointer-replies' });
+    await appendEvent(session.id, { time: 100, source: 'extension', kind: 'user_message', message: { text: 'Hi', chars: 2, truncated: false } });
+    const pointer = '::chatgpt-content-reference{index="0" source_message_id="d2b82e00-509e-4a87-aa93-00bcde251680"}';
+    await appendEvent(session.id, { time: 110, source: 'extension', kind: 'assistant_message', messageId: 'pointer-final', final: true,
+      message: { text: pointer, chars: pointer.length, truncated: false },
+      renderedHtml: { text: '<p>Hi! How can I help you today?</p>', chars: 36, truncated: false } });
+    expect(await goal.conversationMessages(session.id)).toEqual([
+      { role: 'user', content: 'Hi' },
+      { role: 'assistant', content: 'Hi! How can I help you today?' }
+    ]);
   });
 
   it('gives decision helpers authored requests without executor guidance in the reference transcript', async () => {
@@ -379,6 +452,8 @@ describe('what leaves this machine', () => {
     expect(view.stage).toBe('ready');
     // The streamed text, typed: see `humanReply` and the block at the bottom of this file.
     expect(view.reply).toBe(goal.humanReply('what about the tests'));
+    // Its page will type it: the message it comes back as is the app's, not the person's (#1655).
+    expect(takeAutomaticReply('c-goal-2', view.reply)).toBe(true);
     expect(sent.url).toBe('https://openrouter.ai/api/v1/chat/completions');
     expect((sent.headers as Record<string, string>).authorization).toBe('Bearer sk-or-test');
     expect(sent.body.model).toBe('deepseek/deepseek-v4-flash');
@@ -853,6 +928,150 @@ describe('the reply', () => {
     expect(view.reply).toBe('');
   });
 
+  it('keeps "the goal is met" as the run outcome for the app window after the page acts on it', async () => {
+    const sessionId = await seed('c-met');
+    globalThis.fetch = (async () => stream([delta('NO_REPLY'), 'data: [DONE]\n'])) as never;
+    goal.startGoalDraft({ sessionId, conversationId: 'c-met', turnId: 'g-1' });
+    const view = await settled('c-met');
+    expect(goal.goalOutcomeFor('c-met'), 'nothing to report before the page acts on it').toBeNull();
+    expect(goal.ackGoalDraft('c-met', view.token)).toBe(true);
+    // The page is done with it, so its own view goes quiet...
+    expect(goal.goalViewFor('c-met')).toBeNull();
+    // ...but the window still learns that this run ended with the goal met.
+    expect(goal.goalOutcomeFor('c-met')).toMatchObject({ stage: 'no-reply', turnId: 'g-1', reply: '' });
+  });
+
+  /**
+   * "The goal is met" needs nothing typed, so it must not wait for a page to come and act on it.
+   * Seen live on Windows (2026-10-05): the chat's tab closed while the model was deciding, its
+   * NO_REPLY was never acknowledged, the app restarted and lost the in-memory draft, and the
+   * turn stayed owed for the ledger's twelve hours, the Goal row spinning "Answer settling".
+   */
+  it('settles the owed turn as soon as the model says the goal is met, even if no page acknowledges it', async () => {
+    const sessionId = await seed('c-met-unacked');
+    await goal.acceptGoalReplyNow({
+      conversationId: 'c-met-unacked', sessionId, replyId: 'assistant-met-unacked', turnId: 'g-met', eventSeq: 3, blocked: false
+    });
+    globalThis.fetch = (async () => stream([delta('NO_REPLY'), 'data: [DONE]\n'])) as never;
+    goal.startGoalDraft({ sessionId, conversationId: 'c-met-unacked', turnId: 'g-met' });
+    expect((await settled('c-met-unacked')).stage).toBe('no-reply');
+
+    expect(goal.goalPendingReplyFor('c-met-unacked')).toBeNull();
+    expect(goal.pendingGoalReplies().map(owed => owed.conversationId)).not.toContain('c-met-unacked');
+    const saved = goal.snapshotGoalReplies();
+    expect(saved.replies).toContainEqual(expect.objectContaining({ replyId: 'assistant-met-unacked', state: 'handled' }));
+    goal.resetGoalStateForTests();
+    goal.restoreGoalReplies(saved);
+    expect(goal.goalPendingReplyFor('c-met-unacked'), 'still settled after a restart').toBeNull();
+  });
+
+  it('keeps the turn owed while a continuation waits to be typed', async () => {
+    const sessionId = await seed('c-typed-owed');
+    await goal.acceptGoalReplyNow({
+      conversationId: 'c-typed-owed', sessionId, replyId: 'assistant-typed-owed', turnId: 'g-typed', eventSeq: 3, blocked: false
+    });
+    globalThis.fetch = (async () => decision('continue', 'what about the tests')) as never;
+    goal.startGoalDraft({ sessionId, conversationId: 'c-typed-owed', turnId: 'g-typed' });
+    expect((await settled('c-typed-owed')).stage).toBe('ready');
+    // Only the page can type it; until it says it did, the turn is still owed.
+    expect(goal.goalPendingReplyFor('c-typed-owed')).toMatchObject({ turnId: 'g-typed' });
+  });
+
+  describe('finishHoldOnStop (opt-in: a helper saying "done" is not verified completion)', () => {
+    const unverified = async (sessionId: string) => (await readRecentEvents(sessionId, 20))
+      .filter(event => 'reason' in event && event.reason === 'helper_stop_unverified');
+    const stopOnce = async (id: string, setting: boolean | undefined) => {
+      const config = (await import('../src/main/config.js')).getConfig();
+      await saveConfig({ ...config, ui: { ...config.ui, ...(setting === undefined ? {} : { finishHoldOnStop: setting }) } });
+      const sessionId = await seed(id);
+      await goal.acceptGoalReplyNow({ conversationId: id, sessionId, replyId: `assistant-${id}`, turnId: 'g-stop', eventSeq: 3, blocked: false });
+      let requests = 0;
+      globalThis.fetch = (async () => { requests += 1; return decision('stop'); }) as never;
+      goal.startGoalDraft({ sessionId, conversationId: id, turnId: 'g-stop' });
+      const view = await settled(id);
+      return { sessionId, view, requests };
+    };
+
+    it.each([undefined, false])('keeps the default completion behavior when the setting is %s', async setting => {
+      const { sessionId, view, requests } = await stopOnce(`c-stop-default-${setting}`, setting);
+      expect(view).toMatchObject({ stage: 'no-reply', error: null, reply: '', retryable: false });
+      expect(goal.goalPendingReplyFor(`c-stop-default-${setting}`)).toBeNull();
+      expect(await unverified(sessionId)).toEqual([]);
+      expect(requests).toBe(1);
+    });
+
+    it('marks a helper stop as unverified, keeps the reply pending, and records it once', async () => {
+      const { sessionId, view, requests } = await stopOnce('c-stop-optin', true);
+      expect(view).toMatchObject({ stage: 'failed', error: 'goal_helper_stop_unverified', reply: '', retryable: false });
+      expect(view.message).toMatch(/has not been checked/);
+      expect(goal.goalPendingReplyFor('c-stop-optin')).toMatchObject({ turnId: 'g-stop' });
+      expect(await unverified(sessionId)).toHaveLength(1);
+      expect(requests, 'no automatic continuation or retry was started').toBe(1);
+    });
+
+    it('discards an unverified stop retired while its exact source is being resolved', async () => {
+      const config = (await import('../src/main/config.js')).getConfig();
+      await saveConfig({ ...config, ui: { ...config.ui, finishHoldOnStop: true } });
+      const id = 'c-stop-retired-source';
+      const sessionId = await seed(id);
+      await appendEvent(sessionId, { time: 2000, source: 'extension', kind: 'assistant_message',
+        messageId: 'stop-source', turnId: 'source-turn', final: true,
+        message: { text: 'Done', chars: 4, truncated: false } });
+      await goal.acceptGoalReplyNow({ conversationId: id, sessionId, replyId: 'stop-source',
+        turnId: 'reply:stop-source', eventSeq: 2, blocked: false });
+      const store = await import('../src/main/session/store.js');
+      const read = store.readRecentEvents;
+      let entered!: () => void, resume!: () => void;
+      const waiting = new Promise<void>(resolve => { entered = resolve; });
+      const gate = new Promise<void>(resolve => { resume = resolve; });
+      const lookup = vi.spyOn(store, 'readRecentEvents').mockImplementation(async (...args) => {
+        const events = await read(...args);
+        if (args[2]?.kinds?.length === 1 && args[2].kinds[0] === 'assistant_message') {
+          entered();
+          await gate;
+        }
+        return events;
+      });
+      const recorder = await import('../src/main/session/recorder.js');
+      const progress = vi.spyOn(recorder, 'recordProgress').mockResolvedValue({ seq: 3, time: 3000 });
+      try {
+        globalThis.fetch = (async () => decision('stop')) as never;
+        goal.startGoalDraft({ sessionId, conversationId: id, turnId: 'reply:stop-source' });
+        await waiting;
+        expect(goal.retireGoalDraftsFor(id)).toBe(true);
+        resume();
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(progress).not.toHaveBeenCalled();
+        expect(await unverified(sessionId)).toEqual([]);
+        expect(goal.goalViewFor(id)).toBeNull();
+        expect(goal.goalPendingReplyFor(id)).toBeNull();
+      } finally { resume(); lookup.mockRestore(); progress.mockRestore(); }
+    });
+
+    it('reports an unrecorded helper stop without retrying or consuming the reply', async () => {
+      const recorder = await import('../src/main/session/recorder.js');
+      const logger = await import('../src/main/logger.js');
+      const progress = vi.spyOn(recorder, 'recordProgress').mockResolvedValue(null);
+      const warning = vi.spyOn(logger, 'logWarn');
+      try {
+        const { view } = await stopOnce('c-stop-record-failed', true);
+        expect(view).toMatchObject({ stage: 'failed', error: 'goal_helper_stop_unverified', retryable: false });
+        expect(goal.goalPendingReplyFor('c-stop-record-failed')).not.toBeNull();
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining('unverified stop could not be recorded'));
+      } finally { progress.mockRestore(); warning.mockRestore(); }
+    });
+  });
+
+  it('reports no outcome for a typed continuation the page has acted on', async () => {
+    const sessionId = await seed('c-typed');
+    globalThis.fetch = (async () => decision('continue', 'what about the tests')) as never;
+    goal.startGoalDraft({ sessionId, conversationId: 'c-typed', turnId: 'g-1' });
+    const view = await settled('c-typed');
+    expect(view.stage).toBe('ready');
+    expect(goal.ackGoalDraft('c-typed', view.token)).toBe(true);
+    expect(goal.goalOutcomeFor('c-typed')).toBeNull();
+  });
+
   /** Protocol words are never safe composer prose; ambiguity stops instead of self-prompting. */
   it('fails closed when legacy output wraps NO_REPLY in scratchpad prose', async () => {
     const sessionId = await seed('c-mentions');
@@ -1247,6 +1466,33 @@ describe('when OpenRouter refuses', () => {
     }
   });
 
+  it('keeps a failure the page cannot retry on screen after the page acknowledged it (#584)', async () => {
+    // 402: nothing will change until the user adds credit, so the page does not retry. It shows the
+    // reason and acknowledges the draft. The failure must stay the chat's Goal state: hiding it left
+    // only the still-owed reply, which read as "Answer settling" forever.
+    const sessionId = await seed('c-no-credit');
+    globalThis.fetch = (async () => new Response(JSON.stringify({ error: { message: 'Insufficient credits' } }), { status: 402 })) as never;
+    goal.startGoalDraft({ sessionId, conversationId: 'c-no-credit', turnId: 'g-1' });
+    const failed = await settled('c-no-credit');
+    expect(failed.stage).toBe('failed');
+    expect(goal.ackGoalDraft('c-no-credit', failed.token)).toBe(true);
+    expect(goal.goalViewFor('c-no-credit')).toMatchObject({ stage: 'failed', error: expect.stringContaining('out_of_credit'), reply: '' });
+    // Still there once the draft's payload would otherwise expire.
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 11 * 60_000);
+    try {
+      expect(goal.goalViewFor('c-no-credit')).toMatchObject({ stage: 'failed', error: expect.stringContaining('out_of_credit') });
+    } finally { clock.mockRestore(); }
+
+    // A failure the page retries on its own clock is still hidden once acknowledged.
+    const retrySession = await seed('c-busy');
+    globalThis.fetch = (async () => new Response(JSON.stringify({ error: { message: 'busy' } }), { status: 503 })) as never;
+    goal.startGoalDraft({ sessionId: retrySession, conversationId: 'c-busy', turnId: 'g-1' });
+    const busy = await settled('c-busy');
+    expect(goal.ackGoalDraft('c-busy', busy.token)).toBe(true);
+    expect(goal.goalViewFor('c-busy')).toBeNull();
+  });
+
   it('does not read an arbitrarily large OpenRouter error body just to produce a short status', async () => {
     const sessionId = await seed('c-huge-error');
     globalThis.fetch = (async () =>
@@ -1362,6 +1608,29 @@ describe('the model catalogue', () => {
     expect(goal.MODEL_PAGE_SIZE).toBe(20);
   });
 
+  it('searches the whole catalogue before paging matches', async () => {
+    const entries = Array.from({ length: 45 }, (_, index) => ({
+      id: `vendor/model-${index}`,
+      name: `Model ${index}`,
+      created: 10_000 - index
+    }));
+    entries[44] = { id: 'hidden/vendor-needle', name: 'Needle Model', created: 1 };
+    globalThis.fetch = vi.fn(async () => Response.json({ data: entries }));
+
+    const byName = await goal.listGoalModels(0, 20, 'needle');
+    expect(byName.total).toBe(1);
+    expect(byName.models.map(model => model.id)).toEqual(['hidden/vendor-needle']);
+
+    const byId = await goal.listGoalModels(0, 20, 'VENDOR-NEEDLE');
+    expect(byId.total).toBe(1);
+    expect(byId.models.map(model => model.id)).toEqual(['hidden/vendor-needle']);
+
+    const cleared = await goal.listGoalModels(0, 20, '   ');
+    expect(cleared.total).toBe(45);
+    expect(cleared.models).toHaveLength(20);
+    expect(cleared.models[0]?.id).toBe('vendor/model-0');
+  });
+
   it('returns catalogue reasoning metadata for the selected model even outside the requested page', async () => {
     await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, model: 'selected/old-model' } });
     globalThis.fetch = vi.fn(async () => Response.json({ data: [
@@ -1390,6 +1659,29 @@ describe('the model catalogue', () => {
     await setSecret('openRouterApiKey', 'key-a');
     expect((await goal.listGoalModels()).models.map((model) => model.id)).toEqual(['only-for-a']);
     await setSecret('openRouterApiKey', 'key-b');
+    expect((await goal.listGoalModels()).models.map((model) => model.id)).toEqual(['only-for-b']);
+    expect(seenAuth).toEqual(['Bearer key-a', 'Bearer key-b']);
+  });
+
+  it('keeps no catalogue fetched with a key replaced while it loaded, and reuses one while the key stays', async () => {
+    const seenAuth: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      const authorization = String((init?.headers as Record<string, string> | undefined)?.authorization ?? '');
+      seenAuth.push(authorization);
+      if (authorization.endsWith('key-a')) await held;
+      const id = authorization.endsWith('key-b') ? 'only-for-b' : 'only-for-a';
+      return new Response(JSON.stringify({ data: [{ id, name: id, created: 1 }] }), { status: 200 });
+    }) as never;
+
+    await setSecret('openRouterApiKey', 'key-a');
+    const loading = goal.listGoalModels();
+    await vi.waitFor(() => expect(seenAuth).toEqual(['Bearer key-a']));
+    await setSecret('openRouterApiKey', 'key-b');
+    release();
+    expect((await loading).models.map((model) => model.id)).toEqual(['only-for-a']);
+    expect((await goal.listGoalModels()).models.map((model) => model.id)).toEqual(['only-for-b']);
     expect((await goal.listGoalModels()).models.map((model) => model.id)).toEqual(['only-for-b']);
     expect(seenAuth).toEqual(['Bearer key-a', 'Bearer key-b']);
   });
@@ -1530,6 +1822,18 @@ describe('the message a person would have typed', () => {
     expect(typed).toContain('`npm run verify`');
     expect(typed).toContain('src/renderer/chat.ts');
     expect(typed).toContain('https://example.com/build/latest');
+  });
+
+  // VM, 2026-10-19: a Goal follow-up said "run powershel -NoProfile -Command ...". A command
+  // written without backticks is still a command, and a word the reply must contain is literal.
+  it.each([
+    // In each draft the protected word is the only one a mistake could go into.
+    ['a command line without backticks', 'ok, run powershell -NoProfile now', 'powershell -NoProfile'],
+    ['a command after run', 'pls run npm install now', 'npm install'],
+    ['quoted text', 'say "checked" now', '"checked"'],
+    ['the word a reply must be', 'say the word ready now', 'the word ready']
+  ])('keeps %s exact', (_, written, kept) => {
+    expect(goal.humanReply(written)).toContain(kept);
   });
 
   it('leaves a message with nothing to spoil exactly as it was', () => {
@@ -1721,6 +2025,27 @@ describe('a chat driven towards a specific goal', () => {
       turnId: 'source-turn', eventSeq: 0, acceptedAt: Date.now(), state: 'pending'
     }] });
     expect(goal.goalPendingReplyFor('invalid-provisional')).toBeNull();
+  });
+
+  it('persists the three-reload Goal pickup stop and refuses a fourth attempt after restore', async () => {
+    const conversationId = 'goal-pickup-bound';
+    const session = await createSession({ title: 'Bounded Goal pickup', conversationId });
+    const acceptedAt = Date.now();
+    await goal.acceptGoalReplyNow({ conversationId, sessionId: session.id, replyId: 'goal-reply-bound',
+      turnId: 'goal-turn-bound', eventSeq: 42, blocked: false });
+
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', acceptedAt + 120_000, acceptedAt + 420_000))
+      .toEqual({ attempts: 1, nextAt: acceptedAt + 420_000 });
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', acceptedAt + 420_000, acceptedAt + 1_020_000))
+      .toEqual({ attempts: 2, nextAt: acceptedAt + 1_020_000 });
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', acceptedAt + 1_020_000, acceptedAt + 1_920_000))
+      .toEqual({ attempts: 3, stoppedAt: acceptedAt + 1_020_000 });
+
+    const saved = goal.snapshotGoalReplies();
+    goal.resetGoalStateForTests();
+    goal.restoreGoalReplies(saved);
+    expect(goal.goalPendingReplyFor(conversationId)).toMatchObject({ pickupAttempts: 3, pickupStoppedAt: acceptedAt + 1_020_000 });
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', acceptedAt + 1_920_000)).toBeNull();
   });
 
   it('upgrades a decided provisional turn to the stable reply without reopening it', async () => {
@@ -2488,7 +2813,9 @@ it('publishes actual opening response deltas before one validated final result',
   expect(await result).toMatchObject({ reply: goal.humanReply('Inspect then implement') });
 });
 
-it('never owes or generates a browser continuation for Astra even with Goal armed', async () => {
+it('keeps Astra Goal finish-only while the finish tool is enabled and after-turn is not selected', async () => {
+  const config = (await import('../src/main/config.js')).getConfig();
+  await saveConfig({ ...config, ui: { ...config.ui, finishTool: true } });
   const conversationId = 'aaaaaaaa-1111-4222-8333-123456789abc';
   const session = await createSession({ conversationId, title: 'Astra finish-only' });
   await observeSessionModel(session.id, conversationId, 'gpt-6-pro', Date.now());
@@ -2500,6 +2827,31 @@ it('never owes or generates a browser continuation for Astra even with Goal arme
   goal.beginGoalDraft(conversationId, draft.token);
   await vi.waitFor(() => expect(goal.goalViewFor(conversationId)?.stage).toBe('no-reply'));
   expect(fetch).not.toHaveBeenCalled();
+});
+
+it.each(['goal', 'loop'] as const)('runs Astra %s through its ordinary decision after a turn when finish is disabled or after-turn is selected', async mode => {
+  const config = (await import('../src/main/config.js')).getConfig();
+  for (const finishTool of [false, true]) {
+    await saveConfig({ ...config, ui: { ...config.ui, finishTool } });
+    const conversationId = `astra-${mode}-${finishTool}`;
+    const session = await createSession({ conversationId });
+    await observeSessionModel(session.id, conversationId, 'gpt-6-pro', Date.now());
+    await goal.setGoalSwitchNow(conversationId, mode, true, finishTool);
+    await appendEvent(session.id, { kind: 'user_message', source: 'extension', time: Date.now(),
+      message: { text: 'Finish the requested checks', chars: 27, truncated: false } });
+    await recordLoopMcpProof(session.id, 'astra-turn');
+    await goal.acceptGoalReplyNow({ conversationId, sessionId: session.id, replyId: 'astra-final', turnId: 'astra-turn', eventSeq: 10, blocked: false });
+    expect(goal.goalPendingReplyFor(conversationId)?.replyId).toBe('astra-final');
+    const fetcher = vi.fn(async (_url: unknown, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      expect(body.messages[0].content).toBe(mode === 'goal' ? config.goal.prompt : config.goal.loopPrompt);
+      return decision(mode === 'goal' ? 'stop' : 'continue', mode === 'loop' ? 'Continue the requested checks' : '');
+    });
+    globalThis.fetch = fetcher as typeof fetch;
+    goal.startGoalDraft({ conversationId, sessionId: session.id, turnId: 'astra-turn' });
+    expect((await settled(conversationId)).stage).toBe(mode === 'goal' ? 'no-reply' : 'ready');
+    expect(fetcher).toHaveBeenCalledOnce();
+  }
 });
 
 describe('a custom OpenAI-compatible provider', () => {
@@ -2717,5 +3069,138 @@ describe('a custom OpenAI-compatible provider', () => {
       expect(() => open(bad), bad).toThrow(/^invalid_provider/);
     }
     expect(goal.resolveGoalBaseUrl({ kind: 'openrouter', baseUrl: '' })).toBe('https://openrouter.ai/api/v1');
+  });
+});
+
+describe('the original request reaches the helper verbatim', () => {
+  const starter = ' \nShip the importer.\n\n  1. keep the "legacy" flag: it must stay\n  2. no new deps\t(tabs matter)\nDone means: suite green, README updated.\n ';
+
+  async function chat(conversationId: string, first: string): Promise<string> {
+    const session = await createSession({ title: 'verbatim', conversationId });
+    await appendEvent(session.id, { time: 1_000, source: 'extension', kind: 'user_message', message: { text: first, truncated: false, chars: first.length } });
+    await appendEvent(session.id, { time: 1_100, source: 'extension', kind: 'assistant_message', final: true, message: { text: 'importer written, README pending', truncated: false, chars: 31 } });
+    await appendEvent(session.id, { time: 1_200, source: 'extension', kind: 'user_message', message: { text: 'also handle empty files', truncated: false, chars: 23 } });
+    return session.id;
+  }
+
+  /** Every system message of the outgoing request, plus the raw body for substring checks. */
+  function capture(): { system: string[]; raw: string } {
+    const box = { system: [] as string[], raw: '' };
+    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+      box.raw = String(init.body);
+      box.system = (JSON.parse(box.raw) as { messages: { role: string; content: string }[] }).messages.filter(message => message.role === 'system').map(message => message.content);
+      return decision('continue', 'next step');
+    }) as never;
+    return box;
+  }
+
+  it.each(['goal', 'loop'] as const)('does not supplement a first user message already in the %s transcript', async mode => {
+    const conversationId = 'c-present-original';
+    const sessionId = await chat(conversationId, starter);
+    await recordLoopMcpProof(sessionId, 'g-present-original');
+    await goal.setGoalSwitchNow(conversationId, mode, true);
+    const box = capture();
+    goal.startGoalDraft({ sessionId, conversationId, turnId: 'g-present-original' });
+    expect((await settled(conversationId)).stage).toBe('ready');
+    expect(box.raw).not.toContain('Original request (reference):');
+    expect(referenceTranscript(JSON.parse(box.raw).messages)).toContainEqual({ role: 'user', content: starter.trim() });
+    expect(await goal.draftFastFollowup(sessionId, undefined, undefined, undefined, mode)).toBe('next step');
+    expect(box.raw).not.toContain('Original request (reference):');
+  });
+
+  it.each(['goal', 'loop'] as const)('supplements only an absent human original in %s prepared context', async mode => {
+    const sessionId = await chat('c-prepared-original', starter);
+    await recordLoopMcpProof(sessionId, 'g-prepared-original');
+    const box = capture();
+    for (const message of [
+      { role: 'user' as const, content: starter, present: true },
+      { role: 'user' as const, content: starter.trim(), present: true },
+      { role: 'user' as const, content: starter.replace('  1.', ' 1.'), present: false },
+      { role: 'assistant' as const, content: starter, present: false },
+      { role: 'user' as const, origin: 'automatic' as const, content: starter, present: false }
+    ]) {
+      const { present, ...row } = message;
+      const prepared = row.role === 'assistant' ? [row, { role: 'user' as const, content: 'Summary' }] : [row];
+      expect(await goal.draftFastFollowup(sessionId, undefined, prepared, undefined, mode)).toBe('next step');
+      expect(box.raw.includes('Original request (reference):')).toBe(!present);
+    }
+  });
+
+  it.each(['goal', 'loop'] as const)('keeps the later user correction newer than supplemental API original in %s', async mode => {
+    const conversationId = 'c-api-original-order';
+    const sessionId = await chat(conversationId, starter);
+    await recordLoopMcpProof(sessionId, 'api-original-order-turn');
+    await goal.setGoalSwitchNow(conversationId, mode, true);
+    const box = capture();
+    const correction = 'CURRENT HUMAN CORRECTION: do not use the legacy flag.';
+    expect(await goal.draftFastFollowup(sessionId, undefined,
+      [{ role: 'user', content: correction }], undefined, mode)).toBe('next step');
+    const outgoing = JSON.parse(box.raw).messages as { role: string; content: string }[];
+    const originalIndex = outgoing.findIndex(row => row.role === 'user' && row.content.includes('Original request (reference):'));
+    const conversationIndex = outgoing.findIndex(row => row.role === 'user' &&
+      row.content.includes(correction) && row.content.includes('The transcript below is reference data'));
+    expect(originalIndex).toBeGreaterThan(-1);
+    expect(conversationIndex).toBeGreaterThan(-1);
+    expect(originalIndex).toBeLessThan(conversationIndex);
+  });
+
+  it.each(['goal', 'loop'] as const)('shortens a first request over 60,000 characters and still decides in %s mode', async mode => {
+    const long = `START-MARKER ${'x'.repeat(60_000)} END-MARKER`;
+    const sessionId = await chat('c-verbatim-long', long);
+    const box = capture();
+    await recordLoopMcpProof(sessionId, 'g-verbatim-long');
+    await goal.setGoalSwitchNow('c-verbatim-long', mode, true);
+    goal.startGoalDraft({ sessionId, conversationId: 'c-verbatim-long', turnId: 'g-verbatim-long' });
+    expect((await settled('c-verbatim-long')).stage).toBe('ready');
+    expect(await goal.draftFastFollowup(sessionId, undefined, undefined, undefined, mode)).toBe('next step');
+    expect(box.raw).not.toContain('Original request (reference):');
+    expect(await goal.draftFastFollowup(sessionId, undefined, [{ role: 'user', content: 'Summary' }], undefined, mode)).toBe('next step');
+    const messages = JSON.parse(box.raw).messages as { content: string }[];
+    const original = messages.find(message => message.content.startsWith('Original request (reference)'))!.content;
+    expect(original).toContain('START-MARKER');
+    expect(original).toContain('END-MARKER');
+    expect(original).toMatch(/\d+ characters omitted/);
+    expect(original.length).toBeLessThan(20_300);
+  });
+
+  it.each(['saved fragment', 'saved fragment\n…[986 more characters stored in full as abcdef12.txt]'])('includes a recorder-truncated first request (%s) and still decides', async text => {
+    const session = await createSession({ title: 'truncated original', conversationId: 'c-truncated-original' });
+    await appendEvent(session.id, { time: 1_000, source: 'extension', kind: 'user_message', message: { text, truncated: true, chars: 1000 } });
+    const box = capture();
+    goal.startGoalDraft({ sessionId: session.id, conversationId: 'c-truncated-original', turnId: 'g-truncated-original' });
+    expect((await settled('c-truncated-original')).stage).toBe('ready');
+    expect(box.raw).toContain('saved fragment');
+    expect(box.raw).not.toContain('Original request (reference):');
+    expect(await goal.draftFastFollowup(session.id, undefined, [{ role: 'user', content: 'Summary' }], undefined, 'goal')).toBe('next step');
+    expect(box.raw).toContain('recorder');
+    expect(box.raw).toContain('full text is unavailable in this reference');
+    expect(box.raw).not.toContain('characters omitted before storage');
+    if (text.includes('986 more characters')) expect(box.raw).toContain('986 more characters');
+  });
+
+  it.each(['', 'x'])('clips Unicode at whole surrogate pairs with prefix %j and an exact omitted count', async prefix => {
+    const sessionId = await chat('c-unicode-original', prefix + '\u{1F600}'.repeat(20_000));
+    const box = capture();
+    expect(await goal.draftFastFollowup(sessionId, undefined, [{ role: 'user', content: 'Summary' }], undefined, 'goal')).toBe('next step');
+    const original = (JSON.parse(box.raw).messages as { content: string }[]).find(message => message.content.startsWith('Original request (reference)'))!.content;
+    expect(Buffer.from(original, 'utf8').toString('utf8')).toBe(original);
+    const kept = [...original.matchAll(/\u{1F600}/gu)].length * 2;
+    expect(original).toContain(`${40_000 - kept} characters omitted`);
+    expect(kept).toBeGreaterThan(19_000);
+  });
+
+  it('shortens a large first request when prepared context is a summary', async () => {
+    const big = `BEGIN ${'x'.repeat(58_000)} ${starter} FINISH`;
+    const sessionId = await chat('c-verbatim-big', big);
+    goal.setGoalObjective('c-verbatim-big', 'ship the importer');
+    const box = capture();
+    const prepared = [{ role: 'user' as const, content: 'Summary: importer work in progress' }];
+    expect(await goal.draftFastFollowup(sessionId, undefined, prepared, undefined, 'goal')).toBe('next step');
+    const original = (JSON.parse(box.raw) as { messages: { role: string; content: string }[] }).messages.find(message => message.role === 'user' && message.content.startsWith('Original request (reference)'));
+    expect(original?.content).toContain('BEGIN');
+    expect(original?.content).toContain('FINISH');
+    expect(original?.content).toMatch(/\d+ characters omitted/);
+    expect(original!.content.length).toBeLessThan(20_300);
+    expect(box.system.some(content => content.includes('[… cut …]'))).toBe(false);
   });
 });

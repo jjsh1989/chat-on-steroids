@@ -4,7 +4,7 @@ Chat On Steroids is a Windows/macOS/Linux beta maintained by one person. Bug rep
 
 ## Before a pull request
 
-For anything non-trivial, open an issue first so the intended behavior is clear. Security problems must be reported privately through [`SECURITY.md`](SECURITY.md), not as an issue or PR.
+No separate issue is needed: describe the problem and the change in the PR. For anything beyond a small fix, open a draft PR early and agree on the behavior there before building it out. Security problems must be reported privately through [`SECURITY.md`](SECURITY.md), not as an issue or PR.
 
 Keep changes narrow. Preserve existing permission, identity and recovery behavior unless the issue specifically requires changing it. Avoid unrelated formatting, generated output, local debugging material and private data. In screenshots, logs and examples, replace real usernames, local paths, chat text, IDs and credentials with obvious placeholders such as `C:\Users\you\project` or `/home/you/project`.
 
@@ -21,6 +21,28 @@ npm ci
 npm run verify     # the same gate CI runs
 npm run dev        # Electron development build
 ```
+
+On Linux with Nix installed, the repository also has a flake-based development shell. It uses
+Node 22 to match CI, derives the Electron major from `package.json`, and imports npm dependencies
+from the integrity hashes already stored in `package-lock.json`, so there is no second npm
+dependency hash to bump.
+
+The Nix shell has been built and tested on `x86_64-linux`. `aarch64-linux` has only been
+evaluated, not built or tested.
+
+```sh
+nix develop
+npm run verify
+npm run dev
+```
+
+The Nix shell owns its `node_modules` symlinks. When changing dependencies, update the manifest
+and lockfile with `npm install --package-lock-only ...`, then re-enter `nix develop`. If you are
+switching an existing checkout from a regular `npm ci`, remove that generated `node_modules`
+directory once before entering the Nix shell. `flake.lock` is the only Nix-specific dependency
+pin; Nix contributors can update it in their own pull requests with `nix flake update`.
+Run `npm run tunnel` when working on the OpenAI tunnel path; the shell already provides ripgrep
+for normal development fallback discovery.
 
 A behavior change should include a deterministic regression test where practical. Run the nearest focused tests while working and `npm run verify` before submitting.
 
@@ -39,9 +61,56 @@ npm run dist:linux:arm64
 
 Release CI builds and smoke-tests every platform/architecture on a native runner. Packaging downloads/stages pinned external assets and verifies their checksums, so the first packaging run needs network access. Do not claim a cross-OS package is validated merely because electron-builder can sometimes emit it from another host.
 
+## Canary builds
+
+The `canary` prerelease is a test build of `main`, rebuilt automatically after every change to `main` that can affect the app (documentation and test-only changes are skipped). A newer build replaces the previous one. It has no release notes and no support. Issues and pull requests are accepted only for problems that also happen on the latest stable release.
+
+## Issues
+
+A bug report needs the exact app version, for example `2.1.32` (Settings → Activity in the app). "latest" is not enough: it changes with every release. A report without a version number is closed with the `needs-version` label and reopens by itself when the number is edited in.
+
+Bug reports opened from October 15, 2026 on also need:
+
+- **The diagnostics report.** In the app, open Activity and click Diagnostics report, then attach the saved file. Personal details are already replaced in it. If the app does not open at all, attach its `app.log` instead.
+- **A check on the latest release.** Update first and confirm the problem is still there; a report for an older version is asked to retry on the newest one.
+
+A report without them is closed with the `incomplete-report` label and a note on what is missing, and reopens by itself once they are edited in. Steps to reproduce, how often it happens and a screenshot are not required, but they often save a round of questions.
+
+Issues are closed as soon as their fix is merged to `main`; the fix ships with the next release. When an issue is labeled `needs-info`, it waits for details from the reporter: after 7 days without a reply it gets one reminder, and 3 days later it is closed. Reply or reopen at any time with the details.
+
 ## Pull requests
 
-Explain the root cause, the smallest behavior change that fixes it, and exactly how you validated it. Packaging/runtime changes should include a packaged-runtime smoke check where relevant.
+This project is maintained by one person, so review time is the scarce part. A PR is reviewed only when **CI and the "PR checklist" check are green**. When one of them fails, the PR is turned back into a draft (label `not-ready`); fix it and click **Ready for review** to put it back in the queue. The checklist runs automatically on every PR and on every edit of its description; its log says exactly what is missing. Use the pull request template and it passes by itself.
+
+Maintainers are happy to fix small things before merging, but they do not build out, debug or finish a change from scratch, and a pull request whose checks fail is not reviewed until you fix it. AI-assisted contributions are welcome when you have run, understood and tested every line yourself: you are responsible for the whole change, and a PR is not a request for someone else to finish it.
+
+What every PR needs:
+
+1. **Why and what, in the PR itself.** The root cause or user problem, and the behavior change, in a few sentences each. No separate issue is needed; discussion happens on the PR. When it closes an issue, write `Fixes #123` so the issue closes on merge. For anything beyond a small fix, open a draft PR early and agree on the behavior there before building it out.
+2. **A test that fails without the change.** Name it in the PR. The "Fail-first test" check proves it: it runs your changed tests against `main`'s code, and at least one must fail there. Only when a test is truly impossible, write `No test: <reason>`; when your tests only follow a refactor, write `Fail-first: n/a <reason>`.
+3. **Rare and edge cases, handled.** Say under `## Edge cases` which ones your change handles and how: empty or missing input, a restart or reload midway, two things happening at once, a slow or failed network, Windows and macOS, other languages, old saved data, an older extension. Cover the likely ones with tests and name them. A bug that only shows up sometimes is still a bug for the person who meets it. When none apply, write `No edge cases: <reason>`. (Required for PRs that change code, opened from October 21, 2026 on; so are rules 4 to 9.)
+4. **Every language.** Every new text a person sees ships in all 12 languages with your PR: interface text, timeline notes, notifications and the extension's texts. Tick it in the checklist. (Renderer strings are also checked by the tests.)
+5. **Windows and macOS, thought through.** When your change touches the operating system (native helpers, windows and tray, keyboard shortcuts, the terminal and processes, dictation, secure storage, updates), say under `## Platforms` how it behaves on each, including keys the system or an input method takes first. Trying it on a Mac is welcome but not required; then say why it works there. When the platforms cannot differ, write `No platform difference: <reason>`.
+6. **Old saved data still loads.** When your change writes saved data (settings, files the app keeps, secure storage, extension storage), name under `## Saved data` the test that loads data saved by the previous version, and a damaged value. An update that can't read what people already have breaks them right after updating. Otherwise write `No saved-data change: <reason>`.
+7. **Say why in the log.** Whenever the app decides something on its own (it waits, refuses, skips or retries), it writes one log line saying which and why, so a diagnostics report answers "why didn't it…" without guessing. Tick it in the checklist.
+8. **Tests that don't sleep.** New tests use fake timers or wait for the condition they need. A fixed wait over a second makes a test slow and flaky on a busy runner; if one is truly needed, add a line `Long wait: <reason>`.
+9. **Cost and size, stated.** If your change sends more to ChatGPT or another provider per message or per Goal/Loop step, say how much more and why (and cap it). A new file over 500 KB (a picture, a binary), or one your change makes cross 500 KB or grow by more than that, needs a line `Size: <reason>`. Editing a file that was already that large does not, unless it grows by more than 500 KB.
+10. **Live proof for behavior changes.** When the app or the extension behaves differently, show it working in the real app under `## Live proof`: a screenshot, a short recording, or an excerpt of the app log in a code block. Otherwise write `No behavior change: <reason>`. (Required for PRs opened from October 15, 2026 on.)
+11. **Screenshots for interface changes.** Before and after, with placeholder data. Run `npm run verify:ui`. When renderer code changes but nothing on screen does, write `No visual change: <reason>` instead.
+12. **One topic, small.** At most 600 changed lines outside tests and translations. Split larger work, or state `Large change: <reason>` and expect a slower review.
+13. **Clean contents.** Nothing unrelated: no worklogs, notes, logs, formatting-only edits or generated output. Rebase on `main` when it conflicts.
+14. **Green checks.** `npm run verify` passes on your machine. Say which OS you ran it on. Packaging/runtime changes also need a packaged-runtime smoke check.
+15. **Docs with contracts.** A change to the preload API, IPC handlers or `src/shared` types updates the matching part of [`AGENTS.md`](AGENTS.md) in the same PR, or states `No contract change: <reason>`. The same applies to new recorded fields, bridge routes and extension messages.
+16. **Maintainer edits allowed.** Keep "Allow edits by maintainers" on, so a maintainer can make a small fix before merging instead of another review round. Your authorship stays. It is not a way to leave work unfinished.
+17. **No stacks out of order.** A PR that builds on another one says `Depends on #N` and stays a draft until #N is merged; then rebase it on `main`.
+
+What reviews look for, beyond the checks:
+
+- **Every change serves the linked issue.** No extra behavior changes "while at it", even small ones; open a separate issue for them.
+- **Nothing depends on ChatGPT's wording.** Decide behavior from structure, ids and machine fields, never from visible English text. ChatGPT is used in many languages; if text is unavoidable, include a non-English case in the test.
+- **Interface changes are checked in the real app.** Besides `npm run verify:ui`, run the change in a real build and show it in the screenshots or a short clip.
+- **Automatic reviews come first.** CodeRabbit reviews every pull request that is not a draft (Dependabot's excepted), and every push to it, within a few minutes. It only comments; it never pushes to your branch. Its settings are in [`.coderabbit.yaml`](.coderabbit.yaml). Fix what it finds, or answer in its thread why not (you can reply to it there, and `@coderabbitai review` asks for a fresh review). Its comments don't block a merge on their own, but a maintainer reads them before merging.
+- **Answer review comments or fix red checks when you can.** After 3 quiet days a bot leaves one friendly reminder, and 3 days later it closes the PR. If only a small fix is missing, a maintainer may finish it instead. Any push or reply, even "I need more time", resets the clock, and a closed PR can be reopened at any time.
 
 ## Credit and attribution
 

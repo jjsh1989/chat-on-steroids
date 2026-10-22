@@ -12,14 +12,13 @@ function notice(): HTMLElement {
   ui(image, 'aria-label', () => t('Example of a ChatGPT tool approval prompt'));
   image.alt = t('Example of a ChatGPT tool approval prompt');
   card.append(image,
-    el('p', '', () => t('Review the action, then open Allow → Always allow.')),
-    el('p', 'muted tool-approval-footnote', () => t('Separate from Plugins → Allow all actions. This reminder does not approve a tool call.')));
+    el('p', '', () => t('Review the action, then allow it, always for this plugin.')),
+    el('p', 'muted tool-approval-footnote', () => t('This is separate from the plugin’s permissions, and this reminder does not approve a tool call.')));
   return card;
 }
 
 /** Presentation subscribes to an existing successful opening; it never opens a browser. */
 export function initToolApprovalNotice(subscribe?: (listener: () => void) => () => void): void {
-  document.getElementById('toolApprovalSetup')?.replaceChildren(notice());
   const dialog = document.createElement('dialog'); dialog.className = 'tool-approval-dialog';
   ui(dialog, 'aria-label', () => t('ChatGPT tool approval'));
   const close = el('button', 'btn btn-solid', () => t('Got it')) as HTMLButtonElement; close.type = 'button';

@@ -2,9 +2,97 @@ import { readFileSync } from 'node:fs';
 import { JSDOM } from 'jsdom';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { UsageOverview } from '../src/shared/usage.js';
+import type { ProviderUsage } from '../src/shared/provider-usage.js';
 
 let dom: JSDOM;
-afterEach(() => { dom?.window.close(); vi.unstubAllGlobals(); vi.resetModules(); });
+/**
+ * The renderer prints money and compact counts in the app's language, like every other number on
+ * the page; the suite runs in English. (They used to follow the system region, which put
+ * "4.082,99 $" and "8,5 Mrd." on an English page.)
+ */
+const money = new Intl.NumberFormat('en', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+const usd = (value: number) => money.format(value);
+afterEach(() => { dom?.window.close(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.resetModules(); });
+
+it('chooses the week start from a weekday menu, keeps exact counts, and restores the weekday after reload', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  const data: UsageOverview = { contextTokenCap: 256_000, tokens: 0, models: [], days: [], projects: [], sessions: 1,
+    limits: [
+      { model: 'gpt-6-pro', scope: 'model', remaining: 123, remainingPercent: null, resetAt: null, windowSeconds: 604800, observedAt: Date.now() },
+      { model: 'Codex', scope: 'codex', remaining: null, remainingPercent: 16, resetAt: null, windowSeconds: 18000, observedAt: Date.now() },
+      { model: 'deep_research', scope: 'feature', remaining: 250, remainingPercent: null, resetAt: null, windowSeconds: null, observedAt: Date.now() }
+    ],
+    messages: { through: new Date(2026, 8, 21, 12).getTime(), days: [
+      { date: '2026-09-19', gpt56: 1234, gpt6: 12 }, { date: '2026-09-20', gpt56: 10, gpt6: 3 }, { date: '2026-09-21', gpt56: 1, gpt6: 1 }
+    ] } };
+  const getUsage = vi.fn(async () => ({ ok: true, data }));
+  Object.assign(dom.window, { api: { getUsage, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
+  const { initLanguage, setLanguage } = await import('../src/renderer/i18n.js'); initLanguage();
+  const usage = await import('../src/renderer/usage.js'); usage.initUsage();
+  const element = (id: string) => dom.window.document.getElementById(id)!;
+  const select = element('usageWeekStart') as HTMLSelectElement;
+  const surface = select.closest('.usage-message-surface')!;
+  expect(element('usageMessageCounts').parentElement).toBe(surface);
+  expect(element('modelUsage').parentElement).toBe(surface);
+  expect(element('refreshUsage').closest('.settings-section-head')).not.toBeNull();
+  expect(surface.contains(element('refreshUsage'))).toBe(false);
+  const chosen = () => select.selectedOptions[0]!.textContent;
+  const choose = (weekday: number) => { select.value = String(weekday); select.dispatchEvent(new dom.window.Event('change')); };
+  // Seven named choices, Monday first, instead of a button that cycles silently.
+  expect([...select.options].map(option => option.value)).toEqual(['1', '2', '3', '4', '5', '6', '0']);
+  expect(select.options[6]!.textContent).toBe('Since Sunday');
+  expect(element('usageMessages6').textContent).toBe('—');
+  await usage.refreshUsage();
+  expect(chosen()).toBe('Since Monday');
+  expect(element('usageMessages6').textContent).toBe('1');
+  expect(element('usageStatus').textContent).toBe('');
+  const quotas = element('usageLimits').textContent;
+  expect(quotas).toContain('123 remaining');
+  expect(quotas).toContain('250 remaining');
+  // wham/usage's windows are Codex's, labeled as such and listed after the chat limits (2026-10-16).
+  const rows = [...element('usageLimits').querySelectorAll('.usage-limit')].map(row => row.textContent);
+  expect(rows.at(-1)).toContain('Codex · 5-hour limit');
+  expect(rows.at(-1)).toContain('Codex usage, not your ChatGPT chats');
+  expect(quotas).not.toContain('Shared across all models');
+  expect(element('usageMessageCounts').textContent).toContain('sent');
+  expect(element('usageMessageCounts').textContent).not.toContain('remaining');
+  choose(6);
+  expect(chosen()).toBe('Since Saturday');
+  expect(element('usageMessages6').textContent).toBe('16');
+  expect(element('usageMessages56').textContent).toBe((1245).toLocaleString('en')); // Never a rounded 1.2K.
+  expect(element('usageMessagePeriod').textContent).toContain(new Intl.DateTimeFormat('en', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(2026, 8, 19)));
+  expect(select.title).toContain(element('usageMessagePeriod').textContent);
+  expect(element('usageLimits').textContent).toBe(quotas);
+  expect(dom.window.localStorage.getItem('cos.usage.weekStart')).toBe('6');
+  expect(getUsage).toHaveBeenCalledTimes(1);
+  setLanguage('ja');
+  expect(element('usageWeekStart')).toBe(select);
+  expect(chosen()).toContain('土曜日から');
+  expect(element('usageMessages6').textContent).toBe('16');
+  setLanguage('en');
+  choose(0);
+  expect(chosen()).toBe('Since Sunday');
+  expect(element('usageMessages6').textContent).toBe('4');
+  choose(1);
+  expect(element('usageMessages6').textContent).toBe('1');
+  expect(getUsage).toHaveBeenCalledTimes(1);
+  dom.window.localStorage.setItem('cos.usage.weekStart', '6');
+  vi.resetModules();
+  const restored = await import('../src/renderer/usage.js'); restored.initUsage(); await restored.refreshUsage();
+  expect((element('usageWeekStart') as HTMLSelectElement).value).toBe('6');
+  expect(element('usageMessages6').textContent).toBe('16');
+  expect(element('usageStatus').textContent).toBe('');
+});
+
+it.each(['7', '-1', '1.5', 'invalid', ''])('ignores invalid persisted weekday %j', async saved => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  dom.window.localStorage.setItem('cos.usage.weekStart', saved);
+  const { initUsage } = await import('../src/renderer/usage.js'); initUsage();
+  expect((dom.window.document.getElementById('usageWeekStart') as HTMLSelectElement).value).toBe('1');
+  expect(dom.window.document.getElementById('usageMessages6')!.textContent).toBe('—');
+});
 
 it('explains a pending background rebuild and replaces transport failure with a retryable status', async () => {
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
@@ -33,7 +121,7 @@ it.each([256_000, 400_000])('shows the calculated %i context cap and edits formu
     { model: 'gpt-5.6', reasoningEffort: 'high', assumed: true, tokens: 1e6 },
     { model: 'another-model', reasoningEffort: 'low', assumed: false, tokens: 1e6 }
   ];
-  const data: UsageOverview = { contextTokenCap, tokens: 2e6, models, days: [{ date: '2026-09-05', tokens: 2e6, models }], sessions: 1, limits: ['deep_research', 'file_upload', 'paste_text_to_file', 'image_gen'].map(model => ({ model, scope: 'feature', remaining: 3, remainingPercent: 50, resetAt: null, windowSeconds: null, observedAt: Date.now() })) };
+  const data: UsageOverview = { contextTokenCap, messages: { through: Date.now(), days: [] }, tokens: 2e6, models, days: [{ date: '2026-09-05', tokens: 2e6, models }], projects: [], sessions: 1, limits: ['deep_research', 'file_upload', 'paste_text_to_file', 'image_gen'].map(model => ({ model, scope: 'feature', remaining: 3, remainingPercent: 50, resetAt: null, windowSeconds: null, observedAt: Date.now() })) };
   const getUsage = vi.fn(async () => ({ ok: true, data }));
   Object.assign(dom.window, { api: { getUsage, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
   const { initUsage, refreshUsage } = await import('../src/renderer/usage.js');
@@ -42,7 +130,7 @@ it.each([256_000, 400_000])('shows the calculated %i context cap and edits formu
   const cost = () => dom.window.document.getElementById('usageTotalCost')!.textContent;
   const divisor = field('usageDivisor');
   initUsage(); await refreshUsage();
-  expect(dom.window.document.getElementById('usageFormula')!.textContent).toContain(`capped at ${contextTokenCap.toLocaleString()} tokens`);
+  expect(dom.window.document.getElementById('usageFormula')!.textContent).toContain(`capped at ${contextTokenCap.toLocaleString('en')} tokens`);
   const formulaDetails = dom.window.document.getElementById('usageFormulaDetails') as HTMLDetailsElement;
   expect(formulaDetails.open).toBe(false);
   expect(divisor.closest('details')).toBe(formulaDetails);
@@ -56,41 +144,42 @@ it.each([256_000, 400_000])('shows the calculated %i context cap and edits formu
   expect(balances.textContent).not.toMatch(/deep_research|file_upload|paste_text_to_file|image_gen|below/);
   expect(field('usageDivisor')).toBe(divisor);
   expect(dom.window.document.getElementById('costModel')).toBeNull();
-  expect(cost()).toContain('0.48'); expect(cost()).toContain('unpriced');
+  // Unpriced tokens make the priced sum a lower bound.
+  expect(cost()).toContain(`≥ ${usd(0.48)}`);
   change(divisor, '4');
-  expect(cost()).toContain('0.24');
+  expect(cost()).toContain(usd(0.24));
   expect(dom.window.document.getElementById('usageFormula')!.textContent).toContain('÷ 4');
   formulaDetails.querySelector('summary')!.click();
   expect(formulaDetails.open).toBe(false);
-  expect(cost()).toContain('0.24');
+  expect(cost()).toContain(usd(0.24));
   change(divisor, '0'); // Invalid edits do not corrupt the active calculation.
-  expect(cost()).toContain('0.24');
+  expect(cost()).toContain(usd(0.24));
   const unknownRate = dom.window.document.querySelector('input[aria-label="another-model cached-input USD per million tokens"]') as HTMLInputElement;
   change(unknownRate, '1');
-  expect(cost()).toContain('0.84'); expect(cost()).not.toContain('unpriced');
+  expect(cost()).toContain(usd(0.84)); expect(cost()).not.toContain('≥');
   change(field('usageMultiplier'), '1');
-  expect(cost()).toContain('0.70');
+  expect(cost()).toContain(usd(0.7));
   expect(getUsage).toHaveBeenCalledTimes(1);
   expect(JSON.parse(dom.window.localStorage.getItem('usage-formula-v1')!)).toMatchObject({ divisor: 4, multiplier: 1, rates: { 'gpt-5.6': 0.4, 'gpt-5.6-sol': 0.4, 'gpt-6-astra': 1, 'gpt-5.5': 0.5, 'another-model': 1 } });
   vi.resetModules();
   const restored = await import('../src/renderer/usage.js');
   restored.initUsage(); await restored.refreshUsage();
   expect(field('usageDivisor').value).toBe('4'); expect(field('usageMultiplier').value).toBe('1');
-  expect(cost()).toContain('0.70');
+  expect(cost()).toContain(usd(0.7));
 });
 
 it('shows the Sol picker alias rate and preserves an explicitly cleared rate after reload', async () => {
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
   const models = [{ model: 'gpt-5-6-thinking', reasoningEffort: 'high', assumed: false, tokens: 427245 }];
-  const data: UsageOverview = { contextTokenCap: 256_000, tokens: 427245, models, days: [{ date: '2026-09-07', tokens: 427245, models }], sessions: 1, limits: [] };
+  const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 427245, models, days: [{ date: '2026-09-07', tokens: 427245, models }], projects: [], sessions: 1, limits: [] };
   const getUsage = vi.fn(async () => ({ ok: true, data }));
   Object.assign(dom.window, { api: { getUsage, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
   const usage = await import('../src/renderer/usage.js');
   usage.initUsage(); await usage.refreshUsage();
   const rate = () => dom.window.document.querySelector('input[aria-label="gpt-5-6-thinking cached-input USD per million tokens"]') as HTMLInputElement;
   expect(rate().value).toBe('0.4');
-  expect(dom.window.document.getElementById('usageTotalCost')!.textContent).toContain('0.21');
+  expect(dom.window.document.getElementById('usageTotalCost')!.textContent).toContain(usd(0.21));
   expect(dom.window.document.getElementById('usageDays')!.textContent).not.toContain('Rate unknown');
   rate().value = ''; rate().dispatchEvent(new dom.window.Event('input'));
   expect(getUsage).toHaveBeenCalledTimes(1);
@@ -106,19 +195,277 @@ it('combines equivalent recorded names in the table while keeping raw rate edits
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
   const models = ['5.6', 'gpt-5-6-thinking', 'gpt-5.6-sol'].map(model => ({ model, reasoningEffort: 'high', assumed: false, tokens: 1e6 }));
-  const data: UsageOverview = { contextTokenCap: 256_000, tokens: 3e6, models, days: [{ date: '2026-09-08', tokens: 3e6, models }], sessions: 1, limits: [] };
+  const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 3e6, models, days: [{ date: '2026-09-08', tokens: 3e6, models }], projects: [], sessions: 1, limits: [] };
   const getUsage = vi.fn(async () => ({ ok: true, data }));
   Object.assign(dom.window, { api: { getUsage, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
   const usage = await import('../src/renderer/usage.js'); usage.initUsage(); await usage.refreshUsage();
   const table = () => dom.window.document.querySelector('#usageDays table')!;
   expect(table().querySelectorAll('tr')).toHaveLength(2);
   expect(table().textContent).toContain('gpt-5.6-sol · high');
-  expect(table().textContent).toContain('1.44');
+  expect(table().textContent).toContain(usd(1.44));
   expect(table().querySelector('[data-usage-hint]')!.getAttribute('data-usage-hint')).toBe('Recorded IDs: 5.6, gpt-5-6-thinking, gpt-5.6-sol');
   expect(dom.window.document.querySelectorAll('#usageRates input')).toHaveLength(3);
   const rate = dom.window.document.querySelector('input[aria-label="5.6 cached-input USD per million tokens"]') as HTMLInputElement;
   rate.value = ''; rate.dispatchEvent(new dom.window.Event('input'));
-  expect(table().textContent).toContain('0.96 + unpriced');
+  expect(table().textContent).toContain(`≥ ${usd(0.96)}`);
   expect(getUsage).toHaveBeenCalledTimes(1);
   expect(models[0]!.model).toBe('5.6');
+});
+
+it.each(['2026-09-28', '2026-10-01', '2027-01-01', '2028-02-29'])('draws an annual Monday-first calendar ending %s, with twelve month labels and a legend', async date => {
+  vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date(`${date}T12:00:00`));
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  const key = (ago: number) => { const date = new Date(); date.setDate(date.getDate() - ago); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`; };
+  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 1e6 }];
+  const days = [{ date: key(3), tokens: 1e6, models }, { date: key(0), tokens: 4e6, models: [{ ...models[0]!, tokens: 4e6 }] }]; // Oldest first, as the main process sends them.
+  const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 5e6, models, days, projects: [], sessions: 1, limits: [] };
+  Object.assign(dom.window, { api: { getUsage: async () => ({ ok: true, data }), getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
+  const usage = await import('../src/renderer/usage.js'); usage.initUsage(); await usage.refreshUsage();
+  const heat = dom.window.document.getElementById('usageHeatmap')!;
+  const cells = [...heat.querySelectorAll('.heat-grid > .heat-cell')] as HTMLElement[];
+  // A full annual window, even with only two recorded days.
+  expect(cells).toHaveLength(52 * 7);
+  const todayRow = (new Date().getDay() + 6) % 7;
+  const today = cells[51 * 7 + todayRow]!;
+  expect(today.dataset.level).toBe('4');
+  expect(cells.slice(51 * 7 + todayRow + 1).every(cell => cell.classList.contains('is-future'))).toBe(true);
+  expect(cells.filter(cell => cell.dataset.level && cell.dataset.level !== '0')).toHaveLength(2);
+  const cellAt = (cell: HTMLElement) => [cell.style.gridRow, cell.style.gridColumn];
+  expect(cellAt(today)).toEqual([String(todayRow + 2), '53']);
+  // Every row has its (sticky) label cell; every other day is named.
+  expect([...heat.querySelectorAll('.heat-day')].map(label => label.textContent)).toEqual(['Mon', '', 'Wed', '', 'Fri', '', 'Sun']);
+  expect(heat.querySelectorAll('.heat-month')).toHaveLength(12);
+  expect(new Set([...heat.querySelectorAll('.heat-month')].map(label => label.textContent)).size).toBe(12);
+  expect(heat.querySelector('.heat-legend')!.textContent).toBe('LessMore');
+  // The cost chart states its peak and its date range.
+  // Today is the peak day and the newest row of the daily breakdown.
+  const todayCost = dom.window.document.querySelector('.usage-breakdown tr:nth-child(2) td:last-child')!.textContent;
+  expect(dom.window.document.querySelector('.usage-bars-scale')!.textContent).toBe(todayCost);
+  expect(dom.window.document.querySelectorAll('.usage-bar.is-peak')).toHaveLength(1);
+  expect(dom.window.document.querySelectorAll('.usage-bars-axis > span')).toHaveLength(2);
+});
+
+it('prints totals and amounts in the app language and follows a language change', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 8.5e9 }];
+  const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 8.5e9, models, days: [{ date: '2026-09-08', tokens: 8.5e9, models }], projects: [], sessions: 1, limits: [] };
+  Object.assign(dom.window, { api: { getUsage: vi.fn(async () => ({ ok: true, data })), getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
+  const { initUsage, refreshUsage } = await import('../src/renderer/usage.js');
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  initUsage(); await refreshUsage();
+  const processed = () => dom.window.document.querySelector('[data-usage-metric="Processed tokens · est."] strong')!.textContent;
+  const cost = () => dom.window.document.querySelector('#usageTotalCost strong')!.textContent;
+  const compact = (language: string) => new Intl.NumberFormat(language, { notation: 'compact', maximumFractionDigits: 1 }).format(8.5e9);
+  expect(processed()).toBe(compact('en'));
+  const englishCost = cost();
+  setLanguage('de');
+  expect(processed()).toBe(compact('de'));
+  expect(cost()).not.toBe(englishCost);
+  expect(cost()).toMatch(/\$/);
+  setLanguage('en');
+  expect(processed()).toBe(compact('en'));
+});
+
+// German compact notation does not shorten thousands, so an estimated count showed its fraction:
+// "307.373,5" peak daily tokens (2026-10-09). Counts print as whole numbers in every language.
+it('prints estimated token counts as whole numbers where compact notation keeps the thousands', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 307_373.5 }];
+  const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 307_373.5, models, days: [{ date: '2026-10-08', tokens: 307_373.5, models }], projects: [], sessions: 1, limits: [] };
+  Object.assign(dom.window, { api: { getUsage: vi.fn(async () => ({ ok: true, data })), getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
+  const { initUsage, refreshUsage } = await import('../src/renderer/usage.js');
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  initUsage(); await refreshUsage();
+  const peak = () => dom.window.document.querySelector('[data-usage-metric="Peak daily tokens"] strong')!.textContent;
+  setLanguage('de');
+  expect(peak()).toBe('307.374');
+  setLanguage('en');
+  expect(peak()).toBe('307.4K');
+});
+
+// #482: Codex's and Claude Code's usage, read from their own logs on this computer.
+it('shows other apps’ reported limits apart from tokens counted here, and says what is not reported', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  const now = Date.now();
+  const today = new Date(now); const key = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  const providers: ProviderUsage = { enabled: true, readAt: now,
+    codex: { limits: [
+      { id: 'codex', plan: 'plus', reached: null, observedAt: now - 60_000, credits: null, windows: [
+        { windowMinutes: 300, usedPercent: 30, resetsAt: now + 3_600_000 },
+        { windowMinutes: 10080, usedPercent: 65, resetsAt: now - 1000 }
+      ] },
+      { id: 'premium', plan: null, reached: 'workspace_owner_credits_depleted', observedAt: now - 60_000, credits: null, windows: [] }
+    ], days: [{ date: key, input: 2_000_000, cachedInput: 1_500_000, output: 40_000 }] },
+    claude: { days: [{ date: key, models: [{ model: 'claude-opus-5-5', input: 10, cacheWrite: 1000, cacheRead: 3_000_000, output: 5000 }] }] } };
+  const getProviderUsage = vi.fn(async () => ({ ok: true, data: providers }));
+  const data: UsageOverview = { contextTokenCap: 256_000, tokens: 0, models: [], days: [], projects: [], sessions: 0, limits: [], messages: { through: now, days: [] } };
+  Object.assign(dom.window, { api: { getUsage: async () => ({ ok: true, data }), getProviderUsage, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
+  const { initLanguage } = await import('../src/renderer/i18n.js'); initLanguage();
+  const usage = await import('../src/renderer/usage.js'); usage.initUsage();
+  await usage.refreshUsage();
+  const host = dom.window.document.getElementById('otherAppsUsage')!;
+  const text = host.textContent!;
+  expect(text).toContain('Codex · 5-hour limit');
+  expect(text).toContain('70% remaining');
+  // A window that has reset since Codex last reported is not shown as still 35% left.
+  expect(text).toContain('Reset since this reading');
+  expect(text).not.toContain('35% remaining');
+  expect(text).toContain('Limit reached');
+  // Codex's own reason code reads as a sentence in the app's language, not as raw text.
+  expect(text).toContain("The workspace's Codex credits are used up");
+  expect(text).not.toContain('workspace_owner_credits_depleted');
+  expect(text).not.toContain('workspace owner credits depleted');
+  expect(text).toContain('Claude Code');
+  expect(text).toContain('Plan limits not reported');
+  expect(text).toContain('3M');
+  expect(getProviderUsage).toHaveBeenCalledWith(false);
+  (dom.window.document.getElementById('refreshUsage') as HTMLButtonElement).click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(getProviderUsage).toHaveBeenLastCalledWith(true);
+
+  getProviderUsage.mockResolvedValueOnce({ ok: true, data: { enabled: true, readAt: now, codex: null, claude: null } });
+  await usage.refreshUsage();
+  expect(host.textContent).toContain('No Codex logs on this computer');
+  getProviderUsage.mockResolvedValueOnce({ ok: true, data: { enabled: false, readAt: now, codex: null, claude: null } });
+  await usage.refreshUsage();
+  expect(host.textContent).toContain('Off');
+  expect(host.textContent).not.toContain('Codex ·');
+});
+
+it('exports the page as CSV beside Refresh, with the page divisor, and says where it saved', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  let finish!: (reply: unknown) => void;
+  const exportUsage = vi.fn(() => new Promise(resolve => { finish = resolve; }));
+  Object.assign(dom.window, { api: { exportUsage } });
+  const { initUsage } = await import('../src/renderer/usage.js');
+  initUsage();
+  const element = (id: string) => dom.window.document.getElementById(id)!;
+  const button = element('exportUsage') as HTMLButtonElement;
+  expect(button.closest('.settings-section-head')).toBe(element('refreshUsage').closest('.settings-section-head'));
+  expect(button.textContent).toBe('Export CSV');
+  const divisor = element('usageDivisor') as HTMLInputElement;
+  divisor.value = '4'; divisor.dispatchEvent(new dom.window.Event('input'));
+  button.click();
+  // A second click while the dialog is open asks for nothing more.
+  button.click();
+  expect(exportUsage).toHaveBeenCalledTimes(1);
+  expect(exportUsage).toHaveBeenCalledWith(4);
+  expect(button.disabled).toBe(true);
+  finish({ ok: true, data: { saved: true, name: 'chat-on-steroids-usage-2026-10-20.csv' } });
+  await vi.waitFor(() => expect(button.disabled).toBe(false), { timeout: 5000 });
+  expect(dom.window.document.querySelector('.toast')!.textContent).toBe('Saved chat-on-steroids-usage-2026-10-20.csv');
+});
+
+// The IPC reply carries main's error, which names the chosen file's full path (2.1.42 review).
+it('says a failed export could not be saved, without the error that names the file path', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  const exportUsage = vi.fn(async () => ({ ok: false, error: "EBUSY: resource busy or locked, open 'C:\\Users\\you\\Downloads\\usage.csv'" }));
+  Object.assign(dom.window, { api: { exportUsage } });
+  const { initUsage } = await import('../src/renderer/usage.js');
+  initUsage();
+  const button = dom.window.document.getElementById('exportUsage') as HTMLButtonElement;
+  button.click();
+  await vi.waitFor(() => expect(button.disabled).toBe(false), { timeout: 5000 });
+  expect(dom.window.document.querySelector('.toast')!.textContent).toBe('Usage could not be exported.');
+});
+
+it('gives keyboard focus back to Export CSV after the dialog, unless the person moved it', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  let finish!: (reply: unknown) => void;
+  const exportUsage = vi.fn(() => new Promise(resolve => { finish = resolve; }));
+  Object.assign(dom.window, { api: { exportUsage } });
+  const { initUsage } = await import('../src/renderer/usage.js');
+  initUsage();
+  const document = dom.window.document;
+  const button = document.getElementById('exportUsage') as HTMLButtonElement;
+  button.focus();
+  button.click();
+  // Chromium drops focus to the page when the focused button turns disabled; jsdom keeps it there.
+  button.disabled = false; button.blur(); button.disabled = true;
+  expect(document.activeElement).toBe(document.body);
+  finish({ ok: true, data: { saved: false } });
+  await vi.waitFor(() => expect(document.activeElement).toBe(button), { timeout: 5000 });
+
+  button.click();
+  const divisor = document.getElementById('usageDivisor') as HTMLInputElement;
+  divisor.focus();
+  finish({ ok: true, data: { saved: false } });
+  await vi.waitFor(() => expect(button.disabled).toBe(false), { timeout: 5000 });
+  expect(document.activeElement).toBe(divisor);
+});
+
+it('breaks the estimate down by project, naming each from the project list, and follows formula edits', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  const sol = (tokens: number) => ({ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens });
+  const unpriced = { model: 'another-model', reasoningEffort: 'low', assumed: false, tokens: 2e6 };
+  const models = [sol(1.5e6), unpriced];
+  const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 3.5e6, models, days: [{ date: '2026-09-08', tokens: 3.5e6, models }], sessions: 4, limits: [],
+    projects: [{ projectId: null, tokens: 2e6, models: [unpriced] }, { projectId: 'project-a', tokens: 1e6, models: [sol(1e6)] }, { projectId: 'project-gone', tokens: 5e5, models: [sol(5e5)] }] };
+  const getUsage = vi.fn(async () => ({ ok: true, data }));
+  const listProjects = vi.fn(async () => ({ ok: true, data: [{ id: 'project-a', name: 'Website', path: '/home/you/website', createdAt: 1 }, { id: 'project-quiet', name: 'Quiet', path: '/home/you/quiet', createdAt: 1 }] }));
+  Object.assign(dom.window, { api: { getUsage, listProjects, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
+  const { initLanguage, setLanguage } = await import('../src/renderer/i18n.js'); initLanguage();
+  const usage = await import('../src/renderer/usage.js'); usage.initUsage(); await usage.refreshUsage();
+  const rows = () => [...dom.window.document.querySelectorAll('.usage-days-project tr')].map(row => [...row.children].map(cell => cell.textContent));
+  expect(dom.window.document.querySelector('.usage-days-project h3')!.textContent).toBe('By project');
+  // The main process's order, and a chat outside every project as its own row. A project removed
+  // from the sidebar keeps its record and name; only an id missing from the list is unknown.
+  expect(rows()).toEqual([
+    ['Project', 'Estimated tokens', 'Estimated equivalent'],
+    ['No project', (2e6).toLocaleString('en'), 'Rate unknown'],
+    ['Website', (1e6).toLocaleString('en'), usd(0.48)],
+    ['Unknown project', (5e5).toLocaleString('en'), usd(0.24)]
+  ]);
+  const divisor = dom.window.document.getElementById('usageDivisor') as HTMLInputElement;
+  divisor.value = '4'; divisor.dispatchEvent(new dom.window.Event('input'));
+  expect(rows()[2]).toEqual(['Website', (5e5).toLocaleString('en'), usd(0.24)]);
+  setLanguage('de');
+  expect(rows()[1]![0]).toBe('Kein Projekt');
+  setLanguage('en');
+  expect(getUsage).toHaveBeenCalledTimes(1);
+  // An unreadable project list keeps the names already shown, and the page still loads.
+  listProjects.mockRejectedValueOnce(new Error('IPC disconnected'));
+  await usage.refreshUsage(); await new Promise(resolve => setTimeout(resolve));
+  expect(rows().slice(1).map(row => row[0])).toEqual(['No project', 'Website', 'Unknown project']);
+  expect(dom.window.document.getElementById('usageStatus')!.textContent).toBe('');
+  // Someone who never uses projects gets no table holding one "No project" row.
+  data.projects = [{ projectId: null, tokens: 3.5e6, models }];
+  await usage.refreshUsage();
+  expect(dom.window.document.querySelector('.usage-days-project')).toBeNull();
+});
+
+it('shows usage while the project list is still loading, then names the By project rows', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 1e6 }];
+  const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 1e6, models, days: [{ date: '2026-09-08', tokens: 1e6, models }], sessions: 1, limits: [],
+    projects: [{ projectId: 'project-a', tokens: 1e6, models }] };
+  let answer!: (reply: unknown) => void;
+  const listProjects = vi.fn(() => new Promise(resolve => { answer = resolve; }));
+  Object.assign(dom.window, { api: { getUsage: async () => ({ ok: true, data }), listProjects, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
+  const usage = await import('../src/renderer/usage.js'); usage.initUsage();
+  // A project list that never answers must not hold the Usage page in its loading state.
+  await usage.refreshUsage();
+  const document = dom.window.document;
+  expect(document.getElementById('usageStatus')!.textContent).toBe('');
+  expect(document.querySelector('[data-usage-metric="Conversations"] strong')!.textContent).toBe('1');
+  expect(document.querySelector('.usage-days-project td')!.textContent).toBe('Unknown project');
+  // Someone is already reading the Daily breakdown: names that arrive must not close it or take the focus.
+  const breakdown = document.querySelector('.usage-breakdown') as HTMLDetailsElement;
+  const summary = breakdown.querySelector('summary') as HTMLElement;
+  breakdown.open = true; summary.focus();
+  expect(document.activeElement).toBe(summary);
+  answer({ ok: true, data: [{ id: 'project-a', name: 'Website', path: '/home/you/website', createdAt: 1 }] });
+  await vi.waitFor(() => expect(document.querySelector('.usage-days-project td')!.textContent).toBe('Website'), { timeout: 5000 });
+  expect(document.querySelector('.usage-breakdown')).toBe(breakdown);
+  expect(breakdown.open).toBe(true);
+  expect(document.activeElement).toBe(summary);
 });

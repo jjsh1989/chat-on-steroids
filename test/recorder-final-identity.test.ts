@@ -3,11 +3,44 @@ import { promises as fs } from 'node:fs';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { closeConversation, liveConversations, recordChatObservations, recordToolCall, resetRecorderForTests } from '../src/main/session/recorder.js';
 import { emptyEvidence, trackInFlight } from '../src/main/mcp/call-context.js';
-import { appendEvent, flushSessions, getSession, initSessionStore, readEvents, readCompletedFinal, upsertMessageEvent, rebindSession, resetSessionStoreForTests } from '../src/main/session/store.js';
+import { appendEvent, flushSessions, getSession, initSessionStore, readEvents, readCompletedFinal, turnEndedDurably, upsertMessageEvent, rebindSession, resetSessionStoreForTests } from '../src/main/session/store.js';
 import { sessionInputPolicy } from '../src/main/session/input.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let directory: string;
+
+it.each(['same', 'new-question', 'new-turn'] as const)('accepts a later native Stop only for its still-current source (%s)', async change => {
+  const conversationId = `native-stop-upgrade-${change}`;
+  const opened = await recordChatObservations(conversationId, [
+    { kind: 'user_message', messageId: 'stop-question', text: 'Work', time: 10 },
+    { kind: 'turn_start', turnId: 'stop-source', time: 11 },
+    { kind: 'turn_end', turnId: 'stop-source', outcome: 'interrupted', time: 12 }
+  ]);
+  if (change === 'new-question') await recordChatObservations(conversationId, [{ kind: 'user_message', messageId: 'new-question', text: 'Next', time: 13 }]);
+  if (change === 'new-turn') await recordChatObservations(conversationId, [{ kind: 'turn_start', turnId: 'new-turn', time: 13 }]);
+  await flushSessions(); resetRecorderForTests(); resetSessionStoreForTests();
+  const stop = { kind: 'turn_end' as const, turnId: 'stop-source', outcome: 'stopped' as const, time: 14 };
+  const accepted = await recordChatObservations(conversationId, [stop]);
+  expect(accepted.activity.terminal).toBe(change === 'same');
+  await recordChatObservations(conversationId, [stop]);
+  const ends = await readEvents(opened.sessionId!, { kinds: ['turn_end'] });
+  expect(ends.filter(event => event.kind === 'turn_end' && event.outcome === 'stopped')).toHaveLength(change === 'same' ? 1 : 0);
+  if (change === 'new-turn') expect((await getSession(opened.sessionId!))?.activeTurnId).toBe('new-turn');
+});
+
+it('finds the latest real work behind a later revision of an old native label', async () => {
+  const { readRecentEvents } = await import('../src/main/session/store.js');
+  const { workSequence } = await import('../src/shared/session.js');
+  const opened = await recordChatObservations('native-label-work-order', [
+    { kind: 'turn_start', turnId: 'work-order', time: 10 },
+    { kind: 'page_tool', messageId: 'old-step', turnId: 'work-order', text: 'Preparing', time: 11 },
+    { kind: 'page_tool', messageId: 'new-step', turnId: 'work-order', text: 'Searching', time: 12 }
+  ]);
+  const [before] = await readRecentEvents(opened.sessionId!, 1, { kinds: ['page_tool', 'turn_start'] });
+  await recordChatObservations('native-label-work-order', [{ kind: 'page_tool', messageId: 'old-step', turnId: 'work-order', text: 'Prepared', time: 13 }]);
+  const [after] = await readRecentEvents(opened.sessionId!, 1, { kinds: ['page_tool', 'turn_start'] });
+  expect(workSequence(after!)).toBe(workSequence(before!));
+});
 it('records an empty native image message and keeps its stable origin on replay', async () => {
   const image = { kind: 'user_message' as const, messageId: 'image-only-user', time: 100, text: '',
     attachments: [{ id: 'native-file', name: 'example.png', size: 123, mimeType: 'image/png' }] };
@@ -79,7 +112,7 @@ it.each(['missing', 'replaced', 'matching', 'restart'])('closes the canonical re
   expect(await readEvents(sessionId, { kinds: ['turn_end'] })).toHaveLength(1);
 });
 
-it.each(['missing', 'current-page-id'])('never closes newer work from an old canonical answer with %s identity', async mode => {
+it.each(['missing', 'current-page-id', 'original-page-id'])('never closes newer work from an old canonical answer with %s identity', async mode => {
   const conversationId = `historical-final-${mode}`;
   const opened = await recordChatObservations(conversationId, [
     { kind: 'turn_start', time: 10, turnId: 'old-turn' },
@@ -88,11 +121,12 @@ it.each(['missing', 'current-page-id'])('never closes newer work from an old can
     { kind: 'turn_start', time: 20, turnId: 'new-turn' }
   ]);
   const result = await recordChatObservations(conversationId, [{
-    kind: 'assistant_message', time: 30, messageId: 'old-answer', text: 'Old result', state: 'final', final: true,
-    ...(mode === 'current-page-id' ? { turnId: 'new-turn' } : {})
+    kind: 'assistant_message', time: 30, messageId: 'old-answer', text: 'Old result, revised', state: 'final', final: true,
+    activeNow: true, renderedHtml: '<p>Old result, revised</p>',
+    ...(mode === 'current-page-id' ? { turnId: 'new-turn' } : mode === 'original-page-id' ? { turnId: 'old-turn' } : {})
   }]);
   expect((await getSession(opened.sessionId!))?.activeTurnId).toBe('new-turn');
-  expect(result.activity.terminal).toBe(false);
+  expect(result.activity).toMatchObject({ meaningful: false, working: false, terminal: false });
   expect(await readEvents(opened.sessionId!, { kinds: ['turn_end'] })).toHaveLength(1);
 });
 
@@ -132,16 +166,34 @@ it.each(['canonical', 'explicit'])('keeps a turn reopened for late tools open un
   expect((await getSession(opened.sessionId!))?.activeTurnId).toBeNull();
 });
 
+it('treats a reopened exact response as nonterminal until its fresh end', async () => {
+  const conversationId = 'durable-ended-response-reopen';
+  const opened = await recordChatObservations(conversationId, [
+    { kind: 'turn_start', time: 10, turnId: 'turn' },
+    { kind: 'turn_end', time: 12, turnId: 'turn', outcome: 'completed' }
+  ]);
+  expect(await turnEndedDurably(opened.sessionId!, conversationId, 'turn')).toBe(true);
+
+  await appendEvent(opened.sessionId!, {
+    kind: 'turn_start', source: 'app', time: 20, turnId: 'turn', detail: 'Late exact work reopened this response'
+  });
+  expect(await turnEndedDurably(opened.sessionId!, conversationId, 'turn')).toBe(false);
+
+  await appendEvent(opened.sessionId!, { kind: 'turn_end', source: 'app', time: 30, turnId: 'turn', outcome: 'completed' });
+  expect(await turnEndedDurably(opened.sessionId!, conversationId, 'turn')).toBe(true);
+});
+
 it('does not close the old turn after a newer user message arrives in the recovery batch', async () => {
   const conversationId = 'new-user-during-final-recovery';
   const opened = await recordChatObservations(conversationId, [
     { kind: 'turn_start', time: 10, turnId: 'turn' },
     { kind: 'assistant_message', time: 11, turnId: 'turn', messageId: 'answer', text: 'Partial', state: 'streaming' }
   ]);
-  await recordChatObservations(conversationId, [
-    { kind: 'assistant_message', time: 20, messageId: 'answer', text: 'Final answer', state: 'final', final: true },
+  const revised = await recordChatObservations(conversationId, [
+    { kind: 'assistant_message', time: 20, messageId: 'answer', text: 'Final answer', state: 'final', final: true, activeNow: true },
     { kind: 'user_message', time: 21, messageId: 'next-user', text: 'New work', authoredNow: true }
   ]);
+  expect(revised.activity).toMatchObject({ working: true, terminal: false });
   expect((await getSession(opened.sessionId!))?.activeTurnId).toBe('turn');
   expect(await readEvents(opened.sessionId!, { kinds: ['turn_end'] })).toHaveLength(0);
 });
@@ -251,14 +303,32 @@ it('does not close an old turn when its revised final follows a newer user messa
     { kind: 'turn_start', time: 10, turnId: 'turn' },
     { kind: 'assistant_message', time: 11, turnId: 'turn', messageId: 'answer', text: 'Partial', state: 'streaming' }
   ]);
-  await recordChatObservations(conversationId, [
+  const revised = await recordChatObservations(conversationId, [
     { kind: 'user_message', time: 21, messageId: 'next-user', text: 'New work', authoredNow: true },
-    { kind: 'assistant_message', time: 20, messageId: 'answer', text: 'Final answer', state: 'final', final: true }
+    { kind: 'assistant_message', time: 20, messageId: 'answer', text: 'Final answer', state: 'final', final: true, activeNow: true }
   ]);
+  expect(revised.activity).toMatchObject({ working: true, terminal: false });
   expect((await getSession(opened.sessionId!))?.activeTurnId).toBe('turn');
   expect(await readEvents(opened.sessionId!, { kinds: ['turn_end'] })).toHaveLength(0);
 });
 
+
+it.each([false, true])('accepts a textless native final only with exact provider identity (%s)', async native => {
+  const conversationId = `image-final-${native}`;
+  const result = await recordChatObservations(conversationId, [
+    { kind: 'user_message', time: 10, messageId: 'image-question', text: 'Generate two images' },
+    { kind: 'turn_start', time: 11, turnId: 'image-turn' },
+    { kind: 'assistant_message', time: 20, messageId: 'image-final', turnId: 'image-turn', text: '',
+      ...(native ? { providerMessageId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' } : {}), state: 'final', final: true, goalEligible: true },
+    { kind: 'turn_end', time: 21, turnId: 'image-turn', outcome: 'completed' }
+  ]);
+  expect(!!await readCompletedFinal(result.sessionId!, conversationId)).toBe(native);
+  await flushSessions(); resetRecorderForTests(); resetSessionStoreForTests();
+  expect(!!await readCompletedFinal(result.sessionId!, conversationId)).toBe(native);
+  await recordChatObservations(conversationId, [{ kind: 'user_message', time: 30,
+    messageId: 'new-image-question', text: 'Generate another image', authoredNow: true }]);
+  expect(await readCompletedFinal(result.sessionId!, conversationId)).toBeNull();
+});
 
 it('uses an unowned canonical final as a settled ordinary input boundary without inventing a turn', async () => {
   const conversationId = 'unowned-final-current-question';

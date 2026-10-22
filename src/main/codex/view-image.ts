@@ -23,21 +23,13 @@
 
 import sharp from 'sharp';
 
-import { getMetadata, readFile } from './filesystem.js';
+import { localFs, type ProjectFs } from '../remote/project-fs.js';
 import { imageMime, validateImageStructure, formatBytes, MAX_IMAGE_BYTES, type SupportedImageMime } from '../fsops.js';
-
-export const VIEW_IMAGE_TOOL_NAME = 'view_image';
 
 export const VIEW_IMAGE_DESCRIPTION =
   'View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.';
 
 export const VIEW_IMAGE_PATH_DESCRIPTION = 'Local filesystem path to an image file.';
-
-export const VIEW_IMAGE_DETAIL_DESCRIPTION =
-  'Image detail level. Defaults to `high`; use `original` to preserve exact resolution.';
-
-export const VIEW_IMAGE_UNSUPPORTED_MESSAGE =
-  'view_image is not allowed because you do not support image inputs';
 
 export const VIEW_IMAGE_INVALID_MESSAGE = 'unable to process image: invalid or unsupported image data';
 
@@ -87,19 +79,6 @@ export interface ViewImageOptions {
 export const DEFAULT_VIEW_IMAGE_OPTIONS: ViewImageOptions = {
   canRequestOriginalImageDetail: false
 };
-
-/**
- * The handler's detail parsing. Codex keeps accepting `high` and `original` after they disappear
- * from the advertised schema, and rejects anything else.
- */
-export function parseViewImageDetail(detail: string | undefined | null): ImageDetail | null {
-  if (detail === undefined || detail === null) return null;
-  if (detail === 'high') return 'high';
-  if (detail === 'original') return 'original';
-  throw new ViewImageError(
-    `view_image.detail only supports \`high\` or \`original\`; omit \`detail\` for default high resized behavior, got \`${detail}\``
-  );
-}
 
 /** `data_url_from_bytes`. */
 export function dataUrlFromBytes(mime: string, base64: string): string {
@@ -157,11 +136,12 @@ export async function viewImage(
   detail: ImageDetail | null,
   options: ViewImageOptions = DEFAULT_VIEW_IMAGE_OPTIONS,
   modelVisiblePath: string = path,
-  maxBytes: number = MAX_VIEW_IMAGE_BYTES
+  maxBytes: number = MAX_VIEW_IMAGE_BYTES,
+  fs: ProjectFs = localFs
 ): Promise<ViewImageResult> {
   let metadata;
   try {
-    metadata = await getMetadata(path);
+    metadata = await fs.getMetadata(path);
   } catch (error) {
     throw new ViewImageError(`unable to locate image at \`${modelVisiblePath}\`: ${describe(error, path, modelVisiblePath)}`);
   }
@@ -182,7 +162,7 @@ export async function viewImage(
     // Enforce the image transport ceiling on the opened file handle too. The metadata check above
     // gives the useful error before opening in the common case, while this closes the growth race
     // between stat and read without ever allocating up to the generic 512 MiB file-read limit.
-    fileBytes = await readFile(path, effectiveMaxBytes);
+    fileBytes = await fs.readFile(path, effectiveMaxBytes);
   } catch (error) {
     throw new ViewImageError(`unable to read image at \`${modelVisiblePath}\`: ${describe(error, path, modelVisiblePath)}`);
   }

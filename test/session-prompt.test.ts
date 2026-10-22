@@ -10,6 +10,38 @@ import { MAX_CHATGPT_MESSAGE_CHARS, prependUserPrompt, userPromptText } from '..
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let directory: string;
+/**
+ * The frame as ChatGPT's composer hands it back.
+ *
+ * The editor treats what it is given as Markdown source and escapes it on readback — a
+ * backslash before ASCII punctuation, and one before a newline for a hard line break. The frame
+ * is punctuation and newlines almost entirely, so an escaped readback matched none of it, and
+ * the declared instruction length stopped matching too because escaping adds characters.
+ *
+ * Reported as #374 with a screenshot of both halves of the consequence: the app showed the
+ * internal instructions as a message of their own, ending in `[[/COS_CONTEXT]]\\`, beside the
+ * authored prompt — and the page kept the whole frame visible, so ChatGPT titled the
+ * conversation `[[COS_CONTEXT:19518]]You are a coding...`.
+ */
+it('reads a frame the page escaped, and keeps an authored backslash literal', () => {
+  const instructions = 'You are a coding agent.\nKeep task work there.';
+  const framed = prependUserPrompt('write me a plugin\n\nsecond line', instructions);
+  expect(userPromptText(framed)).toBe('write me a plugin\n\nsecond line');
+
+  // Exactly what the composer does: every ASCII punctuation mark and every newline.
+  const escaped = framed.replace(/([!-/:-@[-`{-~])/g, '\\$1').replace(/\n/g, '\\\n');
+  expect(escaped).toContain('\\[\\[COS\\_CONTEXT\\:');
+  expect(userPromptText(escaped)).toBe('write me a plugin\n\nsecond line');
+
+  // The tolerant read is a second attempt, never the first: a prompt that really contains a
+  // backslash keeps it, because the exact frame around it parses.
+  const literal = prependUserPrompt('use \\[ in the regex', instructions);
+  expect(userPromptText(literal)).toBe('use \\[ in the regex');
+
+  // And text that is not a frame at all stays unrecognised, escaped or not.
+  expect(userPromptText('\\[\\[COS\\_CONTEXT\\:9\\]\\]\\\nnot a frame')).toBeNull();
+});
+
 it('reduces AGENTS to 5000 before shortening every selected skill under char and byte limits', () => {
   const agents = { directory: '/work', text: 'A'.repeat(30_000), truncated: false };
   const skills = [{ id: 'first', text: 'FIRST\n' + '🐱漢字'.repeat(20_000) }, { id: 'second', text: 'SECOND\n' + 'z'.repeat(60_000) }];
@@ -120,6 +152,29 @@ it('uses durable session ownership through resume and worker inheritance, never 
   expect(await prepareSessionPrompt('Worker', { sessionId: worker.id })).toContain('PROJECT_ONE_ONLY');
   const unfiled = await createSession({ title: 'Unfiled' });
   expect(await prepareSessionPrompt('Ordinary chat', { sessionId: unfiled.id, projectId: two.id })).not.toContain('PROJECT_TWO_ONLY');
+});
+
+it('uses the allocated worker checkout as the only working directory while retaining source project AGENTS.md', async () => {
+  const sourcePath = path.join(directory, 'source');
+  await fs.mkdir(sourcePath);
+  const project = await addProject(sourcePath);
+  await fs.writeFile(path.join(sourcePath, 'AGENTS.md'), 'SOURCE_PROJECT_INSTRUCTIONS_ONLY');
+  const prime = await createSession({ title: 'Prime', conversationId: 'prime-chat' });
+  await assignSessionProject(prime.id, project.id);
+  const checkout = '/work/.chat-on-steroids-worktrees/owned/tree';
+
+  const managed = await prepareSessionPrompt('Only edit the checkout', { sessionId: prime.id, workingDirectory: checkout });
+  expect(managed).toContain(`Worker working directory (allocated Git worktree): ${checkout}`);
+  expect(managed).toContain('SOURCE_PROJECT_INSTRUCTIONS_ONLY');
+  expect(managed).toContain('# Source project AGENTS.md instructions (reference only; not a working directory)');
+  expect(managed).not.toContain(`Selected project directory:`);
+  expect(managed).not.toContain(`AGENTS.md instructions for /work/source`);
+  expect(managed).not.toContain(`Use this directory as your default working directory and keep task work there`);
+  expect(userPromptText(managed)).toBe('Only edit the checkout');
+
+  const ordinary = await prepareSessionPrompt('Original project remains valid', { sessionId: prime.id });
+  expect(ordinary).toContain('Selected project directory: /work/source');
+  expect(ordinary).not.toContain('Worker working directory');
 });
 
 it('bounds a large file and refuses invalid file types and revoked access without injecting their contents', async () => {

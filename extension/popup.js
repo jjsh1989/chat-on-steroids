@@ -10,14 +10,19 @@
  */
 
 const $ = (id) => document.getElementById(id);
+const { t, tn, localizeDocument } = globalThis.CLF_I18N;
 const RENDER_STREAM_KEY = 'renderStreamEnabled';
 const SHOW_TIMES_KEY = 'showStreamTimes';
 const POLL_MS = 1500;
+
+localizeDocument();
 
 let overwriteEnabled = true;
 let showTimes = false;
 let latest = { status: null, tab: null };
 let openedOnFailure = false;
+let transferringSignIn = false;
+let transferredSignIn = false;
 
 // ------------------------------------------------------------------ formatting
 
@@ -31,9 +36,9 @@ function shorten(value, keep = 6) {
 function ago(at) {
   if (!at) return '';
   const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-  return `${Math.round(seconds / 3600)}h`;
+  if (seconds < 60) return t('popup_time_seconds_short', '$1s', seconds);
+  if (seconds < 3600) return t('popup_time_minutes_short', '$1m', Math.round(seconds / 60));
+  return t('popup_time_hours_short', '$1h', Math.round(seconds / 3600));
 }
 
 /** One capture row: ok, no, wait or off, plus whatever it wants to say on the right. */
@@ -59,12 +64,12 @@ function stage(name, state, meta) {
 
 /** How the app describes what it placed a call on, in its own words. */
 const ATTRIBUTION = {
-  request_id: 'exact request id',
-  unattributed: 'request id not resolved',
-  agent: 'agent key',
-  turn: 'tool block on the page',
-  generation: 'the only chat generating',
-  inferred: 'not placed in a chat'
+  request_id: t('popup_attribution_exact_request_id', 'exact request id'),
+  unattributed: t('popup_attribution_request_id_not_resolved', 'request id not resolved'),
+  agent: t('popup_attribution_agent_key', 'agent key'),
+  turn: t('popup_attribution_tool_block_on_page', 'tool block on the page'),
+  generation: t('popup_attribution_only_chat_generating', 'the only chat generating'),
+  inferred: t('popup_attribution_not_placed_in_chat', 'not placed in a chat')
 };
 
 /**
@@ -83,27 +88,27 @@ function pipeline(info, ready) {
 
   if (!info || !info.isChat) return { read: ['off'], sent: ['off'], proc: ['off'], why: ['', ''] };
   if (!info.recorder) {
-    return { read: ['failed'], sent: ['off'], proc: ['off'], why: ['bad', 'No recorder in this tab. Reload the page.'] };
+    return { read: ['failed'], sent: ['off'], proc: ['off'], why: ['bad', t('popup_pipeline_no_recorder', 'No recorder in this tab. Reload the page.')] };
   }
   if (read === 0) {
-    return { read: ['running'], sent: ['off'], proc: ['off'], why: ['', 'Waiting for the first message.'] };
+    return { read: ['running'], sent: ['off'], proc: ['off'], why: ['', t('popup_pipeline_waiting_first_message', 'Waiting for the first message.')] };
   }
 
   const readStage = calls.length ? ['done', String(calls.length)] : ['running'];
   if (!ready) {
     return {
       read: readStage,
-      sent: ['failed', pending ? `${pending} held` : ''],
+      sent: ['failed', pending ? tn('popup_count_held', pending, '$1 held', '$1 held') : ''],
       proc: ['off'],
-      why: ['bad', 'Delivery is blocked until the app is connected and protocol compatibility is confirmed.']
+      why: ['bad', t('popup_pipeline_delivery_blocked', 'Delivery is blocked until the app is connected and protocol compatibility is confirmed.')]
     };
   }
   if (sent && sent.ok === false) {
     return {
       read: readStage,
-      sent: ['failed', String(sent.error || 'failed')],
+      sent: ['failed', String(sent.error || t('popup_status_failed', 'failed'))],
       proc: ['off'],
-      why: ['bad', `The app rejected the last delivery (${sent.error || 'failed'}).`]
+      why: ['bad', t('popup_pipeline_delivery_rejected', 'The app rejected the last delivery ($1).', sent.error || t('popup_status_failed', 'failed'))]
     };
   }
   // Refused by the extension itself, before anything could be queued for the app. `pending`
@@ -114,22 +119,24 @@ function pipeline(info, ready) {
   if (page.blocked) {
     return {
       read: readStage,
-      sent: ['failed', page.queued ? `${page.queued} held in page` : String(page.blocked)],
+      sent: ['failed', page.queued ? tn('popup_count_held_in_page', page.queued, '$1 held in page', '$1 held in page') : String(page.blocked)],
       proc: ['off'],
       why: [
         'bad',
-        'The extension is not accepting this tab’s observations (' +
-          String(page.blocked) +
-          '). Reload the ChatGPT tab.'
+        t(
+          'popup_pipeline_extension_blocked',
+          'The extension is not accepting this tab’s observations ($1). Reload the ChatGPT tab.',
+          page.blocked
+        )
       ]
     };
   }
   if (pending > 0) {
     return {
       read: readStage,
-      sent: ['running', `${pending} queued`],
+      sent: ['running', t('popup_count_queued', '$1 queued', pending)],
       proc: ['off'],
-      why: ['', 'Queued here. Retrying delivery to the app.']
+      why: ['', t('popup_pipeline_queued_retrying', 'Queued here. Retrying delivery to the app.')]
     };
   }
 
@@ -140,12 +147,12 @@ function pipeline(info, ready) {
       proc: ['running'],
       // The worker's delivery counters cover every tab. Only the page's session
       // receipt proves that this particular chat reached the app.
-      why: ['', 'App reachable. Waiting for this chat’s session receipt.']
+      why: ['', t('popup_pipeline_waiting_session_receipt', 'App reachable. Waiting for this chat’s session receipt.')]
     };
   }
   if (!calls.length) return {
     read: ['running'], sent: ['off'], proc: ['off'],
-    why: ['', 'Chat recorded. Waiting for a request ID from the latest turn.']
+    why: ['', t('popup_pipeline_waiting_latest_request_id', 'Chat recorded. Waiting for a request ID from the latest turn.')]
   };
   const received = calls.filter(call => call.sent || call.app === 'request_id').length;
   const confirmed = calls.filter(call => call.confirmed || call.app === 'request_id').length;
@@ -159,7 +166,19 @@ function pipeline(info, ready) {
       proc: ['failed', `${placed}/${calls.length}`],
       why: [
         'bad',
-        `The app could not place ${missed.length === 1 ? 'a call' : `${missed.length} calls`} by request id — it fell back to ${ATTRIBUTION[missed[0].app] || missed[0].app}.`
+        missed.length === 1
+          ? t(
+            'popup_pipeline_call_fallback_one',
+            'The app could not place a call by request id — it fell back to $1.',
+            ATTRIBUTION[missed[0].app] || missed[0].app
+          )
+          : tn(
+            'popup_pipeline_call_fallback_many',
+            missed.length,
+            'The app could not place $1 call by request id — it fell back to $2.',
+            'The app could not place $1 calls by request id — it fell back to $2.',
+            [missed.length, ATTRIBUTION[missed[0].app] || missed[0].app]
+          )
       ]
     };
   }
@@ -167,10 +186,13 @@ function pipeline(info, ready) {
     read: ['done', String(calls.length)],
     sent: sentStage,
     proc: [confirmed === calls.length ? 'done' : 'running', `${confirmed}/${calls.length}`],
-    why: ['', placed > 0 ? `${placed} request ID${placed === 1 ? '' : 's'} matched to recorded tool activity.`
-      : confirmed > 0 ? 'Request owner confirmed. No matching tool activity recorded yet.'
-        : received > 0 ? 'App received the ID. Waiting for owner confirmation.'
-          : 'ID found in the latest turn. Waiting for the app to confirm receipt.']
+    why: ['', placed > 0
+      ? placed === 1
+        ? t('popup_pipeline_request_id_matched_one', '1 request ID matched to recorded tool activity.')
+        : tn('popup_pipeline_request_id_matched_many', placed, '$1 request ID matched to recorded tool activity.', '$1 request IDs matched to recorded tool activity.')
+      : confirmed > 0 ? t('popup_pipeline_owner_confirmed_no_activity', 'Request owner confirmed. No matching tool activity recorded yet.')
+        : received > 0 ? t('popup_pipeline_received_waiting_owner', 'App received the ID. Waiting for owner confirmation.')
+          : t('popup_pipeline_id_found_waiting_receipt', 'ID found in the latest turn. Waiting for the app to confirm receipt.')]
   };
 }
 
@@ -195,11 +217,21 @@ function paintCalls(page) {
     }
     const tool = document.createElement('span');
     tool.className = 'tool';
-    tool.textContent = entry.tool || 'request ID';
+    tool.textContent = entry.tool || t('popup_request_id', 'request ID');
     const id = document.createElement('span');
     id.className = 'id';
     id.textContent = shorten(entry.requestId, 5);
-    line.title = `${entry.requestId} — found ${entry.read ? 'yes' : 'no'} · app receipt ${entry.sent || entry.app === 'request_id' ? 'confirmed' : 'pending'} · owner ${entry.confirmed ? 'confirmed' : 'pending'} · tool activity ${ATTRIBUTION[entry.app] || 'no record'}`;
+    line.title = t(
+      'popup_call_details',
+      '$1 — found $2 · app receipt $3 · owner $4 · tool activity $5',
+      [
+        entry.requestId,
+        entry.read ? t('popup_yes', 'yes') : t('popup_no', 'no'),
+        entry.sent || entry.app === 'request_id' ? t('popup_confirmed', 'confirmed') : t('popup_pending', 'pending'),
+        entry.confirmed ? t('popup_confirmed', 'confirmed') : t('popup_pending', 'pending'),
+        ATTRIBUTION[entry.app] || t('popup_no_record', 'no record')
+      ]
+    );
     line.append(pips, tool, id);
     box.append(line);
   }
@@ -219,19 +251,20 @@ function paintHeader(status) {
 
   $('pill').className = `pill ${ready ? '' : incompatible ? 'bad' : 'off'}`;
   $('state').textContent = incompatible
-    ? 'Version mismatch'
+    ? t('popup_state_version_mismatch', 'Version mismatch')
     : off
-      ? 'Disconnected'
+      ? t('popup_state_disconnected', 'Disconnected')
       : !connected
-        ? 'App not reachable'
+        ? t('popup_state_app_not_reachable', 'App not reachable')
         : ready
           // Health + pairing prove reachability, not the recorder/command flow.
-          ? `App reachable · Port ${status.port}`
-          : `Port ${status.port} · connecting`;
+          ? t('popup_state_app_reachable_port', 'App reachable · Port $1', status.port)
+          : t('popup_state_port_connecting', 'Port $1 · connecting', status.port);
 
+  // The one state with nothing to click at the top: say what to do instead of a grey pill alone.
+  $('appHint').hidden = !(status && !connected && !off);
   $('retryBtn').hidden = ready || incompatible;
-  $('retryBtn').textContent = off ? 'Connect' : 'Try again';
-  $('unpairBtn').hidden = !paired || incompatible;
+  $('retryBtn').textContent = off ? t('popup_connect', 'Connect') : t('popup_try_again', 'Try again');
   return ready;
 }
 
@@ -241,11 +274,15 @@ function paintAlert(status, info) {
   const pairError = status && status.pairError;
   const error = page && page.lastError;
   const text = incompatible
-    ? `App v${status.appVersion || '?'} (protocol ${status.appProtocol ?? '?'}); companion v${status.extensionVersion || '?'} (protocol ${status.extensionProtocol ?? '?'}). Open your browser's Extensions page, enable Developer mode, then Update / Reload this companion. If the mismatch remains, use Open extension folder in Chat On Steroids and load that folder. Reload ChatGPT tabs when their active work is finished.`
+    ? t(
+      'popup_version_mismatch_help',
+      "App v$1 (protocol $2); extension v$3 (protocol $4). Open your browser's Extensions page, enable Developer mode, then Update / Reload this extension. If the mismatch remains, use Open extension folder in Chat On Steroids and load that folder. Reload ChatGPT tabs when their active work is finished.",
+      [status.appVersion || '?', status.appProtocol ?? '?', status.extensionVersion || '?', status.extensionProtocol ?? '?']
+    )
     : pairError && pairError.message
       ? pairError.message
       : pairError && pairError.error === 'secure_storage_unavailable'
-        ? 'Secure credential storage is unavailable. Open Chat On Steroids for setup instructions.'
+        ? t('popup_secure_storage_unavailable', 'Secure credential storage is unavailable. Open Chat On Steroids for setup instructions.')
     : error && Date.now() - error.at < 10 * 60 * 1000
       ? error.text
       : '';
@@ -276,39 +313,76 @@ function paintDetails(status, info) {
   const page = info && info.page;
   const sent = info && info.delivery;
 
-  detail(grid, 'app', status ? `v${status.appVersion || '?'} · port ${status.port || '—'}` : null);
   detail(
     grid,
-    'extension',
-    status ? `v${status.extensionVersion} · protocol ${status.extensionProtocol}` : null,
+    t('popup_detail_app', 'app'),
+    status ? t('popup_detail_app_value', 'v$1 · port $2', [status.appVersion || '?', status.port || '—']) : null
+  );
+  detail(
+    grid,
+    t('popup_detail_extension', 'extension'),
+    status ? t('popup_detail_extension_value', 'v$1 · protocol $2', [status.extensionVersion, status.extensionProtocol]) : null,
     status && status.compatible === false
   );
-  detail(grid, 'chat id', (info && info.conversationId) || null);
-  detail(grid, 'app session', (page && page.session) || null, Boolean(page && !page.session));
-  detail(grid, 'tab', info ? `${info.tab} · epoch ${info.epoch ?? '—'}` : null);
+  detail(grid, t('popup_detail_chat_id', 'chat id'), (info && info.conversationId) || null);
+  detail(grid, t('popup_detail_app_session', 'app session'), (page && page.session) || null, Boolean(page && !page.session));
   detail(
     grid,
-    'ownership',
-    info ? (info.terminal ? 'retired' : info.bound ? 'bound' : 'unbound') : null,
+    t('popup_detail_tab', 'tab'),
+    info ? t('popup_detail_tab_value', '$1 · epoch $2', [info.tab, info.epoch ?? '—']) : null
+  );
+  detail(
+    grid,
+    t('popup_detail_ownership', 'ownership'),
+    info ? (info.terminal
+      ? t('popup_status_retired', 'retired')
+      : info.bound
+        ? t('popup_status_bound', 'bound')
+        : t('popup_status_unbound', 'unbound')) : null,
     Boolean(info && info.terminal)
   );
-  detail(grid, 'recorder', page ? `fiber v${page.recorderVersion} · run ${page.runId}` : 'not attached', !page);
-  detail(grid, 'turn', page ? (page.generating ? `${shorten(page.turnId, 8)} · live` : 'idle') : null);
-  detail(grid, 'observed', page ? `${page.events} events · ${page.calls} calls` : null);
   detail(
     grid,
-    'in this browser',
-    info ? `${info.pending} held · ${info.pendingAll} total` : null,
+    t('popup_detail_recorder', 'recorder'),
+    page
+      ? t('popup_detail_recorder_value', 'fiber v$1 · run $2', [page.recorderVersion, page.runId])
+      : t('popup_status_not_attached', 'not attached'),
+    !page
+  );
+  detail(
+    grid,
+    t('popup_detail_turn', 'turn'),
+    page ? (page.generating
+      ? t('popup_detail_turn_live', '$1 · live', shorten(page.turnId, 8))
+      : t('popup_status_idle', 'idle')) : null
+  );
+  detail(
+    grid,
+    t('popup_detail_observed', 'observed'),
+    page ? `${tn('popup_detail_events', page.events, '$1 event', '$1 events')} · ${tn('popup_detail_calls', page.calls, '$1 call', '$1 calls')}` : null
+  );
+  detail(
+    grid,
+    t('popup_detail_in_this_browser', 'in this browser'),
+    info ? `${tn('popup_count_held', info.pending, '$1 held', '$1 held')} · ${t('popup_detail_total', '$1 total', info.pendingAll)}` : null,
     Boolean(info && info.pendingAll)
   );
+  const deliveryState = sent ? (sent.ok ? t('popup_status_ok', 'ok') : sent.error || t('popup_status_failed', 'failed')) : '';
   detail(
     grid,
-    'last delivery',
-    sent && sent.at ? `${sent.ok ? 'ok' : sent.error || 'failed'} · ${sent.events} · ${ago(sent.at)} ago` : null,
+    t('popup_detail_last_delivery', 'last delivery'),
+    sent && sent.at
+      ? t('popup_detail_last_delivery_value', '$1 · $2 · $3 ago', [deliveryState, sent.events, ago(sent.at)])
+      : null,
     Boolean(sent && sent.ok === false)
   );
-  detail(grid, 'delivered', sent ? sent.total : null);
-  detail(grid, 'page sends', page ? `${page.sends} · ${page.failures} failed` : null, Boolean(page && page.failures));
+  detail(grid, t('popup_detail_delivered', 'delivered'), sent ? sent.total : null);
+  detail(
+    grid,
+    t('popup_detail_page_sends', 'page sends'),
+    page ? `${page.sends} · ${tn('popup_detail_failed', page.failures, '$1 failed', '$1 failed')}` : null,
+    Boolean(page && page.failures)
+  );
 }
 
 async function refresh() {
@@ -322,14 +396,28 @@ async function refresh() {
   const isChat = Boolean(info && info.isChat);
   const page = info && info.page;
 
-  row('tab', isChat ? 'ok' : 'off', isChat ? '' : 'none open');
-  row('rec', !isChat ? 'off' : info.recorder ? 'ok' : 'no', !isChat ? '' : info.recorder ? (page.generating ? 'answering' : '') : 'reload');
+  row('tab', isChat ? 'ok' : 'off', isChat ? '' : t('popup_status_none_open', 'none open'));
+  row(
+    'rec',
+    !isChat ? 'off' : info.recorder ? 'ok' : 'no',
+    !isChat ? '' : info.recorder ? (page.generating ? t('popup_status_answering', 'answering') : '') : t('popup_status_reload', 'reload')
+  );
 
   const chatId = info && info.conversationId;
-  idRow('chat', !isChat ? 'off' : chatId ? 'ok' : 'wait', !isChat ? '' : chatId ? shorten(chatId, 8) : 'new chat', chatId);
+  idRow(
+    'chat',
+    !isChat ? 'off' : chatId ? 'ok' : 'wait',
+    !isChat ? '' : chatId ? shorten(chatId, 8) : t('popup_status_new_chat', 'new chat'),
+    chatId
+  );
 
   const requestId = page && page.requestId;
-  idRow('req', !isChat ? 'off' : requestId ? 'ok' : 'wait', !isChat ? '' : requestId ? shorten(requestId, 9) : 'none yet', requestId);
+  idRow(
+    'req',
+    !isChat ? 'off' : requestId ? 'ok' : 'wait',
+    !isChat ? '' : requestId ? shorten(requestId, 9) : t('popup_status_none_yet', 'none yet'),
+    requestId
+  );
 
   const state = pipeline(info, ready);
   stage('read', ...state.read);
@@ -344,7 +432,15 @@ async function refresh() {
   row(
     'app',
     !isChat ? 'off' : broken ? 'no' : flowing ? 'ok' : 'wait',
-    !isChat ? '' : broken ? 'blocked' : flowing ? 'tool matched' : state.proc[0] === 'done' ? 'ID confirmed' : 'waiting'
+    !isChat
+      ? ''
+      : broken
+        ? t('popup_status_blocked', 'blocked')
+        : flowing
+          ? t('popup_status_tool_matched', 'tool matched')
+          : state.proc[0] === 'done'
+            ? t('popup_status_id_confirmed', 'ID confirmed')
+            : t('popup_status_waiting', 'waiting')
   );
   // Opens itself the first time something is actually wrong, so the panel that explains
   // the failure is already open when the popup is opened to look at one.
@@ -355,9 +451,43 @@ async function refresh() {
 
   paintAlert(status, info);
   paintDetails(status, info);
+  $('signInTransfer').hidden = !status?.signInOffer && !transferredSignIn && !$('signInTransferResult').textContent;
+  $('signInTransferBtn').disabled = transferringSignIn || transferredSignIn || !status?.signInOffer;
 }
 
 // -------------------------------------------------------------------- controls
+
+$('signInTransferBtn').addEventListener('click', async () => {
+  const offer = latest.status?.signInOffer;
+  if (!offer || transferringSignIn) return;
+  const section = $('signInTransfer');
+  const result = $('signInTransferResult');
+  transferringSignIn = true;
+  $('signInTransferBtn').disabled = true;
+  section.setAttribute('aria-busy', 'true');
+  result.textContent = '';
+  try {
+    // Request from this user gesture, before any messaging/await can lose Chrome's gesture.
+    const allowed = await chrome.permissions.request({ permissions: ['cookies'] });
+    if (!allowed) {
+      result.textContent = t('popup_sign_in_permission', 'Cookie access not allowed. Click again.');
+      return;
+    }
+    const reply = await chrome.runtime.sendMessage({ type: 'cos_sign_in_transfer', id: offer.id });
+    transferredSignIn = reply?.imported === true;
+    if (transferredSignIn) {
+      // The receipt takes the button's place.
+      $('signInTransferBtn').hidden = true;
+      $('signInTransferDone').hidden = false;
+    } else result.textContent = t('popup_sign_in_failed', 'Transfer failed. Start sign-in again from CoS.');
+  } catch {
+    result.textContent = t('popup_sign_in_failed', 'Transfer failed. Start sign-in again from CoS.');
+  } finally {
+    transferringSignIn = false;
+    section.removeAttribute('aria-busy');
+    $('signInTransferBtn').disabled = transferredSignIn;
+  }
+});
 
 function syncOverwrite() {
   $('overwriteToggle').checked = overwriteEnabled;
@@ -375,14 +505,16 @@ async function loadPreferences() {
 async function copyInto(button, text) {
   if (!text) return;
   const was = button.textContent;
+  const copied = t('popup_copied', 'copied');
+  const copyFailed = t('popup_copy_failed', 'copy failed');
   try {
     await navigator.clipboard.writeText(text);
-    button.textContent = 'copied';
+    button.textContent = copied;
   } catch {
-    button.textContent = 'copy failed';
+    button.textContent = copyFailed;
   }
   setTimeout(() => {
-    if (button.textContent === 'copied' || button.textContent === 'copy failed') button.textContent = was;
+    if (button.textContent === copied || button.textContent === copyFailed) button.textContent = was;
   }, 900);
 }
 
@@ -402,20 +534,10 @@ $('copyBtn').addEventListener('click', (event) => {
 
 $('more').addEventListener('toggle', () => paintDetails(latest.status, latest.tab));
 
-$('reloadBtn').addEventListener('click', () => {
-  // The old worker may be stuck: this explicit action belongs to the popup itself.
-  chrome.runtime.reload();
-});
-
 $('retryBtn').addEventListener('click', async () => {
   $('retryBtn').disabled = true;
   await chrome.runtime.sendMessage({ type: 'pair' });
   $('retryBtn').disabled = false;
-  await refresh();
-});
-
-$('unpairBtn').addEventListener('click', async () => {
-  await chrome.runtime.sendMessage({ type: 'unpair' });
   await refresh();
 });
 
@@ -442,4 +564,9 @@ $('timeToggle').addEventListener('change', async () => {
 // A popup is open for seconds at a time and the three stages move within those seconds.
 void loadPreferences().catch(() => undefined);
 void refresh().catch(() => undefined);
+// The app's language arrives with its catalog a moment later; repaint once it is there and on
+// every later change, so the popup reads like the app rather than like Chrome.
+const relocalize = () => { localizeDocument(); void refresh().catch(() => undefined); };
+void globalThis.CLF_I18N.ready?.then(relocalize).catch(() => undefined);
+globalThis.addEventListener?.('clf-i18n-changed', relocalize);
 setInterval(() => void refresh().catch(() => undefined), POLL_MS);

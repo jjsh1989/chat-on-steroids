@@ -1,9 +1,20 @@
 // Isolated Electron fixture: production countdown renderer, dock markup and CSS.
+const { withoutScripts } = require('./ui-check-page.cjs');
 const { app, BrowserWindow } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const { build } = require('esbuild');
+
+async function captureOffscreenFrame(win, file) {
+  // This fixture is an offscreen window. Capture the frame from the offscreen renderer's own
+  // paint event instead of asking Viz to copy the hidden surface again with capturePage().
+  // The listener is armed before invalidation, so the saved image belongs to a freshly generated
+  // frame for the current size/zoom/layout rather than whichever surface Viz last exposed.
+  const frame = new Promise(resolve => win.webContents.once('paint', (_event, _dirty, image) => resolve(image)));
+  win.webContents.invalidate();
+  fs.writeFileSync(file, (await frame).toPNG());
+}
 
 app.whenReady().then(async () => {
   const root = path.join(__dirname, '..');
@@ -14,8 +25,7 @@ app.whenReady().then(async () => {
   const win = new BrowserWindow({ show: false, width: 920, height: 380,
     webPreferences: { sandbox: true, offscreen: true, backgroundThrottling: false } });
   const css = fs.readFileSync(path.join(root, 'src/renderer/styles.css'), 'utf8');
-  const html = fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8')
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '').replace(/<link\b[^>]*>/gi, '');
+  const html = withoutScripts(fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8')).replace(/<link\b[^>]*>/gi, '');
   await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html.replace('</head>', `<style>${css}</style></head>`)));
   await win.webContents.executeJavaScript(bundle.outputFiles[0].text);
   await win.webContents.executeJavaScript(`(() => {
@@ -35,22 +45,25 @@ app.whenReady().then(async () => {
   for (const width of [920, 420]) for (const zoom of [1, 1.5]) for (const theme of ['dark', 'light']) {
     win.setContentSize(width, 380);
     win.webContents.setZoomFactor(zoom);
-    for (const kind of ['thinking-failed', 'unattributed', 'unattributed-wait', 'native-busy', 'silence', 'post-reload'])
-      for (const next of kind === 'post-reload' ? [null, 'queue', 'goal', 'loop'] : [null]) {
-      const measured = await win.webContents.executeJavaScript(`(() => {
+    for (const kind of ['thinking-failed', 'unattributed', 'unattributed-wait', 'assistant-error', 'tab-recovery', 'native-busy', 'silence', 'post-reload'])
+      for (const next of kind === 'post-reload' ? [null, 'queue', 'goal', 'loop', 'continue'] : kind === 'native-busy' ? [null, 'continue'] : [null]) {
+      const measured = await win.webContents.executeJavaScript(`(async () => {
         document.documentElement.dataset.theme = '${theme}';
-        recovery.renderRecoveryCountdowns(document.getElementById('recoveryStatus'), [{ kind: '${kind}', next: ${JSON.stringify(next)}, deadline: ${kind === 'unattributed' ? 15000 : 300000} }], 1000);
+        recovery.renderRecoveryCountdowns(document.getElementById('recoveryStatus'), [{ kind: '${kind}', next: ${JSON.stringify(next)}, generating: ${kind === 'post-reload'}, deadline: ${kind === 'unattributed' ? 15000 : 300000} }], 1000);
+        // Measure the resting layout: the dock's entrance animation would otherwise be caught mid-way.
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        await Promise.race([Promise.all(document.getAnimations().filter(animation => animation.effect?.getComputedTiming().endTime !== Infinity).map(animation => animation.finished.catch(() => undefined))), new Promise(resolve => setTimeout(resolve, 1500))]);
         const host = document.getElementById('recoveryStatus'), timer = host.querySelector('.recovery-countdown');
         const h = host.getBoundingClientRect(), t = timer.getBoundingClientRect();
         return { hostWidth: h.width, height: h.height, timerWidth: t.width, text: timer.textContent,
           fits: t.left >= h.left && t.right <= h.right && host.scrollWidth <= host.clientWidth };
       })()`);
       assert.ok(measured.fits, JSON.stringify({ width, zoom, theme, kind, ...measured }));
-      assert.ok(measured.height >= 38 && measured.timerWidth > 0);
+      assert.ok(measured.height >= 38 && measured.timerWidth > 0, JSON.stringify({ width, zoom, theme, kind, next, ...measured }));
       results.push({ width, zoom, theme, kind, next, ...measured });
       if (width === 920 && zoom === 1 && theme === 'dark') {
         await win.webContents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
-        fs.writeFileSync(path.join(output, `${kind}${next ? '-' + next : ''}.png`), (await win.webContents.capturePage()).toPNG());
+        await captureOffscreenFrame(win, path.join(output, `${kind}${next ? '-' + next : ''}.png`));
       }
     }
   }
@@ -58,11 +71,16 @@ app.whenReady().then(async () => {
   win.setContentSize(920, 320);
   win.webContents.setZoomFactor(1);
   const previews = [
+    { file: 'preview-pickup', kind: 'pickup', next: 'queue', deadline: 300_000, now: 0 },
+    { file: 'preview-pickup-stopped', kind: 'pickup-stopped', next: 'queue', attempts: 3, deadline: 300_000, now: 0 },
     { file: 'preview-unattributed', kind: 'unattributed', deadline: 15_000, now: 0 },
     { file: 'preview-unattributed-multiple', kind: 'unattributed', deadline: 60_000, now: 0 },
     { file: 'preview-unattributed-five-minute', kind: 'unattributed-wait', deadline: 300_000, now: 60_000 },
     { file: 'preview-thinking-failed', kind: 'thinking-failed', deadline: 300_000, now: 0 },
     { file: 'preview-extended-wait', kind: 'native-busy', deadline: 600_000, now: 300_000 },
+    { file: 'preview-continue-one-minute', kind: 'native-busy', next: 'continue', deadline: 60_000, now: 0 },
+    { file: 'preview-continue-five-minutes', kind: 'native-busy', next: 'continue', deadline: 300_000, now: 0 },
+    { file: 'preview-generating-queue', kind: 'post-reload', generating: true, next: 'queue', deadline: 60_000, now: 0 },
     { file: 'preview-pro-silence', kind: 'silence', visibleAt: 300_000, deadline: 600_000, now: 300_000 },
     { file: 'preview-goal-one-minute', kind: 'post-reload', next: 'goal', deadline: 180_000, now: 120_000 },
     { file: 'preview-queue-one-minute', kind: 'post-reload', next: 'queue', deadline: 180_000, now: 120_000 },
@@ -79,7 +97,7 @@ app.whenReady().then(async () => {
         : 'Loop · Continue the requested work and verify the result.';
       return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     })()`);
-    fs.writeFileSync(path.join(output, `${preview.file}.png`), (await win.webContents.capturePage()).toPNG());
+    await captureOffscreenFrame(win, path.join(output, `${preview.file}.png`));
   }
   fs.writeFileSync(path.join(output, 'measurements.json'), JSON.stringify(results, null, 2));
   console.log(`Passed ${results.length} recovery layout cases. Screenshots: ${output}`);

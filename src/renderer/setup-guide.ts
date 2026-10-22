@@ -1,92 +1,181 @@
-import { el } from './dom.js';
-import { t, ui } from './i18n.js';
+import { el, icon } from './dom.js';
+import { currentLanguage, onLanguageChange, t, ui, type Language } from './i18n.js';
+import { quoted } from './extension-pictures.js';
+import pages from './setup-images/pages/manifest.json';
 import { initToolApprovalNotice } from './tool-approval.js';
 
-type Callout = { text: string; at: [number, number]; box: [number, number, number, number] };
-type Shot = { src: string; title: string; portrait?: boolean; notes: Callout[] };
+/** One place to click: a few words, and where it is on the picture as percentages of its size. */
+type Spot = { text: () => string; box: [number, number, number, number]; pin?: 'top-left' | 'bottom-left' | 'outside-left' };
+type Shot = { src: string; spots: Spot[] };
+type Box = [number, number, number, number];
+type Capture = { file: string; size: [number, number]; labels: Record<string, string>; spots: Record<string, Box> };
+/** A page captured by scripts/capture-setup-pages.mjs: its own words fill the move texts. */
+type Page = { scene: string; spots: Array<{ key: string; text: (labels: Record<string, string>) => string; pin?: Spot['pin'] }> };
+type Still = { src: string; spots: Array<{ text: string | (() => string); box: Box; pin?: Spot['pin'] }> };
 
-// Only reviewed, redacted assets belong here. Overlays explain clicks; they never hide secrets.
-const guides: Record<string, Shot[]> = {
+const pageFiles = import.meta.glob('./setup-images/pages/*.webp', { eager: true, query: '?url', import: 'default' }) as Record<string, string>;
+
+/** The capture of a page in the app's language (ChatGPT's own words there), else in English. */
+function capture(scene: string, language: Language = currentLanguage()): Capture | null {
+  const scenes = pages as unknown as Record<string, Partial<Record<Language, Capture>>>;
+  return scenes[scene]?.[language] ?? scenes[scene]?.en ?? null;
+}
+
+/** A label ChatGPT shows in the app's language, else its English one: for steps without a capture of their own. */
+function label(scene: string, key: string): string {
+  const scenes = pages as unknown as Record<string, Partial<Record<Language, { labels: Record<string, string> }>>>;
+  return scenes[scene]?.[currentLanguage()]?.labels[key] ?? scenes[scene]!.en!.labels[key]!;
+}
+
+// Only reviewed, redacted captures belong here: placeholders stand in for every name, address and id.
+// The ChatGPT and OpenAI Platform pages are re-captured with scripts/capture-setup-pages.mjs.
+const guides: Record<string, Array<Page | Still>> = {
+  signin: [
+    { src: new URL('./setup-images/cos-browser-sign-in.png', import.meta.url).href, spots: [
+      // Two places side by side: the pins take opposite corners so neither covers the other.
+      { text: () => t('Click {0}', [quoted(label('signin', 'login'))]), box: [72, 11.7, 8.7, 10.6], pin: 'bottom-left' },
+      { text: 'Green dot: the app is connected', box: [77.2, 2.6, 2.9, 5.1] }
+    ] }
+  ],
+  'external-browser': [
+    { src: new URL('./setup-images/external-browser-chatgpt.png', import.meta.url).href, spots: [
+      { text: 'Review extension', box: [96.1, 2.8, 2.6, 5.1], pin: 'outside-left' },
+      { text: () => t('Click {0}', [quoted(label('signin', 'login'))]), box: [91.2, 12.1, 7.5, 11.1], pin: 'bottom-left' }
+    ] }
+  ],
   tunnel: [
-    { src: new URL('./setup-images/workspace.png', import.meta.url).href,
-      title: 'Select the workspace you use in ChatGPT, then create the tunnel and copy its ID.', notes: [
-        { text: '1 · Name your tunnel', at: [75, 16], box: [6, 18, 88.5, 5.2] },
-        { text: '2 · Add a description', at: [75, 29], box: [6, 31.5, 88.5, 11.3] },
-        { text: '3 · Choose your ChatGPT workspace here', at: [70, 71.5], box: [6, 74, 88.5, 19.3] }
-      ] }
+    { scene: 'tunnel-create', spots: [
+      { key: 'name', text: () => t('Name it') },
+      { key: 'workspace', text: () => t('Pick your ChatGPT workspace') },
+      { key: 'create', text: labels => t('Click {0}', [quoted(labels.create!)]) }
+    ] },
+    { scene: 'tunnel-id', spots: [{ key: 'copy', text: () => t('Copy the tunnel ID') }] }
   ],
   key: [
-    { src: new URL('./setup-images/api-key.png', import.meta.url).href, portrait: true,
-      title: 'Choose Restricted, then enable Read and Use under Tunnels. Leave other permissions at None.', notes: [
-        { text: '1 · Select a project', at: [82, 24], box: [3, 26, 62, 3] },
-        { text: '2 · Restricted', at: [82, 37], box: [10, 39, 14, 3] },
-        { text: '3 · Tunnels: Read + Use', at: [80, 80], box: [52, 86, 46, 6] }
-      ] }
-  ],
-  developer: [
-    { src: new URL('./setup-images/developer-mode.png', import.meta.url).href,
-      title: 'Settings → Security and login → Developer mode. Turn the switch on.', notes: [
-        { text: '1 · Security and login', at: [16, 65], box: [2, 68.6, 26, 5.8] },
-        { text: '2 · Turn Developer mode on', at: [70, 36], box: [88.8, 44.9, 5.7, 3.8] }
-      ] }
+    { scene: 'api-key-create', spots: [
+      { key: 'project', text: () => t('Pick your project') },
+      { key: 'restricted', text: labels => t('Choose {0}', [quoted(labels.restricted!)]) }
+    ] },
+    { scene: 'api-key-tunnels', spots: [
+      { key: 'tunnels', text: labels => t('{0}: {1} and {2}', [quoted(labels.tunnels!), quoted(labels.read!), quoted(labels.use!)]) }
+    ] }
   ],
   plugin: [
-    { src: new URL('./setup-images/plugins-page.png', import.meta.url).href,
-      title: 'Open the ChatGPT Plugins page and click + at the top right.', notes: [
-        { text: 'Click + to add your plugin', at: [68, 39], box: [91.3, 12.3, 4.8, 11.8] }
-      ] },
-    { src: new URL('./setup-images/new-plugin.png', import.meta.url).href, portrait: true,
-      title: 'Copy the Core name and description below. Choose Tunnel, select your tunnel, choose No Auth, accept the notice and click Create.', notes: [
-        { text: '1 · Choose Tunnel', at: [63, 36.5], box: [72.4, 39.2, 16.2, 3.5] },
-        { text: '2 · Pick your tunnel', at: [64, 55], box: [12, 47, 77, 4.7] },
-        { text: '3 · No Auth', at: [73, 67], box: [12, 60.8, 77, 4.7] },
-        { text: '4 · Accept, then Create', at: [45, 86.5], box: [76.6, 90, 12, 4.4] }
-      ] }
+    { scene: 'plugin-add', spots: [{ key: 'item', text: labels => `${quoted(labels.add!)} → ${quoted(labels.item!)}` }] },
+    { scene: 'plugin-new', spots: [
+      { key: 'name', text: () => t('Paste the name exactly') },
+      { key: 'connection', text: labels => t('{0}, then your tunnel ID', [quoted(labels.tunnel!)]) },
+      { key: 'auth', text: labels => quoted(labels.noAuth!) },
+      { key: 'create', text: labels => t('{0}, then {1}', [quoted(labels.consent!), quoted(labels.create!)]) }
+    ] },
+    // So tasks are not paused for approval: the plugin's own permissions page, where ChatGPT has one.
+    { src: new URL('./setup-images/plugin-permissions.png', import.meta.url).href, spots: [
+      { text: 'Where the plugin offers permissions: allow all tools', box: [3.1, 76.9, 93.9, 13.5] }
+    ] },
+    // The first tool call asks for approval; this is where the app's one-time reminder points too.
+    { src: new URL('./setup-images/tool-approval.jpg', import.meta.url).href, spots: [
+      { text: 'First tool call: allow it, always for this plugin', box: [85.5, 79.6, 12.2, 14.6] }
+    ] }
   ]
 };
 
-function screenshot(shot: Shot): HTMLElement {
-  const figure = el('figure', 'setup-figure');
-  const frame = el('div', `setup-shot${shot.portrait ? ' is-portrait' : ''}`);
-  const img = document.createElement('img');
-  img.src = shot.src;
-  img.alt = ''; // The adjacent caption and text overlays describe the image in reading order.
-  img.decoding = 'async';
-  frame.append(img);
-  for (const note of shot.notes) {
-    const [x, y, width, height] = note.box;
-    const box = el('span', 'setup-target');
-    box.setAttribute('aria-hidden', 'true');
-    Object.assign(box.style, { left: `${x}%`, top: `${y}%`, width: `${width}%`, height: `${height}%` });
-    const [startX, startY] = note.at;
-    const down = startY < y;
-    const label = el('span', 'setup-callout', () => t(note.text));
-    Object.assign(label.style, {
-      left: `${startX}%`, top: `${startY}%`,
-      maxWidth: `${Math.min(startX, 100 - startX) * 2 - 4}%`,
-      transform: `translate(-50%, ${down ? '-100%' : '0'})`
-    });
-    // The label's anchored edge is also the arrow's start, independent of wrapping/language.
-    const endX = Math.max(x + 2, Math.min(startX, x + width - 2));
-    const endY = down ? y : y + height;
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.setAttribute('class', 'setup-arrow');
-    svg.setAttribute('viewBox', '0 0 100 100');
-    svg.setAttribute('preserveAspectRatio', 'none');
-    svg.setAttribute('aria-hidden', 'true');
-    const line = document.createElementNS(svg.namespaceURI, 'path');
-    const tipY = endY + (down ? -1.2 : 1.2);
-    line.setAttribute('d', `M${startX} ${startY} L${endX} ${endY} M${endX - 0.8} ${tipY} L${endX} ${endY} L${endX + 0.8} ${tipY}`);
-    svg.append(line);
-    frame.append(svg, box, label);
-  }
-  const caption = el('figcaption');
-  caption.append(el('p', '', () => t(shot.title)));
-  figure.append(frame, caption);
-  return figure;
+/** The pictures and move texts of a guide in the app's current language. */
+function shots(group: string): Shot[] {
+  return (guides[group] ?? []).flatMap(entry => {
+    if ('src' in entry) return [{ src: entry.src, spots: entry.spots.map(spot => ({ ...spot, text: typeof spot.text === 'string' ? () => t(spot.text as string) : spot.text })) }];
+    const page = capture(entry.scene);
+    const src = page ? pageFiles[`./setup-images/pages/${page.file}`] : undefined;
+    if (!page || !src) return [];
+    return [{ src, spots: entry.spots.flatMap(spot => page.spots[spot.key]
+      ? [{ box: page.spots[spot.key]!, pin: spot.pin, text: () => spot.text(capture(entry.scene)?.labels ?? page.labels) }] : []) }];
+  });
 }
 
-/** All instructions stay visible together; each figure can open in a native larger view. */
+/** A picture with its click targets marked, numbered from `first` so pins match the moves. */
+function picture(shot: Shot, first: number): HTMLElement {
+  const frame = el('span', 'guide-picture');
+  const img = document.createElement('img');
+  img.src = shot.src;
+  img.alt = '';
+  img.decoding = 'async';
+  img.draggable = false;
+  frame.append(img);
+  shot.spots.forEach((spot, index) => {
+    const [x, y, width, height] = spot.box;
+    const mark = el('span', 'guide-spot');
+    mark.dataset.spot = String(first + index);
+    Object.assign(mark.style, { left: `${x}%`, top: `${y}%`, width: `${width}%`, height: `${height}%` });
+    const pin = el('span', 'guide-pin', String(first + index + 1));
+    if (spot.pin) pin.dataset.corner = spot.pin;
+    mark.append(pin);
+    frame.append(mark);
+  });
+  return frame;
+}
+
+/**
+ * The step's moves beside its pictures. Pointing at a move (or focusing it) shows the picture
+ * it happens in and lights its place there; the picture itself opens full size.
+ */
+function guide(host: HTMLElement, shots: Shot[], enlarge: (shot: Shot, first: number) => void): void {
+  const moves = el('ol', 'guide-moves');
+  const stage = el('div', 'guide-stage');
+  const frames: HTMLButtonElement[] = [];
+  const dots = el('div', 'guide-dots');
+  const firsts: number[] = [];
+  let next = 0;
+  for (const shot of shots) { firsts.push(next); next += shot.spots.length; }
+
+  const show = (shotIndex: number, spot: number | null) => {
+    frames.forEach((frame, index) => { frame.hidden = index !== shotIndex; });
+    for (const mark of stage.querySelectorAll<HTMLElement>('.guide-spot')) {
+      mark.classList.toggle('is-lit', spot !== null && Number(mark.dataset.spot) === spot);
+    }
+    for (const move of moves.querySelectorAll<HTMLElement>('.guide-move')) {
+      move.classList.toggle('is-lit', spot !== null && Number(move.dataset.spot) === spot);
+      move.classList.toggle('is-here', Number(move.dataset.shot) === shotIndex);
+    }
+    [...dots.children].forEach((dot, index) => dot.setAttribute('aria-pressed', String(index === shotIndex)));
+    stage.classList.toggle('has-lit', spot !== null);
+  };
+
+  shots.forEach((shot, shotIndex) => {
+    const frame = el('button', 'guide-frame') as HTMLButtonElement;
+    frame.type = 'button';
+    ui(frame, 'aria-label', () => t('Enlarge image'));
+    frame.append(picture(shot, firsts[shotIndex]!), icon('i-zoom-in', 'ico guide-zoom'));
+    frame.addEventListener('click', () => enlarge(shot, firsts[shotIndex]!));
+    frames.push(frame);
+    stage.append(frame);
+    shot.spots.forEach((spot, index) => {
+      const move = el('li', 'guide-move');
+      move.tabIndex = 0;
+      move.dataset.shot = String(shotIndex);
+      move.dataset.spot = String(firsts[shotIndex]! + index);
+      move.append(el('span', 'guide-pin', String(firsts[shotIndex]! + index + 1)), el('span', 'guide-move-text', spot.text));
+      const light = () => show(shotIndex, firsts[shotIndex]! + index);
+      move.addEventListener('pointerenter', light);
+      move.addEventListener('focus', light);
+      move.addEventListener('click', light);
+      moves.append(move);
+    });
+    if (shots.length > 1) {
+      const dot = el('button', 'guide-dot') as HTMLButtonElement;
+      dot.type = 'button';
+      ui(dot, 'aria-label', () => t('Picture {0} of {1}', [shotIndex + 1, shots.length]));
+      dot.addEventListener('click', () => show(shotIndex, null));
+      dots.append(dot);
+    }
+  });
+  moves.addEventListener('pointerleave', () => show(frames.findIndex(frame => !frame.hidden), null));
+  if (shots.length > 1) stage.append(dots);
+  show(0, null);
+  // A step may keep its moves in its own column, apart from the pictures beside them.
+  const slot = host.dataset.movesInto ? document.getElementById(host.dataset.movesInto) : null;
+  if (slot) { slot.append(moves); host.append(stage); } else host.append(moves, stage);
+}
+
+/** Pictures sit small beside their moves; each opens full size, pins and all, in one dialog. */
 export function initSetupGuide(): void {
   initToolApprovalNotice(window.api?.onToolApprovalNotice);
   const dialog = document.createElement('dialog');
@@ -95,24 +184,33 @@ export function initSetupGuide(): void {
   const close = el('button', 'btn', () => t('Close'));
   close.setAttribute('type', 'button');
   close.addEventListener('click', () => dialog.close());
-  const large = el('div');
+  const large = el('div', 'guide-large');
   dialog.append(close, large);
   dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
   dialog.addEventListener('close', () => large.replaceChildren());
   document.body.append(dialog);
 
-  for (const host of document.querySelectorAll<HTMLElement>('[data-setup-guide]')) {
-    const shots = guides[host.dataset.setupGuide!] ?? [];
-    if (!shots.length) continue;
-    const gallery = el('div', `setup-gallery${shots.length > 1 ? ' has-pair' : ''}`);
-    for (const shot of shots) {
-      const figure = screenshot(shot);
-      const enlarge = el('button', 'btn setup-enlarge', () => t('Enlarge image'));
-      enlarge.setAttribute('type', 'button');
-      enlarge.addEventListener('click', () => { large.replaceChildren(screenshot(shot)); dialog.showModal(); });
-      figure.querySelector('figcaption')!.append(enlarge);
-      gallery.append(figure);
+  const enlarge = (shot: Shot, first: number) => {
+    const legend = el('ol', 'guide-moves');
+    shot.spots.forEach((spot, index) => {
+      const move = el('li', 'guide-move');
+      move.append(el('span', 'guide-pin', String(first + index + 1)), el('span', 'guide-move-text', spot.text));
+      legend.append(move);
+    });
+    large.replaceChildren(picture(shot, first), legend);
+    dialog.showModal();
+  };
+  // Captured pages change with the language (ChatGPT's own words and screens), so the guides are
+  // built again on a language change, the moves a step keeps in its own column included.
+  const build = (): void => {
+    for (const host of document.querySelectorAll<HTMLElement>('[data-setup-guide]')) {
+      host.replaceChildren();
+      const slot = host.dataset.movesInto ? document.getElementById(host.dataset.movesInto) : null;
+      slot?.querySelector(':scope > .guide-moves')?.remove();
+      const pictures = shots(host.dataset.setupGuide!);
+      if (pictures.length) guide(host, pictures, enlarge);
     }
-    host.append(gallery);
-  }
+  };
+  build();
+  onLanguageChange(build);
 }

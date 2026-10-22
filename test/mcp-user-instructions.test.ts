@@ -71,6 +71,36 @@ afterEach(() => {
 });
 
 describe('the user’s own connector instructions', () => {
+  it.each([
+    [true, true, false, 'file writing and exec_command'],
+    [true, false, false, 'file writing'],
+    [false, true, false, 'exec_command'],
+    [false, false, false, null],
+    [true, true, true, null],
+  ] as const)('affirms only enabled local capabilities (write=%s command=%s readOnly=%s)', (write, command, readOnly, expected) => {
+    const text = serverInstructions({ ...ctx, readOnly, caps: {
+      ...ctx.caps, create: write, edit: write, move: write, deleteFile: write, command,
+    } }, 'core', 'win32');
+    const assertion = text.split('\n').find(line => / (is|are) enabled in CoS\.$/.test(line));
+    if (expected) {
+      expect(assertion).toBe({ 'file writing and exec_command': 'File writing and exec_command are enabled in CoS.',
+        'file writing': 'File writing is enabled in CoS.', 'exec_command': 'exec_command is enabled in CoS.' }[expected]);
+    } else expect(assertion).toBeUndefined();
+  });
+  it.each(['win32', 'darwin', 'linux'] as const)('teaches the same terminal result lifetime on %s', platform => {
+    const text = serverInstructions({ ...ctx, caps: { ...ctx.caps, command: true } }, 'core', platform);
+    expect(text).toContain('completed_session_id');
+    // write_stdin has one id argument. completed_session_id is an exec_command result field that
+    // goes into it; read as a second argument, the strict schema refuses the call.
+    expect(text).toContain("pass a finished command's completed_session_id as session_id");
+    expect(text).toContain('expected_exit');
+    expect(text).not.toContain('benign');
+    expect(text).toContain('without rerunning work');
+    if (platform !== 'win32') {
+      expect(text).toContain('normal POSIX shell');
+      expect(text).not.toContain('Pipe foreach output');
+    }
+  });
   it('starts with the coding guidance and explains connectors once beside the local tools without a setup link', () => {
     const text = serverInstructions(ctx, 'core', 'win32');
     expect(text.startsWith('You are a coding agent working with the user through Chat On Steroids.')).toBe(true);
@@ -102,6 +132,24 @@ describe('the user’s own connector instructions', () => {
     const withoutCommands = serverInstructions({ ...ctx, caps: { ...ctx.caps, command: false } }, 'core', 'linux');
     expect(withoutCommands).toContain('find searches');
     expect(withoutCommands).not.toContain('exec_command runs');
+  });
+
+  // #1755: ChatGPT's safety check flagged the connector text as a "Suspicious instruction" that
+  // tries to steer how calls are run and judged. The instructions state facts, never rules for
+  // treating blocks, approvals or ChatGPT's own messages.
+  it.each(['win32', 'darwin'] as const)('states facts, never rules about blocks or approvals (%s)', platform => {
+    const text = serverInstructions({ ...ctx, caps: { ...ctx.caps, command: true, create: true, edit: true } }, 'core', platform);
+    expect(text).not.toMatch(/never hallucinate a block|retry the identical call|keep using enabled tools|you can always use|not permission\./i);
+  });
+
+  it('explains the transient ChatGPT safety refusal and offers session_finish to any model', () => {
+    // #555: a benign call was blocked once by ChatGPT and succeeded unchanged on retry.
+    const text = serverInstructions({ ...ctx, exposedFinishTool: true }, 'core', 'win32');
+    expect(text).toContain('"This tool call was blocked by OpenAI because we couldn\'t determine the safety status of the request." comes from ChatGPT before the call reaches CoS');
+    expect(text).toContain('the same call often succeeds when made again');
+    // #556: the tool is exposed by the finish setting, not by model; Sol users were told "Astra only".
+    expect(text).toContain('Use session_finish only when the user prompt explicitly requests it, with any model.');
+    expect(text).not.toMatch(/Astra only/);
   });
 
   it('adds nothing at all when empty, not even the heading', () => {

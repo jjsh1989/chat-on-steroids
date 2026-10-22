@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { expect, it, vi } from 'vitest';
 import sharp from 'sharp';
 import { CODE_MODE_LIMITS, runCodeMode } from '../src/main/mcp/code-mode-runtime.js';
@@ -60,6 +61,20 @@ it('throws a sky tool failure before a dependent input and preserves its useful 
   expect(output.isError).toBe(true);
   expect(invoke).toHaveBeenCalledTimes(1);
   expect(rendered(output)).toContain('STALE_WINDOW: observe again');
+});
+
+// #1367: the CPU budget counts the worker thread's CPU, not wall time a busy runner spends
+// descheduling or pausing it. A whole-process stop mid-slice stands in for that pause.
+it.skipIf(process.platform === 'win32')('does not charge a paused worker for wall time it did not compute', async () => {
+  const invoke = vi.fn(async () => {
+    if (invoke.mock.calls.length === 1) spawn('sh', ['-c', `sleep 0.1; kill -STOP ${process.pid}; sleep 1.2; kill -CONT ${process.pid}`], { detached: true, stdio: 'ignore' }).unref();
+    return result('paused');
+  });
+  const output = await runCodeMode('await tools.lookup({}); const t = Date.now(); while (Date.now() - t < 400) {} await tools.lookup({}); text("finished")',
+    tools, invoke, { ...limits, wallMs: 10_000, cpuMs: 1000 });
+  expect(rendered(output)).not.toContain('CPU_LIMIT');
+  expect(invoke).toHaveBeenCalledTimes(2);
+  expect(output.content).toEqual([{ type: 'text', text: 'finished' }]);
 });
 
 it('reports already dispatched inputs when an unsupported timer stops a Desktop script', async () => {
@@ -150,7 +165,10 @@ it('emits valid native images and rejects malformed or remote image payloads', a
 it('stops new admission on timeout while an accepted tool finishes under its own owner', async () => {
   let resolve!: (value: ToolResult) => void;
   const invoke = vi.fn(() => new Promise<ToolResult>(done => { resolve = done; }));
-  const output = await runCodeMode('text("retained"); await tools.lookup({}); await tools.lookup({});', tools, invoke, { ...limits, wallMs: 500 });
+  // Include enough wall time for a cold QuickJS worker to start under a loaded test run.
+  // The timeout must happen after the first call is admitted so this assertion covers
+  // the still-pending owner path, rather than racing worker startup.
+  const output = await runCodeMode('text("retained"); await tools.lookup({}); await tools.lookup({});', tools, invoke, { ...limits, wallMs: 5_000 });
   expect(rendered(output)).toContain('TIME_LIMIT');
   expect(output.content.slice(0, 2)).toEqual([
     { type: 'text', text: expect.stringContaining('CODE_MODE_TIME_LIMIT') },
@@ -161,7 +179,7 @@ it('stops new admission on timeout while an accepted tool finishes under its own
   resolve(result('late private value'));
   await new Promise(done => setImmediate(done));
   expect(invoke).toHaveBeenCalledTimes(1);
-});
+}, 10_000);
 
 it('keeps output-limit diagnostics ahead of a full 40000-byte preview and preserves dispatched effects', async () => {
   for (const priorCall of [false, true]) {

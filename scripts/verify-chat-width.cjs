@@ -13,17 +13,18 @@ app.whenReady().then(async () => {
   const win = new BrowserWindow({ show: false, width: 1500, height: 1000, webPreferences: { offscreen: true } });
   const css = fs.readFileSync(path.join(__dirname, '../src/renderer/styles.css'), 'utf8');
   await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(`<style>${css}</style>
-    <div id="fixture"><div id="chatBody" class="scroll"><div class="view" data-view="timeline">
+    <div id="fixture"><div id="chatBody" class="scroll"><div class="view" id="timelineContent" data-view="timeline">
     <div id="timeline"><button class="timeline-window-note" hidden>Back to latest</button>
     <div class="ev"><div class="ev-body"><p class="msg" id="prose"></p></div></div>
     <details class="tool-group"><summary>Refused to run a tool</summary><div class="tool-group-body" style="height:400px">Recorded tool details</div></details>
+    <div class="ev ev-tool_call"><div class="ev-body"><details class="tool tone-good"><summary><b>Edited 2 files</b><span class="metric"><span class="metric-added">+28</span> <span class="metric-removed">−11</span></span></summary></details></div></div>
     </div></div></div></div>`));
   const results = [];
   for (const zoom of [1, 1.17, 1.5]) {
     win.webContents.setZoomFactor(zoom);
     for (const width of [1100, 760, 500]) {
       const states = await win.webContents.executeJavaScript(`(async () => {
-        const pane = document.getElementById('chatBody'), timeline = document.getElementById('timeline');
+        const pane = document.getElementById('chatBody'), timeline = document.getElementById('timelineContent');
         const prose = document.getElementById('prose'), group = document.querySelector('details'), latest = document.querySelector('button');
         document.getElementById('fixture').style.width = '${width}px';
         prose.textContent = 'The chat text should keep the same line breaks when opening tool details or returning to the latest messages. '.repeat(4);
@@ -51,6 +52,29 @@ app.whenReady().then(async () => {
         assert.equal(state.left, states[0].left, 'Text position must remain stable');
         assert.deepEqual(state.lines, states[0].lines, 'Authored line wrapping must remain identical');
       }
+      const call = await win.webContents.executeJavaScript(`(() => {
+        const body = document.querySelector('.ev-tool_call .ev-body');
+        const head = body.querySelector('summary');
+        const label = head.querySelector('b');
+        const metric = head.querySelector('.metric');
+        const added = metric.querySelector('.metric-added');
+        const removed = metric.querySelector('.metric-removed');
+        const red = document.createElement('span'); red.style.color = 'var(--red)'; document.body.append(red);
+        const green = document.createElement('span'); green.style.color = 'var(--green)'; document.body.append(green);
+        const result = {
+          bleedStart: body.getBoundingClientRect().left - head.getBoundingClientRect().left,
+          bleedEnd: head.getBoundingClientRect().right - body.getBoundingClientRect().right,
+          insetStart: label.getBoundingClientRect().left - head.getBoundingClientRect().left,
+          insetEnd: head.getBoundingClientRect().right - metric.getBoundingClientRect().right,
+          addedColor: getComputedStyle(added).color, removedColor: getComputedStyle(removed).color,
+          green: getComputedStyle(green).color, red: getComputedStyle(red).color
+        };
+        red.remove(); green.remove(); return result;
+      })()`);
+      assert.ok(call.bleedStart >= 9.5 && call.bleedEnd >= 9.5, `Tool hover does not reach past the text column: ${JSON.stringify(call)}`);
+      assert.ok(call.insetStart >= 9.5 && call.insetEnd >= 9.5, `Tool hover lacks inner spacing: ${JSON.stringify(call)}`);
+      assert.equal(call.addedColor, call.green, 'Added lines use the success color');
+      assert.equal(call.removedColor, call.red, 'Removed lines use the danger color');
       results.push({ zoom, container: width, textWidth: states[0].width, phases: states.length });
     }
   }

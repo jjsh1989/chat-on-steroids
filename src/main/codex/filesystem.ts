@@ -226,11 +226,21 @@ export async function* readFileStream(path: string): AsyncGenerator<Buffer, void
   }
 }
 
-/** `ExecutorFileSystem::read_file_text`: `read_file` plus a strict UTF-8 decode. */
+/**
+ * `ExecutorFileSystem::read_file_text`: `read_file` plus a strict UTF-8 decode.
+ *
+ * A leading byte-order mark stays in the text as U+FEFF, as it does in Rust's `String`. The
+ * decoder's default drops it, and a file rewritten from that text lost its mark: a PowerShell
+ * script with non-ASCII text is then read as ANSI by Windows PowerShell 5.1.
+ */
 export async function readFileText(path: string): Promise<string> {
-  const bytes = await readFile(path);
+  return decodeFileText(await readFile(path));
+}
+
+/** `readFileText`'s strict decode, for bytes read by another backend (#1469). */
+export function decodeFileText(bytes: Buffer): string {
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
     const error = new Error('stream did not contain valid UTF-8') as NodeJS.ErrnoException;
     error.code = 'EILSEQ';
@@ -328,6 +338,16 @@ function pushWalkError(
   return true;
 }
 
+/** The three primitives a walk is built from, so a server folder (#1469) walks the same way. */
+export interface WalkPrimitives {
+  getMetadata(path: string): Promise<FileMetadata>;
+  readDirectory(path: string): Promise<ReadDirectoryEntry[]>;
+  canonicalize(path: string): Promise<string>;
+  join(directory: string, name: string): string;
+}
+
+const localWalkPrimitives: WalkPrimitives = { getMetadata, readDirectory, canonicalize, join: nodePath.join };
+
 /**
  * `walk_via_directory_reads`: a breadth-first walk built only from `read_directory`,
  * `get_metadata` and `canonicalize`.
@@ -336,6 +356,11 @@ function pushWalkError(
  * returns what was collected so far, so a caller always gets a usable partial answer.
  */
 export async function walk(root: string, options: WalkOptions): Promise<WalkOutcome> {
+  return await walkWith(localWalkPrimitives, root, options);
+}
+
+/** `walk` over any backend's primitives. */
+export async function walkWith(fs: WalkPrimitives, root: string, options: WalkOptions): Promise<WalkOutcome> {
   if (options.maxDirectories === 0 || options.maxEntries === 0) {
     throw invalidInput('filesystem walk limits must be greater than zero');
   }
@@ -349,12 +374,12 @@ export async function walk(root: string, options: WalkOptions): Promise<WalkOutc
     );
   }
 
-  const rootMetadata = await getMetadata(root);
+  const rootMetadata = await fs.getMetadata(root);
   if (!rootMetadata.isDirectory || (rootMetadata.isSymlink && !options.followDirectorySymlinks)) {
     return { entries: [], errors: [], truncated: false };
   }
 
-  const rootIdentity = options.followDirectorySymlinks ? await canonicalize(root) : root;
+  const rootIdentity = options.followDirectorySymlinks ? await fs.canonicalize(root) : root;
   const outcome: WalkOutcome = { entries: [], errors: [], truncated: false };
   const queue: Array<[string, number]> = [[root, 0]];
   let queueHead = 0;
@@ -370,7 +395,7 @@ export async function walk(root: string, options: WalkOptions): Promise<WalkOutc
 
     let entries: ReadDirectoryEntry[];
     try {
-      entries = await readDirectory(directory);
+      entries = await fs.readDirectory(directory);
     } catch (error) {
       if (!pushWalkError(outcome, state, directory, errorMessage(error))) return outcome;
       continue;
@@ -384,10 +409,10 @@ export async function walk(root: string, options: WalkOptions): Promise<WalkOutc
       }
       entryCount += 1;
 
-      const path = nodePath.join(directory, entry.fileName);
+      const path = fs.join(directory, entry.fileName);
       let metadata: FileMetadata;
       try {
-        metadata = await getMetadata(path);
+        metadata = await fs.getMetadata(path);
       } catch (error) {
         if (!pushWalkError(outcome, state, path, errorMessage(error))) return outcome;
         continue;
@@ -417,7 +442,7 @@ export async function walk(root: string, options: WalkOptions): Promise<WalkOutc
         let directoryIdentity: string;
         if (options.followDirectorySymlinks) {
           try {
-            directoryIdentity = await canonicalize(path);
+            directoryIdentity = await fs.canonicalize(path);
           } catch (error) {
             if (!pushWalkError(outcome, state, path, errorMessage(error))) return outcome;
             continue;

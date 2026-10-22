@@ -54,7 +54,7 @@ beforeAll(async () => {
   directory = await makeTempDir('clf-plugins-surface-');
   initConfigPath(directory); await loadConfig(); initDurableStore(directory); initSessionStore(directory);
   await updateConfig(config => ({ ...config, multiAgent: { ...config.multiAgent, enabled: false } }));
-  endpoint = await startMcpServer(() => ({ roots: [], caps: effectiveCapabilities(getConfig()), readOnly: getConfig().readOnly }));
+  endpoint = await startMcpServer(() => ({ setupProfileId: 'plugins-profile', roots: [], caps: effectiveCapabilities(getConfig()), readOnly: getConfig().readOnly }));
 });
 beforeEach(async () => { plugin.enabled = true; plugin.call.mockClear(); plugin.redactResult.mockClear(); await updateConfig(config => ({ ...config, readOnly: false })); });
 afterEach(() => { vi.restoreAllMocks(); });
@@ -90,6 +90,50 @@ it('rejects stale calls after disabling and fails closed in read-only mode regar
   expect(plugin.call).not.toHaveBeenCalled();
 });
 
+it('refuses a worker plugin call when the Plugins endpoint belongs to another Setup profile', async () => {
+  await updateConfig(config => ({ ...config, multiAgent: { ...config.multiAgent, enabled: true } }));
+  const primeConversationId = 'plugins-profile-prime';
+  const workerConversationId = 'plugins-profile-worker';
+  try {
+    const run = agents.spawn({
+      caller: { conversationId: primeConversationId, setupProfileId: 'family-profile' },
+      workers: [{ task: 'plugin provenance check' }]
+    });
+    expect(agents.bindConversation('worker-1', workerConversationId, run.runId)).toBe(true);
+    const session = await createSession({ conversationId: workerConversationId, title: 'Plugin worker profile fence' });
+    const requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
+    observeRequestCorrelation({
+      requestId,
+      conversationId: workerConversationId,
+      sessionId: session.id,
+      messageId: randomUUID(),
+      tool: plugin.declaration.name,
+      observedAt: Date.now()
+    });
+
+    // A refusal must happen before broker liveness or delivery bookkeeping as well as before
+    // the plugin handler. Observing these owners does not replace their implementations.
+    const alive = vi.spyOn(agents, 'noteAgentAlive');
+    const acknowledged = vi.spyOn(input, 'acknowledgeToolInput');
+    const offered = vi.spyOn(input, 'offerToolInput');
+    const response = await rpc(
+      'plugins',
+      'tools/call',
+      { name: plugin.declaration.name, arguments: { name: 'scene' } },
+      requestId
+    );
+    expect(response.result.isError).toBe(true);
+    expect(response.result.content[0].text).toContain('WORKER_CONNECTION_PROFILE_MISMATCH');
+    expect(plugin.call).not.toHaveBeenCalled();
+    expect(alive).not.toHaveBeenCalled();
+    expect(acknowledged).not.toHaveBeenCalled();
+    expect(offered).not.toHaveBeenCalled();
+  } finally {
+    agents.resetAgentsForTests();
+    await updateConfig(config => ({ ...config, multiAgent: { ...config.multiAgent, enabled: false } }));
+  }
+});
+
 it('redacts only delivery additions after the plugin boundary and records the exact delivered protocol result', async () => {
   const data = (await sharp({ create: { width: 1, height: 1, channels: 4, background: { r: 1, g: 2, b: 3, alpha: 1 } } }).webp().toBuffer()).toString('base64');
   expect(data.startsWith('UklGR')).toBe(true);
@@ -102,7 +146,7 @@ it('redacts only delivery additions after the plugin boundary and records the ex
     structuredContent: { count: 2, detail: 'credential-fixture' },
     _meta: { detail: 'credential-fixture' }
   });
-  vi.spyOn(agents, 'offerMessagesForConversation').mockReturnValue({ agentId: 'prime', messages: [{
+  vi.spyOn(agents, 'offerMessagesForCaller').mockReturnValue({ agentId: 'prime', messages: [{
     id: 'message-fixture', from: 'worker-1', to: 'prime', time: Date.now(), text: 'credential-fixture inbox',
     offeredAt: Date.now(), offers: 1, offeredOnFinish: false, offeredViaRevival: false, ackedAt: null
   }] });

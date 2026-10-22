@@ -10,6 +10,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { positionOf } from '../src/shared/chronology.js';
 import sharp from 'sharp';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
@@ -32,6 +33,7 @@ import {
   appendEvent,
   autoCompactionReady,
   observeSessionModel,
+  recordWorkerAssignment,
   createSession,
   deleteSession,
   endSession,
@@ -45,13 +47,16 @@ import {
   pruneSessions,
   readAsset,
   readEvents,
+  readActivityEvents,
   readRecentEvents,
+  readToolEditReview,
   readLatestUserMessage,
   turnHasMcpCall,
   conversationHasMcpCallSince,
   readHandoff,
   rebindSession,
   renameSession,
+  clearSessionName,
   reopenSession,
   resetSessionStoreForTests,
   rewriteUnattributedToolCalls,
@@ -62,7 +67,8 @@ import {
   writeAsset
 } from '../src/main/session/store.js';
 import { summarizeToolCall } from '../src/main/session/summarize.js';
-import { HANDOFF_BRIEF_RULES, nativeHandoffPrompt } from '../src/main/session/handoff-prompt.js';
+import { nativeHandoffPrompt } from '../src/main/session/handoff-prompt.js';
+import { DEFAULT_HANDOFF_PROMPT } from '../src/shared/handoff.js';
 import {
   CHAT_ACTIVE_MS,
   CHAT_SILENCE_MS,
@@ -104,6 +110,97 @@ const evidence = (patch: Partial<ReturnType<typeof emptyEvidence>> = {}) => ({ .
 // ------------------------------------------------------------------- store
 
 describe('session store', () => {
+  it('reports the same unreadable recent event only once until the journal recovers or worsens (#1269)', async () => {
+    const session = await createSession({ title: 'damaged recent journal', conversationId: 'recent-warning-test' });
+    await appendEvent(session.id, { time: 100, source: 'extension', kind: 'turn_start', turnId: 'known-good' });
+    await flushSessions();
+    const file = path.join(sessionsRoot(), session.id, 'events.jsonl');
+    const good = await fs.readFile(file, 'utf8');
+    const warnings = () => getLog().filter(entry => entry.message.includes(`session ${session.id}: skipped`) &&
+      entry.message.includes('unreadable recent event line(s)'));
+
+    await fs.appendFile(file, '{unreadable one}\n');
+    expect(await readRecentEvents(session.id, 10)).toHaveLength(1);
+    expect(await readRecentEvents(session.id, 10)).toHaveLength(1);
+    expect(warnings()).toHaveLength(1);
+
+    // A second damaged line is new information, not a reason to suppress all warnings.
+    await fs.appendFile(file, '{unreadable two}\n');
+    expect(await readRecentEvents(session.id, 10)).toHaveLength(1);
+    expect(warnings()).toHaveLength(2);
+
+    // Once the journal is readable, a later new corruption must be reported again.
+    await fs.writeFile(file, good);
+    expect(await readRecentEvents(session.id, 10)).toHaveLength(1);
+    await fs.appendFile(file, '{unreadable again}\n');
+    expect(await readRecentEvents(session.id, 10)).toHaveLength(1);
+    expect(warnings()).toHaveLength(3);
+    // Ordinary new activity must not turn one old malformed line into new warnings.
+    await fs.appendFile(file, `${JSON.stringify({ seq: 2, time: 101, source: 'extension',
+      kind: 'turn_end', turnId: 'known-good', outcome: 'completed' })}\n`);
+    expect(await readRecentEvents(session.id, 10)).toHaveLength(2);
+    expect(warnings()).toHaveLength(3);
+  });
+
+  it('keeps an exact tool edit review after later edits, but never invents one for failed or oversized calls', async () => {
+    const conversationId = 'conv-exact-edit-review';
+    const sessionId = await sessionForConversation(conversationId);
+    const changed = evidence({
+      changes: [{ path: '/project/src/main.ts', added: 1, removed: 1, approximate: false }],
+      reviews: [{ changeIndex: 0, before: 'one\n', after: 'two\n' }]
+    });
+    const first = await recordToolCall({ tool: 'apply_patch', args: { patch: 'first' },
+      content: [{ type: 'text', text: 'ok' }], outcome: 'ok', durationMs: 1, startedAt: Date.now(),
+      conversationId, sessionId, evidence: changed });
+    expect(first?.changes?.[0]?.reviewAssetId).toMatch(/^[a-f0-9]{32}\.txt$/);
+    const second = await recordToolCall({ tool: 'apply_patch', args: { patch: 'second' },
+      content: [{ type: 'text', text: 'ok' }], outcome: 'ok', durationMs: 1, startedAt: Date.now() + 1,
+      conversationId, sessionId, evidence: evidence({
+        changes: [{ path: '/project/src/main.ts', added: 1, removed: 1, approximate: false }],
+        reviews: [{ changeIndex: 0, before: 'two\n', after: 'three\n' }]
+      }) });
+    expect(await readToolEditReview(sessionId!, first!.callId, 0)).toMatchObject({ baseText: 'one\n', currentText: 'two\n' });
+    expect(await readToolEditReview(sessionId!, second!.callId, 0)).toMatchObject({ baseText: 'two\n', currentText: 'three\n' });
+    expect(await readToolEditReview(sessionId!, first!.callId, 1)).toBeNull();
+    const failed = await recordToolCall({ tool: 'apply_patch', args: { patch: 'failed' },
+      content: [{ type: 'text', text: 'failed' }], outcome: 'tool_execution_error', durationMs: 1, startedAt: Date.now() + 2,
+      conversationId, sessionId, evidence: changed });
+    expect(failed?.changes?.[0]?.reviewAssetId).toBeUndefined();
+    const huge = await recordToolCall({ tool: 'apply_patch', args: { patch: 'huge' },
+      content: [{ type: 'text', text: 'ok' }], outcome: 'ok', durationMs: 1, startedAt: Date.now() + 3,
+      conversationId, sessionId, evidence: evidence({
+        changes: [{ path: '/project/src/huge.ts', added: 1, removed: 0, approximate: false }],
+        reviews: [{ changeIndex: 0, before: '', after: 'x'.repeat(512 * 1024) }]
+      }) });
+    expect(huge?.changes?.[0]?.reviewAssetId).toBeUndefined();
+    expect(huge?.changes?.[0]?.reviewUnavailable).toBe('too-large');
+    expect(first?.changes?.[0]?.reviewUnavailable).toBeUndefined();
+  });
+
+  it('keeps reviews for every file of a larger patch and says why one was not kept (#563)', async () => {
+    const conversationId = 'conv-many-file-review';
+    const sessionId = await sessionForConversation(conversationId);
+    const files = Array.from({ length: 10 }, (_, index) => `/project/src/file-${index}.ts`);
+    const many = await recordToolCall({ tool: 'apply_patch', args: { patch: 'many' },
+      content: [{ type: 'text', text: 'ok' }], outcome: 'ok', durationMs: 1, startedAt: Date.now(),
+      conversationId, sessionId, evidence: evidence({
+        changes: files.map(path => ({ path, added: 1, removed: 1, approximate: false })),
+        reviews: files.map((_, changeIndex) => ({ changeIndex, before: `a${changeIndex}\n`, after: `b${changeIndex}\n` }))
+      }) });
+    // Before, only the first 8 files of a patch could ever be reviewed.
+    expect(many?.changes?.every(change => change.reviewAssetId && !change.reviewUnavailable)).toBe(true);
+    expect(await readToolEditReview(sessionId!, many!.callId, 9)).toMatchObject({ baseText: 'a9\n', currentText: 'b9\n' });
+    const budget = await recordToolCall({ tool: 'apply_patch', args: { patch: 'budget' },
+      content: [{ type: 'text', text: 'ok' }], outcome: 'ok', durationMs: 1, startedAt: Date.now() + 1,
+      conversationId, sessionId, evidence: evidence({
+        changes: [0, 1, 2, 3, 4].map(index => ({ path: `/project/big-${index}.txt`, added: 1, removed: 0, approximate: false })),
+        reviews: [0, 1, 2, 3, 4].map(changeIndex => ({ changeIndex, before: '', after: 'x'.repeat(480 * 1024) }))
+      }) });
+    expect(budget?.changes?.slice(0, 4).every(change => change.reviewAssetId)).toBe(true);
+    expect(budget?.changes?.[4]).toMatchObject({ reviewUnavailable: 'not-kept' });
+    expect(budget?.changes?.[4]?.reviewAssetId).toBeUndefined();
+  });
+
   it('uses original call time and exact conversation for late attribution health proof', async () => {
     const conversationId = 'health-current';
     const session = await createSession({ title: 'attribution health', conversationId });
@@ -265,6 +362,42 @@ describe('session store', () => {
     }
     expect(seen.size).toBeGreaterThanOrEqual(12);
   });
+  it('pages revised long answers by origin in both directions while live deltas still use revision sequence', async () => {
+    const session = await createSession({ title: 'Origin paging' });
+    const body = { text: 'Detailed review. '.repeat(1200), truncated: false, chars: 19200 };
+    const answer = { kind: 'assistant_message' as const, source: 'extension' as const,
+      time: 100, messageId: 'long-review', message: body, final: true };
+    const first = await upsertMessageEvent(session.id, answer);
+    for (let i = 0; i < 12; i++) await appendEvent(session.id, {
+      time: 200 + i, source: 'app', kind: 'note', message: { text: `later ${i}`, truncated: false, chars: 8 }
+    });
+    const revised = await upsertMessageEvent(session.id, { ...answer, renderedHtml: { text: '<p>Detailed review.</p>', truncated: false, chars: 23 } });
+    expect(revised.event.seq).toBeGreaterThan(first.event.seq);
+    const all = await readEvents(session.id);
+    const expected = all.map(positionOf).sort((a, b) => a - b);
+    const backwards: number[] = [];
+    let before: number | undefined;
+    for (;;) {
+      const page = await readRecentEvents(session.id, 3, { before, orderByOrigin: true });
+      if (!page.length) break;
+      backwards.push(...page.map(positionOf));
+      before = Math.min(...page.map(positionOf));
+    }
+    expect(backwards.sort((a, b) => a - b)).toEqual(expected);
+    const forwards: number[] = [];
+    let after = 0;
+    for (;;) {
+      const page = await readRecentEvents(session.id, 3, { after, orderByOrigin: true });
+      if (!page.length) break;
+      forwards.push(...page.map(positionOf));
+      after = Math.max(...page.map(positionOf));
+    }
+    expect(forwards).toEqual(expected);
+    expect((await readEvents(session.id, { from: revised.event.seq })).find(e => e.kind === 'assistant_message')).toMatchObject({
+      seq: revised.event.seq, origin: first.event.seq, message: body
+    });
+  });
+
   it('counts stable legacy message revisions once when building a recent presentation window', async () => {
     const summary = await createSession({ title: 'legacy recent dedupe' });
     await appendEvent(summary.id, {
@@ -366,8 +499,11 @@ describe('session store', () => {
 
   it('finds an attachment beyond the 5,000-session maintenance scan cap', async () => {
     const seed = await createSession({ title: 'catalog seed', conversationId: null });
-    const seedSummary = await getSession(seed.id);
-    expect(seedSummary).not.toBeNull();
+    await flushSessions();
+    // Clone an actual persisted checkpoint, including its private version/watermark
+    // fields. A public summary is a legacy fixture and causes 5,001 real migrations.
+    const seedSummary = JSON.parse(await fs.readFile(path.join(sessionsRoot(), seed.id, 'meta.json'), 'utf8'));
+    const seedStat = await fs.stat(path.join(sessionsRoot(), seed.id, 'meta.json'));
     // Force the next lookup to rebuild from the durable catalog rather than the live seed.
     resetSessionStoreForTests();
 
@@ -376,7 +512,23 @@ describe('session store', () => {
     const targetId = names[names.length - 1] as string;
     const realReaddir = fs.readdir.bind(fs);
     const realReadFile = fs.readFile.bind(fs);
+    const realStat = fs.stat.bind(fs);
     const rootPath = sessionsRoot();
+    const virtualNames = new Set(names);
+    const virtualId = (file: string): string | null => {
+      const parts = path.relative(rootPath, file).split(path.sep);
+      return parts.length === 2 && virtualNames.has(parts[0]!) ? parts[0]! : null;
+    };
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(
+      (async (target: Parameters<typeof fs.stat>[0], ...args: unknown[]) => {
+        const file = String(target);
+        if (virtualId(file)) {
+          if (path.basename(file) === 'meta.json') return seedStat;
+          throw Object.assign(new Error('synthetic catalog has no message history'), { code: 'ENOENT' });
+        }
+        return (realStat as (...callArgs: unknown[]) => ReturnType<typeof fs.stat>)(target, ...args);
+      }) as typeof fs.stat
+    );
     const readdirSpy = vi.spyOn(fs, 'readdir').mockImplementation(
       (async (target: Parameters<typeof fs.readdir>[0], ...args: unknown[]) => {
         if (String(target) === rootPath) return names;
@@ -386,8 +538,8 @@ describe('session store', () => {
     const readSpy = vi.spyOn(fs, 'readFile').mockImplementation(
       (async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
         const file = String(target);
-        const id = path.basename(path.dirname(file));
-        if (file.endsWith('meta.json') && id.startsWith('catalog-')) {
+        const id = virtualId(file);
+        if (path.basename(file) === 'meta.json' && id) {
           return JSON.stringify({
             ...seedSummary,
             id,
@@ -402,9 +554,13 @@ describe('session store', () => {
 
     try {
       expect((await findSessionByConversation(conversationId, { requireUnique: true }))?.id).toBe(targetId);
+      expect((await realReaddir(rootPath)).some(name => virtualNames.has(name))).toBe(false);
     } finally {
       readSpy.mockRestore();
       readdirSpy.mockRestore();
+      statSpy.mockRestore();
+      resetSessionStoreForTests();
+      await deleteSession(seed.id);
     }
   }, 90_000);
 
@@ -458,6 +614,321 @@ describe('session store', () => {
     const events = await readEvents(summary.id);
     expect(events.map((event) => event.seq)).toEqual([1, 2, 3, 4]);
     expect(events.map((event) => event.kind)).toEqual(kinds);
+  });
+
+  /**
+   * A file that cannot be read right now is not a file that holds nothing.
+   *
+   * Reported as #393 from Windows 11: thirteen `no valid metadata projection` warnings inside
+   * thirteen milliseconds across several sessions — one catalog sweep, which reads sixty-four
+   * folders at a time — and from then on the app behaved as if those chats did not exist.
+   * Genuine corruption does not arrive in every session at the same instant; a share lock or an
+   * exhausted descriptor table does. Every read path here used to answer such a failure with the
+   * value that means "empty", and the empty answer is the destructive one: an unread journal is
+   * reported as sequence zero, and the projection is then stamped over a full session.
+   */
+  it('answers a locked journal with a failure instead of stamping the session empty', async () => {
+    const session = await createSession({ title: 'locked journal', conversationId: 'locked-journal' });
+    await appendEvent(session.id, { time: 100, source: 'extension', kind: 'turn_start', turnId: 'work' });
+    await appendEvent(session.id, { time: 200, source: 'extension', kind: 'turn_end', turnId: 'work', outcome: 'completed' });
+    await flushSessions();
+    const folder = path.join(sessionsRoot(), session.id);
+    const metaBefore = await fs.readFile(path.join(folder, 'meta.json'), 'utf8');
+    const journalBefore = await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8');
+    resetRecorderForTests();
+    resetSessionStoreForTests();
+
+    const stat = fs.stat.bind(fs);
+    const spy = vi.spyOn(fs, 'stat').mockImplementation((async (target, ...args) => {
+      if (String(target) === path.join(folder, 'events.jsonl')) throw Object.assign(new Error('locked'), { code: 'EBUSY' });
+      return stat(target, ...args);
+    }) as typeof fs.stat);
+    try {
+      await expect(getSession(session.id)).rejects.toThrow(/locked/);
+    } finally {
+      spy.mockRestore();
+    }
+
+    // Nothing was rewritten while the answer was unknown, so the session is simply itself again.
+    expect(await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8')).toBe(journalBefore);
+    expect(await fs.readFile(path.join(folder, 'meta.json'), 'utf8')).toBe(metaBefore);
+    resetSessionStoreForTests();
+    expect((await readEvents(session.id)).map(event => event.seq)).toEqual([1, 2]);
+    expect((await getSession(session.id))?.timelineTurns?.work).toMatchObject({ time: 100 });
+  });
+
+  /**
+   * An empty folder is not a session, and does not get a warning about one.
+   *
+   * `refusing to treat it as an empty session` was written for metadata that went missing under
+   * a session that still has its history. A folder with nothing in it says the same sentence,
+   * and it reached two bug reports that way: measured from a reporter's log on 2026-09-25, the
+   * same pair of warnings every few minutes for hours, both files simply absent, nothing lost
+   * and nothing for anybody to do about it.
+   */
+  it('says nothing about a session folder that holds nothing, and still reports one that lost its metadata', async () => {
+    const empty = path.join(sessionsRoot(), '2026-09-25-0000beef');
+    await fs.mkdir(empty, { recursive: true });
+    const log = vi.spyOn(console, 'warn');
+    try {
+      resetSessionStoreForTests();
+      expect(await getSession('2026-09-25-0000beef')).toBeNull();
+      const lines = getLog().filter(entry => entry.message.includes('2026-09-25-0000beef')).map(entry => entry.message);
+      expect(lines, `an empty folder was reported as a session: ${lines.join(' | ')}`).toHaveLength(0);
+
+      // The same folder with history and no metadata is the case the sentence was written for.
+      await fs.writeFile(path.join(empty, 'events.jsonl'),
+        `${JSON.stringify({ seq: 1, kind: 'note', time: 1, source: 'app', message: { text: 'kept', chars: 4, truncated: false } })}\n`);
+      resetSessionStoreForTests();
+      await getSession('2026-09-25-0000beef');
+      expect(getLog().some(entry => entry.message.includes('2026-09-25-0000beef') && /meta\.json absent/.test(entry.message))).toBe(true);
+    } finally {
+      log.mockRestore();
+      await fs.rm(empty, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * A file where a session folder should be is an answer, not a refusal.
+   *
+   * Anything with a session-shaped name in the history folder is read as a session — a stray
+   * file somebody dropped there, a leftover from a copy. Opening `<that file>/meta.json` fails
+   * with ENOTDIR, which is not a filesystem refusing to cooperate: there is no projection under
+   * a file and never was. Reporting it as unreadable would stop the catalog from being cached
+   * for the life of the process because of one thing that is not a session at all.
+   */
+  it('reads a file sitting where a session folder would be as simply absent', async () => {
+    const present = await createSession({ title: 'real session', conversationId: 'stray-neighbour' });
+    await flushSessions();
+    const stray = path.join(sessionsRoot(), '2026-09-25-deadbeef');
+    await fs.writeFile(stray, 'not a session');
+    try {
+      resetRecorderForTests();
+      resetSessionStoreForTests();
+      expect((await findSessionByConversation('stray-neighbour', { requireUnique: true }))?.id).toBe(present.id);
+      expect(await getSession('2026-09-25-deadbeef')).toBeNull();
+    } finally {
+      await fs.rm(stray, { force: true });
+    }
+  });
+
+  /**
+   * The three answers metadata can give, told apart.
+   *
+   * `refusing to treat it as an empty session` named neither the file's state nor whether the
+   * validated checkpoint beside it was usable, so #393 could not be read as either "your
+   * meta.json was truncated" or "this machine would not let the app read it" — which are a
+   * restore and a lock, and nothing a reader does about one helps the other.
+   */
+  it('recovers a damaged projection from its checkpoint and refuses an unreadable one', async () => {
+    const session = await createSession({ title: 'damaged projection', conversationId: 'damaged-projection' });
+    await appendEvent(session.id, { time: 100, source: 'extension', kind: 'turn_start', turnId: 'work' });
+    await flushSessions();
+    await appendEvent(session.id, { time: 200, source: 'extension', kind: 'turn_end', turnId: 'work', outcome: 'completed' });
+    await flushSessions();
+    const folder = path.join(sessionsRoot(), session.id);
+    expect((await fs.stat(path.join(folder, 'meta.backup.json'))).size).toBeGreaterThan(0);
+
+    // Truncated bytes are the session's own damage, and the checkpoint is what it is for.
+    await fs.writeFile(path.join(folder, 'meta.json'), '{"id":"damaged-pro');
+    resetRecorderForTests();
+    resetSessionStoreForTests();
+    expect((await getSession(session.id))?.title).toBe('damaged projection');
+
+    // A refusal to read is not damage, and may not be answered as "no such session".
+    resetSessionStoreForTests();
+    const readFile = fs.readFile.bind(fs);
+    const spy = vi.spyOn(fs, 'readFile').mockImplementation((async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
+      if (String(target).startsWith(path.join(folder, 'meta'))) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      return (readFile as (...input: unknown[]) => Promise<unknown>)(target, ...args);
+    }) as unknown as typeof fs.readFile);
+    try {
+      await expect(getSession(session.id)).rejects.toThrow(/EACCES/);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  /**
+   * One unreadable folder may not outlive the moment it was unreadable.
+   *
+   * The catalog is built once and kept for the life of the process — it answers ownership,
+   * retention and the newest resumable handoff — so a folder dropped from one sweep used to be
+   * missing from every later answer too. That is the shape #393 reports: the chats came back
+   * after a restart, because only the restart rebuilt the catalog.
+   */
+  it('does not keep a catalog that lost a folder to a read failure', async () => {
+    const present = await createSession({ title: 'readable', conversationId: 'catalog-readable' });
+    const blocked = await createSession({ title: 'blocked', conversationId: 'catalog-blocked' });
+    await flushSessions();
+    resetRecorderForTests();
+    resetSessionStoreForTests();
+
+    const folder = path.join(sessionsRoot(), blocked.id);
+    const readFile = fs.readFile.bind(fs);
+    const spy = vi.spyOn(fs, 'readFile').mockImplementation((async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
+      if (String(target).startsWith(path.join(folder, 'meta'))) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      return (readFile as (...input: unknown[]) => Promise<unknown>)(target, ...args);
+    }) as unknown as typeof fs.readFile);
+    try {
+      expect(await findSessionByConversation('catalog-readable', { requireUnique: true })).not.toBeNull();
+      expect(await findSessionByConversation('catalog-blocked', { requireUnique: true })).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The lock is gone, and so is the belief that the session was not there.
+    expect((await findSessionByConversation('catalog-blocked', { requireUnique: true }))?.id).toBe(blocked.id);
+    expect((await findSessionByConversation('catalog-readable', { requireUnique: true }))?.id).toBe(present.id);
+  });
+
+  /**
+   * The publishing rename may not outrun the bytes it publishes.
+   *
+   * `writeFile` then `rename` makes the *name* change atomically and says nothing about the
+   * contents: the entry can be in place while the data is still in the page cache, so an unclean
+   * shutdown in that window leaves a meta.json that exists and is empty — which is exactly the
+   * damage the recovery path above cannot undo, since a zero-length projection is no longer a
+   * projection of anything. Both the summary and the checkpoint it rotates are flushed first.
+   */
+  it('flushes a summary and its checkpoint before the rename that publishes them', async () => {
+    const steps: string[] = [];
+    const label = (file: unknown): string =>
+      String(file).includes('meta.backup.json') ? 'checkpoint' : String(file).includes('meta.json') ? 'summary' : '';
+    const open = fs.open.bind(fs);
+    const rename = fs.rename.bind(fs);
+    const openSpy = vi.spyOn(fs, 'open').mockImplementation((async (file, ...args) => {
+      const handle = await open(file as string, ...args as []);
+      const named = label(file);
+      if (named) {
+        const sync = handle.sync.bind(handle);
+        handle.sync = async () => { steps.push(`flush ${named}`); return sync(); };
+      }
+      return handle;
+    }) as typeof fs.open);
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation((async (from, to) => {
+      if (label(to)) steps.push(`publish ${label(to)}`);
+      return rename(from as string, to as string);
+    }) as typeof fs.rename);
+    try {
+      const session = await createSession({ title: 'durable summary' });
+      await appendEvent(session.id, { time: 100, source: 'extension', kind: 'turn_start', turnId: 'work' });
+      await flushSessions();
+    } finally {
+      openSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+    // The first write has no valid predecessor to keep; the second rotates one.
+    expect(steps.slice(0, 2)).toEqual(['flush summary', 'publish summary']);
+    expect(steps).toContain('flush checkpoint');
+    for (let i = 0; i < steps.length; i++) {
+      if (steps[i]!.startsWith('publish')) {
+        expect(steps.slice(0, i), `${steps[i]} was published unflushed`)
+          .toContain(`flush ${steps[i]!.slice('publish '.length)}`);
+      }
+    }
+  });
+
+  it.each([false, true])('keeps recovered replies in their original turn across bounded reads and legacy restart (%s)', async restart => {
+    const session = await createSession({ title: 'paged turn boundaries', conversationId: 'timeline-boundaries' });
+    const text = (value: string) => ({ text: value, chars: value.length, truncated: false });
+    await upsertMessageEvent(session.id, { kind: 'user_message', messageId: 'first-question', time: 90, source: 'extension', message: text('First question') });
+    const start = await appendEvent(session.id, { kind: 'turn_start', turnId: 'first', time: 100, source: 'extension' });
+    await appendEvent(session.id, { kind: 'progress', turnId: 'first', time: 120, source: 'app', message: text('First work') });
+    await appendEvent(session.id, { kind: 'turn_end', turnId: 'first', time: 180, source: 'extension', outcome: 'completed' });
+    await upsertMessageEvent(session.id, { kind: 'user_message', messageId: 'second-question', time: 200, source: 'extension', message: text('Second question') });
+    await appendEvent(session.id, { kind: 'turn_start', turnId: 'second', time: 210, source: 'extension' });
+    const work = await appendEvent(session.id, { kind: 'progress', turnId: 'second', time: 230, source: 'app', message: text('Second work') });
+    const recovered = await upsertMessageEvent(session.id, { kind: 'assistant_message', turnId: 'first', time: 290,
+      authoredAt: 150, messageId: 'first-reply', source: 'extension', message: text('Recovered first answer'), final: true });
+    await upsertMessageEvent(session.id, { kind: 'assistant_message', turnId: 'second', time: 280,
+      messageId: 'second-reply', source: 'extension', message: text('Second answer'), final: true });
+    await appendEvent(session.id, { kind: 'turn_end', turnId: 'second', time: 300, source: 'extension', outcome: 'completed' });
+    await flushSessions();
+    const folder = path.join(sessionsRoot(), session.id);
+    const journal = await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8');
+    const before = await readEvents(session.id);
+    const coordinates = (event: SessionEvent) => ({ seq: event.seq, position: positionOf(event), time: event.time, turnId: event.turnId });
+    const original = before.map(coordinates);
+    if (restart) {
+      resetRecorderForTests(); resetSessionStoreForTests();
+      for (const name of ['meta.json', 'meta.backup.json']) {
+        const file = path.join(folder, name);
+        const metadata = JSON.parse(await fs.readFile(file, 'utf8'));
+        delete metadata.timelineTurns;
+        await fs.writeFile(file, JSON.stringify(metadata));
+      }
+    }
+    const page = await readRecentEvents(session.id, 4, { orderByOrigin: true });
+    expect(page[0]).toMatchObject({ kind: 'assistant_message', messageId: 'first-reply',
+      seq: recovered.event.seq, origin: recovered.event.origin, time: 290, authoredAt: 150, turnId: 'first', turnOrigin: start.seq });
+    expect(page[1]?.seq).toBe(work.seq);
+    const full = await readEvents(session.id);
+    expect(full.map(coordinates)).toEqual(original);
+    for (const row of full) {
+      const older = await readRecentEvents(session.id, 3, { before: positionOf(row) + 1, orderByOrigin: true });
+      const keys = new Set(older.map(event => event.seq));
+      expect(older.map(event => event.seq)).toEqual(full.filter(event => keys.has(event.seq)).map(event => event.seq));
+    }
+    expect((await getSession(session.id))?.activeTurnId).toBeNull();
+    expect((await getSession(session.id))?.timelineTurns?.first).toEqual({ origin: start.seq, time: 100,
+      endTime: 180, endOrigin: 4, questionId: 'first-question' });
+    expect(await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8')).toBe(journal);
+  });
+
+  it.each([false, true])('keeps reloaded interim prose before later tools across every read path and restart (%s)', async restart => {
+    const session = await createSession({ title: 'native interim ordering', conversationId: 'interim-order' });
+    const working = '11111111-1111-4111-8111-111111111111';
+    const exchange = '22222222-2222-4222-8222-222222222222';
+    const parent = '33333333-3333-4333-8333-333333333333';
+    const text = (value: string) => ({ text: value, chars: value.length, truncated: false });
+    const start = await appendEvent(session.id, { kind: 'turn_start', source: 'extension', time: 100, turnId: 'working' });
+    await upsertMessageEvent(session.id, { kind: 'assistant_message', source: 'extension', time: 110,
+      messageId: `assistant:${parent}:${working}:${exchange}`, turnId: 'working', message: text('First update'), final: false });
+    const later = await appendEvent(session.id, { kind: 'tool_call', source: 'mcp', time: 150, turnId: 'working',
+      call: { callId: 'later-tool', tool: 'read', requestId: 'interim-request', conversationId: 'interim-order',
+        attribution: 'request_id', attributionMethod: 'request_id', args: text('{}'), result: text('ok'), outcome: 'ok', durationMs: 1,
+        summary: { kind: 'read', title: 'Later tool', tone: 'neutral' } } });
+    const interim = await upsertMessageEvent(session.id, { kind: 'assistant_message', source: 'extension', time: 140,
+      messageId: `assistant:${exchange}:${working}:${exchange}`, message: text('Second update'), final: false });
+    await flushSessions();
+    const folder = path.join(sessionsRoot(), session.id);
+    const journal = await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8');
+    const shardName = createHash('sha256').update(`assistant_message\u0000${interim.event.messageId}`).digest('hex') + '.json';
+    const shard = await fs.readFile(path.join(folder, 'messages', shardName), 'utf8');
+    if (restart) resetSessionStoreForTests();
+    const full = await readEvents(session.id);
+    expect(full.map(row => row.seq)).toEqual([start.seq, 2, interim.event.seq, later.seq]);
+    for (const page of [
+      await readRecentEvents(session.id, 2, { orderByOrigin: true }),
+      await readRecentEvents(session.id, 2, { after: 2, orderByOrigin: true }),
+      await readEvents(session.id, { from: 3, limit: 2 }),
+      (await readActivityEvents(session.id, 3, 2)).events
+    ]) {
+      expect(page.map(row => row.seq)).toEqual([interim.event.seq, later.seq]);
+      expect(page[0]).toMatchObject({ origin: interim.event.origin, time: 140, turnOrigin: start.seq });
+      expect(page[0]?.turnId).toBeUndefined();
+    }
+    const summary = await getSession(session.id);
+    expect(summary?.activeTurnId).toBe('working');
+    expect(summary?.lastAssistantFinalAt).toBeNull();
+    expect(await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8')).toBe(journal);
+    expect(await fs.readFile(path.join(folder, 'messages', shardName), 'utf8')).toBe(shard);
+  });
+
+  it('preserves the legacy authored position when a reload changes the provider timestamp for the same UUID', async () => {
+    const session = await createSession({ title: 'reload authored timestamp' });
+    const owner = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const providerMessageId = '11111111-2222-4333-8444-555555555555';
+    const message = { text: 'The recorded answer', chars: 19, truncated: false };
+    const first = await upsertMessageEvent(session.id, { kind: 'assistant_message', source: 'extension', final: true,
+      messageId: `assistant:${owner}:${owner}:1789662776481`, providerMessageId, time: 1789662900000, message });
+    const replay = await upsertMessageEvent(session.id, { kind: 'assistant_message', source: 'extension', final: true,
+      messageId: `assistant:${owner}:${owner}:1789662999999`, providerMessageId, time: 1789663000000,
+      authoredAt: 1789662999999, message }, { preferTime: true });
+    expect(replay.event).toMatchObject({ messageId: first.event.messageId, time: first.event.time,
+      origin: first.event.origin, authoredAt: 1789662776481 });
+    expect(await readEvents(session.id)).toHaveLength(1);
   });
 
   it('reorders late events only inside the durable turn that owns them', async () => {
@@ -898,6 +1369,26 @@ describe('session store', () => {
         summary: { title: 'Read a.ts', tone: 'neutral', kind: 'read' }
       }
     });
+    // A repaired historical call can be appended later even though it started earlier. It
+    // counts as an action, but it must not replace the latest-activity projection.
+    await appendEvent(summary.id, {
+      time: toolAt - 5,
+      source: 'mcp',
+      kind: 'tool_call',
+      call: {
+        callId: 'call-tool-clock-older',
+        tool: 'find',
+        attribution: 'request_id',
+        requestId: 'wfr-tool-clock-older',
+        conversationId: 'c-tool-clock',
+        attributionMethod: 'request_id',
+        args: { text: '{"query":"older"}', truncated: false, chars: 17 },
+        result: { text: 'ok', truncated: false, chars: 2 },
+        outcome: 'ok',
+        durationMs: 1,
+        summary: { title: 'Searched older history', tone: 'neutral', kind: 'search' }
+      }
+    });
     await appendEvent(summary.id, {
       time: laterAt,
       source: 'extension',
@@ -905,7 +1396,19 @@ describe('session store', () => {
       message: { text: 'later but not a tool call', truncated: false, chars: 25 }
     });
 
-    expect(await getSession(summary.id)).toMatchObject({ updatedAt: laterAt, lastToolCallAt: toolAt });
+    expect(await getSession(summary.id)).toMatchObject({
+      updatedAt: laterAt,
+      toolCalls: 2,
+      lastToolCallAt: toolAt,
+      lastToolActivity: { kind: 'read', title: 'Read a.ts' }
+    });
+    await flushSessions();
+    resetSessionStoreForTests();
+    expect(await getSession(summary.id)).toMatchObject({
+      toolCalls: 2,
+      lastToolCallAt: toolAt,
+      lastToolActivity: { kind: 'read', title: 'Read a.ts' }
+    });
   });
 
   /**
@@ -951,6 +1454,32 @@ describe('session store', () => {
     });
 
     expect((await getSession(summary.id))?.lastAssistantFinalAt).toBe(200);
+  });
+
+  it('keeps the final boundary when a reloaded page reports the same finished answer again', async () => {
+    const summary = await createSession({ title: 'final reread' });
+    const messageId = 'assistant-final-reread';
+    const final = (time: number, text: string, extra: { goalEligible?: boolean; providerMessageId?: string } = {}) =>
+      upsertMessageEvent(summary.id, {
+        time,
+        source: 'extension',
+        kind: 'assistant_message',
+        messageId,
+        message: { text, truncated: false, chars: text.length },
+        state: 'final',
+        final: true,
+        ...extra
+      });
+    await final(200, 'Finished.');
+
+    // ChatGPT redraws the same answer after a reload or a branch and the page learns more about
+    // it: a revision of the stored answer, not a new one.
+    expect((await final(900, 'Finished.', { goalEligible: true, providerMessageId: messageId })).changed).toBe(true);
+    expect((await getSession(summary.id))?.lastAssistantFinalAt).toBe(200);
+
+    // A final whose text changed is a new answer.
+    await final(1000, 'Finished, revised.');
+    expect((await getSession(summary.id))?.lastAssistantFinalAt).toBe(1000);
   });
 
   it('projects a successful worker finish report as the session finish boundary', async () => {
@@ -1004,7 +1533,7 @@ describe('session store', () => {
   });
 
   it.each(['completed', 'stopped'] as const)('does not restore an abandoned older turn after the latest turn %s', async (outcome) => {
-    const conversationId = 'c-restore-latest-terminal';
+    const conversationId = `c-restore-latest-terminal-${outcome}`;
     const opened = await recordChatObservations(conversationId, [
       { kind: 'turn_start', time: 10, turnId: 'g-abandoned' },
       { kind: 'turn_start', time: 20, turnId: 'g-latest' },
@@ -1721,8 +2250,9 @@ describe('handoff storage', () => {
 
   it('finds the newest handoff even when its session is beyond the 5,000-folder maintenance cap', async () => {
     const seed = await createSession({ title: 'handoff catalog seed' });
-    const seedSummary = await getSession(seed.id);
-    expect(seedSummary).not.toBeNull();
+    await flushSessions();
+    const seedSummary = JSON.parse(await fs.readFile(path.join(sessionsRoot(), seed.id, 'meta.json'), 'utf8'));
+    const seedStat = await fs.stat(path.join(sessionsRoot(), seed.id, 'meta.json'));
     resetSessionStoreForTests();
 
     const names = Array.from({ length: 5001 }, (_, index) => `handoff-${String(index).padStart(5, '0')}`);
@@ -1730,7 +2260,23 @@ describe('handoff storage', () => {
     const handoffId = '2026-08-24-deadbeef';
     const realReaddir = fs.readdir.bind(fs);
     const realReadFile = fs.readFile.bind(fs);
+    const realStat = fs.stat.bind(fs);
     const rootPath = sessionsRoot();
+    const virtualNames = new Set(names);
+    const virtualId = (file: string): string | null => {
+      const parts = path.relative(rootPath, file).split(path.sep);
+      return parts.length === 2 && virtualNames.has(parts[0]!) ? parts[0]! : null;
+    };
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(
+      (async (target: Parameters<typeof fs.stat>[0], ...args: unknown[]) => {
+        const file = String(target);
+        if (virtualId(file)) {
+          if (path.basename(file) === 'meta.json') return seedStat;
+          throw Object.assign(new Error('synthetic catalog has no message history'), { code: 'ENOENT' });
+        }
+        return (realStat as (...callArgs: unknown[]) => ReturnType<typeof fs.stat>)(target, ...args);
+      }) as typeof fs.stat
+    );
     const readdirSpy = vi.spyOn(fs, 'readdir').mockImplementation(
       (async (target: Parameters<typeof fs.readdir>[0], ...args: unknown[]) => {
         if (String(target) === rootPath) return names;
@@ -1740,8 +2286,8 @@ describe('handoff storage', () => {
     const readSpy = vi.spyOn(fs, 'readFile').mockImplementation(
       (async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
         const file = String(target);
-        const id = path.basename(path.dirname(file));
-        if (file.endsWith('meta.json') && id.startsWith('handoff-')) {
+        const id = virtualId(file);
+        if (path.basename(file) === 'meta.json' && id) {
           return JSON.stringify({
             ...seedSummary,
             id,
@@ -1751,7 +2297,7 @@ describe('handoff storage', () => {
             lastHandoffAt: id === targetId ? 20_000 : null
           });
         }
-        if (file.endsWith(`${path.sep}handoffs${path.sep}${handoffId}.json`)) {
+        if (file === path.join(rootPath, targetId, 'handoffs', `${handoffId}.json`)) {
           return JSON.stringify(handoff(targetId, handoffId, 20_000));
         }
         return (realReadFile as (...callArgs: unknown[]) => ReturnType<typeof fs.readFile>)(target, ...args);
@@ -1760,9 +2306,12 @@ describe('handoff storage', () => {
 
     try {
       expect((await latestHandoff())?.id).toBe(handoffId);
+      expect((await realReaddir(rootPath)).some(name => virtualNames.has(name))).toBe(false);
     } finally {
       readdirSpy.mockRestore();
       readSpy.mockRestore();
+      statSpy.mockRestore();
+      resetSessionStoreForTests();
       await deleteSession(seed.id);
     }
   }, 90_000);
@@ -1903,7 +2452,7 @@ describe('handoff storage', () => {
 
   it('asks for user-authoritative handoffs up to the documented 30k-token ceiling', () => {
     const prompt = nativeHandoffPrompt();
-    expect(prompt).toContain(HANDOFF_BRIEF_RULES);
+    expect(prompt).toContain(DEFAULT_HANDOFF_PROMPT);
     expect(prompt).toMatch(/user's messages as the highest-authority source/i);
     expect(prompt).toMatch(/10,000[–-]30,000 tokens/i);
     expect(prompt).toMatch(/~6,000-token brief is normally too short/i);
@@ -1914,6 +2463,36 @@ describe('handoff storage', () => {
     expect(prompt).toMatch(/FAILED \/ UNRESOLVED/i);
     expect(prompt).toMatch(/VERIFICATION/i);
     expect(prompt).toMatch(/completed and verified/i);
+  });
+
+  it('keeps continuation framing code-owned around an editable handoff prompt', () => {
+    const custom = 'CUSTOM HANDOFF POLICY: carry only the state needed for the next action.';
+    const prompt = nativeHandoffPrompt('abcdefghijklmnop', false, custom);
+    expect(prompt).toContain('[[CLF-HANDOFF:abcdefghijklmnop]]');
+    expect(prompt).toContain(custom);
+    expect(prompt).not.toContain(DEFAULT_HANDOFF_PROMPT);
+    expect(prompt).toContain('omit raw tool-call arguments and result bodies');
+    expect(prompt).toContain('Your reply to this message must be the brief itself and nothing else');
+    expect(prompt).toContain('no tool calls');
+  });
+
+  it('keeps the thorough default byte for byte and swaps only the length for a shorter brief (#995)', () => {
+    expect(nativeHandoffPrompt('token', true, DEFAULT_HANDOFF_PROMPT, 'thorough')).toBe(nativeHandoffPrompt('token', true));
+    const short = nativeHandoffPrompt('token', true, DEFAULT_HANDOFF_PROMPT, 'short');
+    expect(short).not.toMatch(/10,000[–-]30,000|10k[–-]30k|~6,000-token brief is normally too short|Never exceed 30,000/i);
+    expect(short).toMatch(/target roughly 2,000–6,000 tokens/);
+    expect(short).toContain('Length setting: aim for roughly 2,000–6,000 tokens and never exceed 6,000.');
+    // Everything else the brief must carry stays exactly as it was.
+    expect(short).toMatch(/user's messages as the highest-authority source/i);
+    expect(short).toMatch(/PLANNED \/ DECIDED/i);
+    const standard = nativeHandoffPrompt('token', true, DEFAULT_HANDOFF_PROMPT, 'standard');
+    expect(standard).toMatch(/target roughly 4,000–10,000 tokens/);
+    expect(standard).toContain('never exceed 10,000');
+    // An edited prompt has no default sentence to swap; the code-owned line still sets the length.
+    const custom = 'Carry only the state needed for the next action. Aim for about 20,000 tokens.';
+    const edited = nativeHandoffPrompt('token', true, custom, 'short');
+    expect(edited).toContain(custom);
+    expect(edited).toContain('This replaces any other length target in these instructions.');
   });
 
   it('honors the tool-detail setting in the handoff brief without claiming to erase seen history', () => {
@@ -2121,6 +2700,21 @@ describe('canonical recorder 1.8', () => {
     expect(await readEvents(retry.sessionId!, { kinds: ['chat_error'] })).toHaveLength(1);
   });
 
+  it('coalesces the same transport notice with Retry button text across document turns', async () => {
+    const conversationId = 'conv-error-retry-label';
+    const error = { kind: 'chat_error' as const, time: 100_000,
+      text: 'Message delivery timed out. Please try again.', recoverable: true, turnId: 'original' };
+    const first = await recordChatObservations(conversationId, [
+      { kind: 'user_message', messageId: 'question', text: 'Build', time: 90_000, authoredNow: true },
+      { ...error, text: `${error.text} Retry` }, { ...error, time: 100_100, turnId: undefined }
+    ]);
+    await flushSessions(); resetRecorderForTests(); resetSessionStoreForTests();
+    await recordChatObservations(conversationId, [{ ...error, time: 200_000, turnId: 'replacement' }]);
+    expect(await readEvents(first.sessionId!, { kinds: ['chat_error'] })).toHaveLength(1);
+    await recordChatObservations(conversationId, [{ ...error, time: 201_000, text: 'Connection interrupted' }]);
+    expect(await readEvents(first.sessionId!, { kinds: ['chat_error'] })).toHaveLength(2);
+  });
+
   it('keeps one exact Thinking failed notice across reload/restart beyond the burst window', async () => {
     const conversationId = 'conv-failed-header-reload';
     const error = { kind: 'chat_error' as const, time: 100_000, text: 'Thinking failed',
@@ -2278,8 +2872,9 @@ describe('canonical recorder 1.8', () => {
    * request id that starts after the reported end is proof the end was the page's, not
    * ChatGPT's. The recorder reopens the turn durably and lets the real end close it later.
    */
-  it('reopens a turn the page ended while its server turn kept calling tools', async () => {
-    const conversationId = 'conv-false-turn-end';
+  it.each(['completed', 'stopped', 'interrupted'] as const)('reopens a turn the page marked %s while its server turn kept calling tools', async outcome => {
+    const conversationId = `conv-false-turn-end-${outcome}`;
+    const sameRequest = `wfr_same_turn_${outcome}`, nextRequest = `wfr_next_turn_${outcome}`;
     const sessionId = await sessionForConversation(conversationId);
     const now = Date.now();
     const active = () => liveConversations().find((entry) => entry.conversationId === conversationId)?.activeTurnId ?? null;
@@ -2288,28 +2883,28 @@ describe('canonical recorder 1.8', () => {
       {
         kind: 'tool_evidence', time: now, fiberConversationId: conversationId,
         calls: [
-          { messageId: 'same-0', tool: 'read', order: 0, answered: false, requestId: 'wfr_same_turn' },
-          { messageId: 'next-0', tool: 'read', order: 1, answered: false, requestId: 'wfr_next_turn' }
+          { messageId: 'same-0', tool: 'read', order: 0, answered: false, requestId: sameRequest },
+          { messageId: 'next-0', tool: 'read', order: 1, answered: false, requestId: nextRequest }
         ]
       }
     ]);
-    await tool('wfr_same_turn', now + 10);
+    await tool(sameRequest, now + 10);
     expect(active()).toBe('g-false-end');
 
     await recordChatObservations(conversationId, [
-      { kind: 'turn_end', time: now + 20, turnId: 'g-false-end', outcome: 'completed' }
+      { kind: 'turn_end', time: now + 20, turnId: 'g-false-end', outcome }
     ]);
     expect(active()).toBeNull();
 
     // An in-flight call that merely finished late proves nothing about the end.
-    await tool('wfr_same_turn', now + 15);
+    await tool(sameRequest, now + 15);
     expect(active()).toBeNull();
     // Nor does a different server turn: that is a different turn.
-    await tool('wfr_next_turn', now + 30);
+    await tool(nextRequest, now + 30);
     expect(active()).toBeNull();
 
     // The same server turn calling on after the end is the turn not having ended.
-    await tool('wfr_same_turn', now + 40);
+    await tool(sameRequest, now + 40);
     expect(active()).toBe('g-false-end');
     const starts = await readEvents(sessionId!, { kinds: ['turn_start'] });
     expect(starts.map((event) => [event.turnId, event.source])).toEqual([
@@ -2319,7 +2914,7 @@ describe('canonical recorder 1.8', () => {
     expect(starts[1]?.kind === 'turn_start' && starts[1].detail).toMatch(/kept calling tools/);
 
     // Reopened once; the same turn going on is not news, and the real end is accepted.
-    await tool('wfr_same_turn', now + 50);
+    await tool(sameRequest, now + 50);
     expect(await readEvents(sessionId!, { kinds: ['turn_start'] })).toHaveLength(2);
     await recordChatObservations(conversationId, [
       { kind: 'turn_end', time: now + 60, turnId: 'g-false-end', outcome: 'completed' }
@@ -2327,6 +2922,42 @@ describe('canonical recorder 1.8', () => {
     expect(active()).toBeNull();
     const ends = await readEvents(sessionId!, { kinds: ['turn_end'] });
     expect(ends.map((event) => event.time)).toEqual([now + 20, now + 60]);
+  });
+
+  it.each(['continued-work', 'native-final'] as const)(
+    'reconciles a stopped response after recorder restart from %s', async evidenceKind => {
+    const conversationId = `conv-stop-restart-${evidenceKind}`;
+    const requestId = `wfr_stop_restart_${evidenceKind}`, turnId = 'stopped-before-restart';
+    const now = Date.now();
+    const { sessionId } = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: now, messageId: 'restart-question', text: 'Complete the task.' },
+      { kind: 'turn_start', time: now + 1, turnId },
+      { kind: 'tool_evidence', time: now + 2, turnId, fiberConversationId: conversationId,
+        calls: [{ messageId: 'restart-call', tool: 'read', order: 0, answered: false, requestId }] }
+    ]);
+    await tool(requestId, now + 3);
+    await recordChatObservations(conversationId, [{ kind: 'turn_end', time: now + 10, turnId, outcome: 'stopped' }]);
+    await flushSessions();
+    resetRecorderForTests();
+    resetSessionStoreForTests();
+    await sessionForConversation(conversationId);
+    // Restored exact request proof is supplied by a re-observed native call.
+    await recordChatObservations(conversationId, [{ kind: 'tool_evidence', time: now + 20, turnId,
+      fiberConversationId: conversationId,
+      calls: [{ messageId: 'restart-call', tool: 'read', order: 0, answered: true, requestId }] }]);
+    if (evidenceKind === 'continued-work') {
+      await tool(requestId, now + 21);
+      expect((await getSession(sessionId!))?.activeTurnId).toBe(turnId);
+    }
+    await recordChatObservations(conversationId, [{ kind: 'assistant_message', time: now + 30,
+      turnId, messageId: 'native-final-after-reload', providerMessageId: '11111111-2222-4333-8444-555555555555',
+      text: 'The full answer is available after reload.', state: 'final', final: true, activeNow: false }]);
+    const { readCompletedFinal } = await import('../src/main/session/store.js');
+    expect(await readCompletedFinal(sessionId!, conversationId, turnId))
+      .toMatchObject({ messageId: 'native-final-after-reload', turnId });
+    await tool(requestId, now + 31);
+    expect((await getSession(sessionId!))?.activeTurnId).toBeNull();
+    expect(await readCompletedFinal(sessionId!, conversationId, turnId)).not.toBeNull();
   });
 
   it('never cross-attributes concurrent same-tool calls from two chats', async () => {
@@ -2722,6 +3353,159 @@ describe('naming the chats this app opened', () => {
     expect((await getSession(opened.sessionId!))?.title).toBe('Actual request');
   });
 
+  it('names a chat this app opened after the request, not after ChatGPT\'s title for the instructions', async () => {
+    // Live: all 21 app-started chats were called "Coding Agent Instructions" or a variant.
+    const conversationId = 'desktop-provider-title';
+    await noteChatOrigin(conversationId, { kind: 'desktop', fromSessionId: null, agentId: null, task: '' });
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'conversation_title', time: Date.now(), text: 'Coding Agent Instructions' }
+    ]);
+    await upsertMessageEvent(opened.sessionId!, { kind: 'user_message', source: 'app', time: Date.now(),
+      messageId: 'desktop-opening', authoredText: 'Fix the flaky bridge test', message: { text: '[[COS_CONTEXT:10]]\nwire', chars: 23, truncated: false } });
+    expect((await getSession(opened.sessionId!))?.title).toBe('Fix the flaky bridge test');
+    await recordChatObservations(conversationId, [{ kind: 'conversation_title', time: Date.now(), text: 'Coding Agent Anleitung' }]);
+    expect((await getSession(opened.sessionId!))?.title).toBe('Fix the flaky bridge test');
+    await renameSession(opened.sessionId!, 'My own name');
+    expect((await getSession(opened.sessionId!))?.title).toBe('My own name');
+  });
+
+  it('clears a name back to ChatGPT\'s newest title, also after a restart (#1107)', async () => {
+    const conversationId = 'named-then-cleared';
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'conversation_title', time: Date.now(), text: 'First provider title' }
+    ]);
+    await renameSession(opened.sessionId!, 'My name');
+    await recordChatObservations(conversationId, [{ kind: 'conversation_title', time: Date.now(), text: 'Newer provider title' }]);
+    let summary = await getSession(opened.sessionId!);
+    expect(summary).toMatchObject({ title: 'My name', titleSource: 'manual', autoTitle: { title: 'Newer provider title', source: 'provider' } });
+    await flushSessions(); resetRecorderForTests(); resetSessionStoreForTests();
+    expect(await getSession(opened.sessionId!)).toMatchObject({ title: 'My name', autoTitle: { title: 'Newer provider title' } });
+    await clearSessionName(opened.sessionId!);
+    summary = await getSession(opened.sessionId!);
+    expect(summary).toMatchObject({ title: 'Newer provider title', titleSource: 'provider' });
+    expect(summary?.autoTitle).toBeUndefined();
+    // ChatGPT names it again from here on.
+    await recordChatObservations(conversationId, [{ kind: 'conversation_title', time: Date.now(), text: 'Latest provider title' }]);
+    expect((await getSession(opened.sessionId!))?.title).toBe('Latest provider title');
+  });
+
+  it('clears a name to the title the chat had by its own rules: request, first message or worker task (#1107)', async () => {
+    // A chat this app opened: named by its request, and ChatGPT's instructions title never wins.
+    const desktop = 'named-desktop';
+    await noteChatOrigin(desktop, { kind: 'desktop', fromSessionId: null, agentId: null, task: '' });
+    const opened = await recordChatObservations(desktop, [{ kind: 'conversation_title', time: Date.now(), text: 'Coding Agent Instructions' }]);
+    await upsertMessageEvent(opened.sessionId!, { kind: 'user_message', source: 'app', time: Date.now(),
+      messageId: 'named-desktop-opening', authoredText: 'Fix the flaky bridge test', message: { text: '[[COS_CONTEXT:10]]\nwire', chars: 23, truncated: false } });
+    await renameSession(opened.sessionId!, 'Bridge work');
+    await recordChatObservations(desktop, [{ kind: 'conversation_title', time: Date.now(), text: 'Coding Agent Anleitung' }]);
+    await clearSessionName(opened.sessionId!);
+    expect((await getSession(opened.sessionId!))?.title).toBe('Fix the flaky bridge test');
+
+    // A chat with no title from ChatGPT yet: its first message.
+    const plain = await recordChatObservations('named-plain', [
+      { kind: 'user_message', time: Date.now(), text: 'why is the bridge flaky', messageId: 'named-plain-1' }
+    ]);
+    await renameSession(plain.sessionId!, 'Flaky bridge');
+    await clearSessionName(plain.sessionId!);
+    expect(await getSession(plain.sessionId!)).toMatchObject({ title: 'why is the bridge flaky', titleSource: 'fallback' });
+
+    // A worker: its task title, also when the origin is stamped while it carries a name.
+    const work = await recordChatObservations('named-worker', [
+      { kind: 'user_message', time: Date.now(), text: 'bootstrap', messageId: 'named-worker-boot' }
+    ]);
+    await renameSession(work.sessionId!, 'My worker');
+    await noteChatOrigin('named-worker', worker);
+    expect((await getSession(work.sessionId!))?.title).toBe('My worker');
+    await clearSessionName(work.sessionId!);
+    expect((await getSession(work.sessionId!))?.title).toBe('worker-1 · Port the recorder tests to the new fixture');
+  });
+
+  it('repairs a stored instructions title of an app-opened chat on cold read', async () => {
+    const session = await createSession({ conversationId: 'desktop-stored-provider', title: 'Temporary' });
+    await upsertMessageEvent(session.id, { kind: 'user_message', source: 'app', time: Date.now(),
+      messageId: 'desktop-stored-opening', authoredText: 'Plan the release', message: { text: '[[COS_CONTEXT:10]]\nwire', chars: 23, truncated: false } });
+    await flushSessions(); resetSessionStoreForTests();
+    const metaPath = path.join(sessionsRoot(), session.id, 'meta.json');
+    const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+    Object.assign(meta, { title: 'Coding Agent Instructions', titleSource: 'provider', origin: { kind: 'desktop', fromSessionId: null, agentId: null, task: '' } });
+    await fs.writeFile(metaPath, JSON.stringify(meta));
+    expect((await getSession(session.id))?.title).toBe('Plan the release');
+  });
+
+  it('never takes a project page title as the chat name and repairs one already stored', async () => {
+    const conversationId = 'project-page-title';
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: Date.now(), text: 'Fix the homelab backup', messageId: 'project-user' }
+    ]);
+    await recordChatObservations(conversationId, [{ kind: 'conversation_title', time: Date.now(), text: 'ChatGPT - Homelab Development' }]);
+    expect((await getSession(opened.sessionId!))?.title).toBe('Fix the homelab backup');
+    await recordChatObservations(conversationId, [{ kind: 'conversation_title', time: Date.now(), text: 'Homelab Backup Fix' }]);
+    expect((await getSession(opened.sessionId!))?.title).toBe('Homelab Backup Fix');
+
+    // Stored by a build before the filter: repaired on the next cold read.
+    const stored = await createSession({ conversationId: 'stored-project-title', title: 'Temporary' });
+    await upsertMessageEvent(stored.id, { kind: 'user_message', source: 'app', time: Date.now(),
+      messageId: 'stored-project-user', authoredText: 'Plan the NAS migration', message: { text: 'Plan the NAS migration', chars: 22, truncated: false } });
+    await flushSessions(); resetSessionStoreForTests();
+    const metaPath = path.join(sessionsRoot(), stored.id, 'meta.json');
+    const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+    Object.assign(meta, { title: 'ChatGPT - Homelab Development', titleSource: 'provider' });
+    await fs.writeFile(metaPath, JSON.stringify(meta));
+    expect((await getSession(stored.id))?.title).toBe('Plan the NAS migration');
+  });
+
+  it('hides a leftover Plan helper and names a message-less project page chat after its project', async () => {
+    const legacy = async (conversationId: string, patch: Record<string, unknown>) => {
+      const session = await createSession({ conversationId, title: 'Temporary' });
+      await flushSessions(); resetSessionStoreForTests();
+      const metaPath = path.join(sessionsRoot(), session.id, 'meta.json');
+      const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+      Object.assign(meta, patch); delete meta.origin;
+      await fs.writeFile(metaPath, JSON.stringify(meta));
+      return { id: session.id, metaPath };
+    };
+    const planner = await legacy('legacy-planner', { title: 'You are a task planner, not the executor. Produce 2 to 12 substantial workflow stages', titleSource: 'provider' });
+    const project = await legacy('tools-only-project', { title: 'ChatGPT - Homelab Development' });
+    const manual = await legacy('manual-project-name', { title: 'ChatGPT - My own name', titleSource: 'manual' });
+    // The chat list is read first, as in the app: it must already be repaired, without any of these
+    // sessions having been opened.
+    const listed = await listSessions();
+    expect(listed.map(row => row.id)).not.toContain(planner.id);
+    expect(listed.find(row => row.id === project.id)?.title).toBe('Homelab Development');
+    expect(listed.find(row => row.id === manual.id)?.title).toBe('ChatGPT - My own name');
+    expect((await getSession(planner.id))?.origin?.kind).toBe('helper');
+    // Repaired once, on disk: the next cold start serves the fixed labels from the fast path.
+    expect(JSON.parse(await fs.readFile(project.metaPath, 'utf8')).title).toBe('Homelab Development');
+    expect(JSON.parse(await fs.readFile(planner.metaPath, 'utf8')).origin?.kind).toBe('helper');
+    // Hidden, never deleted: the recording stays on disk.
+    await expect(fs.stat(planner.metaPath)).resolves.toBeTruthy();
+  });
+
+  it('repairs those labels on recordings shaped like the real ones from September', async () => {
+    // Real leftovers carry a user message: a Plan helper's is the planner instructions themselves,
+    // and an old project page chat has an ordinary request but no stored title source.
+    const legacy = async (conversationId: string, message: string, patch: Record<string, unknown>) => {
+      const session = await createSession({ conversationId, title: 'Temporary' });
+      await upsertMessageEvent(session.id, { kind: 'user_message', source: 'extension', time: Date.now(),
+        messageId: `${conversationId}-user`, message: { text: message, chars: message.length, truncated: false } });
+      await flushSessions(); resetSessionStoreForTests();
+      const metaPath = path.join(sessionsRoot(), session.id, 'meta.json');
+      const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+      Object.assign(meta, patch); delete meta.origin;
+      if (!('titleSource' in patch)) delete meta.titleSource;
+      await fs.writeFile(metaPath, JSON.stringify(meta));
+      return { id: session.id, metaPath };
+    };
+    const instructions = 'You are a task planner, not the executor. Produce 2 to 12 substantial workflow stages.';
+    const planner = await legacy('sept-planner', instructions, { title: 'You are a task planner, not the executor', titleSource: 'provider' });
+    const project = await legacy('sept-project-page', 'Check the desktop and browser automation', { title: 'ChatGPT - Homelab Development' });
+    const listed = await listSessions();
+    expect(listed.map(row => row.id)).not.toContain(planner.id);
+    expect(listed.find(row => row.id === project.id)?.title).toBe('Check the desktop and browser automation');
+    expect(JSON.parse(await fs.readFile(planner.metaPath, 'utf8')).origin?.kind).toBe('helper');
+    expect(JSON.parse(await fs.readFile(project.metaPath, 'utf8')).title).toBe('Check the desktop and browser automation');
+  });
+
   it('repairs a legacy context preview on cold read using durable authored text', async () => {
     const raw = '[[COS_CONTEXT:19268]]\nInternal instructions and AGENTS.md '.repeat(3);
     const session = await createSession({ conversationId: 'legacy-context-preview', title: 'Temporary' });
@@ -2735,6 +3519,29 @@ describe('naming the chats this app opened', () => {
     expect((await listSessions()).find(row => row.id === session.id)?.title).toBe('Only my request');
     expect((await getSession(session.id))?.title).toBe('Only my request');
     expect(JSON.parse(await fs.readFile(metaPath, 'utf8')).titleSource).toBe('fallback');
+  });
+
+  it('keeps the complete sent prompt weight when the page later projects only authored user text', async () => {
+    const session = await createSession({ conversationId: 'wire-context-weight', title: 'Wire context weight' });
+    const authored = 'Inspect the project.';
+    const instructions = 'Internal executor guidance. '.repeat(500);
+    const wire = `[[COS_CONTEXT:${instructions.length}]]\n${instructions}\n[[/COS_CONTEXT]]\n\n${authored}`;
+    const wireTokens = estimateTokens(wire);
+    await upsertMessageEvent(session.id, {
+      kind: 'user_message', source: 'app', time: 100, messageId: 'wire-user', authoredText: authored,
+      wireTokenEstimate: wireTokens, message: { text: wire, chars: wire.length, truncated: false }
+    });
+    const before = (await getSession(session.id))!.contextTokens;
+    await upsertMessageEvent(session.id, {
+      kind: 'user_message', source: 'extension', time: 101, messageId: 'wire-user',
+      message: { text: authored, chars: authored.length, truncated: false }
+    });
+    const after = (await getSession(session.id))!.contextTokens;
+    const [stored] = await readEvents(session.id, { kinds: ['user_message'] });
+    expect(after).toBe(before);
+    expect(stored).toMatchObject({ kind: 'user_message', authoredText: authored, wireTokenEstimate: wireTokens,
+      message: { text: authored } });
+    expect(stored && eventTokens(stored)).toBeGreaterThan(estimateTokens(authored));
   });
 
   it('does not persist native file credentials in recorded artifact arguments', async () => {
@@ -3321,13 +4128,13 @@ describe('folding redrawn commentary', () => {
       message: { text, truncated: false, chars: text.length }
     }) as SessionEvent;
 
-  it('reconciles a stored Stop status from its exact stopped turn without moving or duplicating the row', () => {
+  it('keeps a Stop request truthful when the page reports stopped without a final answer', () => {
     const pending: SessionEvent = { ...progress(2, 'finish-release:stop-one', 'Stop requested. ChatGPT has not yet confirmed that generation stopped.'), source: 'app', turnId: 'stop-one' };
     const stopped: SessionEvent = { seq: 4, time: 4, source: 'extension', kind: 'turn_end', turnId: 'stop-one', outcome: 'stopped' };
     const rows = [pending, stopped];
     const folded = foldProgress(rows);
     expect(folded).toHaveLength(2);
-    expect(folded[0]).toMatchObject({ seq: 2, time: 2, progressId: 'finish-release:stop-one', turnId: 'stop-one', message: { text: 'Stopped. ChatGPT confirmed that generation stopped.', truncated: false } });
+    expect(folded[0]).toEqual(pending);
     expect(foldProgress(folded)).toEqual(folded);
     expect(pending.kind === 'progress' && pending.message.text).toContain('not yet confirmed');
   });
@@ -3424,4 +4231,28 @@ describe('activity windows', () => {
     // tick and the extension's thirty-second alarm floor.
     expect(CHAT_ACTIVE_MS - CHAT_SILENCE_MS).toBeGreaterThanOrEqual(60_000);
   });
+});
+
+it('ships the long-standing handoff brief rules as the editable default, unchanged', () => {
+  // Making the prompt editable must not quietly change Compact & Resume for everyone who never
+  // opens the editor: the default is the brief the app has always asked for.
+  expect(DEFAULT_HANDOFF_PROMPT).toContain('target roughly 10,000–30,000 tokens');
+  for (const heading of ['TASK —', 'USER SPECIFICATION —', 'CURRENT STATE —', 'DONE —', 'IN PROGRESS —', 'PLANNED / DECIDED —',
+    'FAILED / UNRESOLVED —', 'FILES —', 'VERIFICATION —', 'ENVIRONMENT —', 'NEXT —', 'DO NOT —']) {
+    expect(DEFAULT_HANDOFF_PROMPT, heading).toContain(heading);
+  }
+});
+
+it('persists worker presentation independently of broker retention and rejects stale or foreign projections', async () => {
+  const session = await createSession({ conversationId: 'archive-worker', title: 'Original',
+    origin: { kind: 'worker', fromSessionId: null, agentId: 'worker-1', task: 'Original task' } });
+  const assignment = { conversationId: 'archive-worker', agentId: 'worker-1', label: 'Review', task: 'New task', recordedAt: 20 };
+  await recordWorkerAssignment(assignment);
+  await recordWorkerAssignment({ ...assignment, label: 'Stale', recordedAt: 10 });
+  await recordWorkerAssignment({ ...assignment, agentId: 'worker-2', label: 'Foreign', recordedAt: 30 });
+  await flushSessions(); resetSessionStoreForTests();
+  const restored = await getSession(session.id);
+  expect(restored?.workerAssignment).toEqual(assignment);
+  expect(restored?.origin?.task).toBe('Original task');
+  expect(restored?.title).toBe('Original');
 });

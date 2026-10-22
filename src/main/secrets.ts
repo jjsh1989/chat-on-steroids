@@ -13,6 +13,7 @@ import path from 'node:path';
 import { safeStorage } from 'electron';
 import type { SecureStorageInfo } from '../shared/types.js';
 import { logError, logWarn } from './logger.js';
+import { afterKeychainRead, beforeKeychainRead } from './keychain-notice.js';
 
 const FILE_NAME = 'secrets.bin';
 const LINUX_BASIC_TEXT_PREFIX = Buffer.from('v10', 'ascii');
@@ -22,8 +23,35 @@ let secretsPath = '';
 let cache: Record<string, string> | null = null;
 /** A successful decrypt asked us to reseal the blob with the current async key. */
 let rotationPending = false;
+/**
+ * True after a read found a file that working secure storage could not turn back into keys:
+ * the key is gone (keychain reset, profile copied to another computer) or the file is damaged.
+ * Every mutation then fails closed, which used to be a dead end. A keychain that is only locked
+ * can look the same, so nothing is done about it unless the person asks
+ * (`setAsideUnreadableSecrets`), and even then only after one more attempt to read it.
+ */
+let unreadable = false;
+const UNAVAILABLE = 'Secure OS credential storage is unavailable, so the key was not saved';
+const UNREADABLE = 'The saved keys could not be read, so the key was not saved';
+
+export function storedSecretsUnreadable(): boolean {
+  return unreadable;
+}
 /** Invalidates a decrypt that started before an explicit store reset/delete boundary. */
 let loadGeneration = 0;
+/** Counts every change to the stored secrets this process sees, read or written. */
+let revision = 0;
+function setCache(values: Record<string, string> | null): void {
+  cache = values;
+  revision += 1;
+}
+/**
+ * Changes whenever the stored secrets may have: lets a cache scoped to a credential notice a new
+ * one without keeping the credential or anything derived from it.
+ */
+export function secretsRevision(): number {
+  return revision;
+}
 /**
  * Coalesces concurrent cache misses into one disk/keyring read.
  *
@@ -62,7 +90,7 @@ function enqueue<T>(operation: () => Promise<T>): Promise<T> {
  * drafts, one per active provider), so they live under the same OS-backed encrypted blob
  * as the rest and never leave the main process.
  */
-export type SecretKey = 'openaiApiKey' | 'bridgeToken' | 'openRouterApiKey' | 'customProviderApiKey' | `plugin:${string}` | `setup:${string}`;
+export type SecretKey = 'openaiApiKey' | 'bridgeToken' | 'openRouterApiKey' | 'customProviderApiKey' | `plugin:${string}` | `setup:${string}` | `mcp:path:${string}`;
 
 export function initSecretsPath(userDataDir: string): void {
   secretsPath = path.join(userDataDir, FILE_NAME);
@@ -83,9 +111,40 @@ export function secureStorageCiphertextIsProtected(
   return platform !== 'linux' || !encrypted.subarray(0, LINUX_BASIC_TEXT_PREFIX.length).equals(LINUX_BASIC_TEXT_PREFIX);
 }
 
+/**
+ * Every safeStorage call goes through here. The first one sets up Electron's encryptor, which on
+ * macOS reads the key from the Keychain, and after an update that read waits on the password
+ * prompt; keychain-notice.ts lets the window say so before it starts.
+ */
+let keychainCallsInFlight = 0;
+
+/**
+ * Whether a safeStorage call is still waiting on the Keychain, typically on the macOS password
+ * prompt after an update. Quitting reads this: Chromium's own teardown waits for that read, so
+ * `app.exit()` never returns while the prompt is open.
+ */
+export function keychainReadPending(): boolean {
+  return keychainCallsInFlight > 0;
+}
+
+async function keychain<T>(operation: () => Promise<T>, ok: (result: T) => boolean = () => true): Promise<T> {
+  await beforeKeychainRead();
+  keychainCallsInFlight += 1;
+  try {
+    const result = await operation();
+    void afterKeychainRead(ok(result));
+    return result;
+  } catch (error) {
+    void afterKeychainRead(false);
+    throw error;
+  } finally {
+    keychainCallsInFlight -= 1;
+  }
+}
+
 export async function secureStorageStatus(platform: NodeJS.Platform = process.platform): Promise<SecureStorageInfo> {
   try {
-    if (!(await safeStorage.isAsyncEncryptionAvailable())) {
+    if (!(await keychain(() => safeStorage.isAsyncEncryptionAvailable(), available => available))) {
       return {
         available: false,
         detail:
@@ -99,7 +158,7 @@ export async function secureStorageStatus(platform: NodeJS.Platform = process.pl
     if (platform === 'linux') {
       // Probe the provider Electron actually chose, not only the desktop/backend label above.
       // The probe contains no credential and is never persisted.
-      const probe = await safeStorage.encryptStringAsync(LINUX_STORAGE_PROBE);
+      const probe = await keychain(() => safeStorage.encryptStringAsync(LINUX_STORAGE_PROBE));
       if (!secureStorageCiphertextIsProtected(probe, platform)) {
         return {
           available: false,
@@ -155,21 +214,24 @@ async function loadAll(): Promise<Record<string, string>> {
       // there is no supported secure Linux v10 format to migrate here.
       logWarn('Stored Linux credentials use Electron’s insecure hard-coded-key fallback; the file was left untouched');
       rotationPending = false;
+      unreadable = true;
       return {};
     }
-    const decrypted = await safeStorage.decryptStringAsync(blob);
+    const decrypted = await keychain(() => safeStorage.decryptStringAsync(blob));
     const parsed = parseSecretStore(decrypted.result);
     // `deleteAllSecrets()` is allowed to race a Keychain decrypt without waiting for a prompt or
     // unavailable provider. Once deletion starts, plaintext from the older generation must never
     // republish credentials that have just been removed from disk.
     if (generation !== loadGeneration) return cache ?? {};
-    cache = parsed;
+    setCache(parsed);
+    unreadable = false;
     rotationPending = decrypted.shouldReEncrypt;
   } catch (err) {
     if (generation !== loadGeneration) return cache ?? {};
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT') {
-      cache = {};
+      setCache({});
+      unreadable = false;
       rotationPending = false;
     } else {
       // Electron's async API can reject while a key provider is temporarily unavailable, but
@@ -186,10 +248,11 @@ async function loadAll(): Promise<Record<string, string>> {
           : 'Stored credentials are temporarily unavailable because secure storage could not decrypt them'
       );
       rotationPending = false;
+      unreadable = available;
       return {};
     }
   }
-  return cache;
+  return cache ?? {};
 }
 
 async function readAll(): Promise<Record<string, string>> {
@@ -208,7 +271,7 @@ async function writeAll(values: Record<string, string>): Promise<void> {
   if (!(await isEncryptionAvailable())) {
     throw new Error('Secure OS credential storage is unavailable, so the key was not saved');
   }
-  const blob = await safeStorage.encryptStringAsync(JSON.stringify(values));
+  const blob = await keychain(() => safeStorage.encryptStringAsync(JSON.stringify(values)));
   if (!secureStorageCiphertextIsProtected(blob)) {
     throw new Error('Secure OS credential storage is unavailable, so the key was not saved');
   }
@@ -218,7 +281,7 @@ async function writeAll(values: Record<string, string>): Promise<void> {
   await fs.rename(tmp, secretsPath);
   // Published only once the rename succeeded. A failed disk write must leave the
   // process believing the old state, not a credential it never actually saved.
-  cache = values;
+  setCache(values);
   rotationPending = false;
 }
 
@@ -248,10 +311,25 @@ async function rotateIfNeeded(): Promise<void> {
   });
 }
 
+/**
+ * API keys never contain whitespace or invisible characters, but a copied key can carry one that
+ * trim() keeps, such as a soft hyphen (U+00AD) or NEL (U+0085). OpenRouter then reads
+ * "Bearer \u00ADsk-…" as "Missing Authentication header" (#577). Removing them when a key is
+ * stored and when it is read also heals a key stored before this check existed.
+ */
+const INVISIBLE_IN_KEYS = /[\s\u0085\u00AD\u180E\u200B-\u200F\u2028-\u202F\u205F-\u2064\u2066-\u206F\uFEFF]/g;
+function isApiKey(key: SecretKey): boolean {
+  return key === 'openaiApiKey' || key === 'openRouterApiKey' || key === 'customProviderApiKey' || key.startsWith('setup:');
+}
+export function cleanApiKey(value: string): string {
+  return value.replace(INVISIBLE_IN_KEYS, '');
+}
+
 export async function getSecret(key: SecretKey): Promise<string | null> {
   const all = await readAll();
-  const value = all[key];
+  const stored = all[key];
   await rotateIfNeeded();
+  const value = stored && isApiKey(key) ? cleanApiKey(stored) : stored;
   return value && value.length > 0 ? value : null;
 }
 
@@ -271,11 +349,9 @@ export function setSecret(key: SecretKey, value: string): Promise<void> {
     // Keychain/Secret Service is unavailable. A mutation must never compose from that view:
     // if the read did not establish an authoritative cache, writing it would replace real
     // encrypted credentials with a partial/empty blob after a transient unlock race.
-    if (cache === null) {
-      throw new Error('Secure OS credential storage is unavailable, so the key was not saved');
-    }
+    if (cache === null) throw new Error(unreadable ? UNREADABLE : UNAVAILABLE);
     const all = { ...current };
-    const trimmed = value.trim();
+    const trimmed = isApiKey(key) ? cleanApiKey(value) : value.trim();
     if (trimmed === '') {
       delete all[key];
     } else {
@@ -296,10 +372,11 @@ export function deleteAllSecrets(): Promise<void> {
     // view instead of resurrecting the deleted credentials into cache.
     loadGeneration += 1;
     rotationPending = false;
-    cache = null;
+    setCache(null);
     try {
       await fs.rm(secretsPath, { force: true });
-      cache = {};
+      setCache({});
+      unreadable = false;
     } catch (err) {
       logError(`Could not remove stored credentials: ${(err as Error).message}`);
       throw err;
@@ -307,10 +384,34 @@ export function deleteAllSecrets(): Promise<void> {
   });
 }
 
+/**
+ * The way out of an unreadable file, taken only when the person asks for it: the file is renamed
+ * and kept, and the store starts empty. Returns the backup's name, or null when the file could
+ * be read after all (a keychain that was only locked) and nothing was changed.
+ */
+export function setAsideUnreadableSecrets(now: Date = new Date()): Promise<string | null> {
+  return enqueue(async () => {
+    if (!(await isEncryptionAvailable())) throw new Error('Secure OS credential storage is unavailable, so nothing was changed');
+    if (cache === null) await readAll();
+    if (cache !== null || !unreadable) return null;
+    const stamp = now.toISOString().replace(/[^0-9]/g, '');
+    const name = `secrets.unreadable-${stamp.slice(0, 8)}-${stamp.slice(8, 14)}-${stamp.slice(14, 17)}.bin`;
+    // A decrypt still under way must not publish the old file's contents afterwards.
+    loadGeneration += 1;
+    rotationPending = false;
+    await fs.rename(secretsPath, path.join(path.dirname(secretsPath), name));
+    setCache({});
+    unreadable = false;
+    logWarn(`Stored credentials could not be read; at the user's request the file was set aside as ${name}`);
+    return name;
+  });
+}
+
 /** Test seam: forgets the decrypted blob so the next read comes from disk. */
 export function resetSecretsCacheForTests(): void {
   loadGeneration += 1;
-  cache = null;
+  unreadable = false;
+  setCache(null);
   rotationPending = false;
   loadInFlight = null;
 }

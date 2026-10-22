@@ -43,6 +43,9 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 public static class Clf {
+  // The app's own process. Its windows stay out of every window lookup, as on macOS, where the
+  // backend runs inside the app and skips its own process id.
+  public static uint OwnPid = 0;
   [StructLayout(LayoutKind.Sequential)]
   struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr dwExtraInfo; }
   [StructLayout(LayoutKind.Sequential)]
@@ -332,6 +335,7 @@ public static class Clf {
     if (!GetWindowRect(h, out r) || r.Right - r.Left <= 0 || r.Bottom - r.Top <= 0) return "";
     uint pid;
     GetWindowThreadProcessId(h, out pid);
+    if (OwnPid != 0 && pid == OwnPid) return ""; // CoS's own windows are not listed or targeted.
     string[] identity = CosWindowsAppIdentity.Read(handle, pid);
     if (identity[0].Length == 0) return ""; // Unknown app identity cannot be targeted by the window API.
     string proc = System.IO.Path.GetFileNameWithoutExtension(identity[1]);
@@ -456,17 +460,39 @@ public static class Clf {
     if (IsIconic(h)) ShowWindow(h, 9);
     uint dummy;
     uint fore = GetWindowThreadProcessId(GetForegroundWindow(), out dummy);
+    uint target = GetWindowThreadProcessId(h, out dummy);
     uint self = GetCurrentThreadId();
-    bool attached = fore != 0 && fore != self && AttachThreadInput(self, fore, true);
+    var attached = new List<Tuple<uint, uint>>();
+    Action<uint, uint> attach = (from, to) => {
+      if (from == 0 || to == 0 || from == to) return;
+      foreach (var pair in attached)
+        if ((pair.Item1 == from && pair.Item2 == to) || (pair.Item1 == to && pair.Item2 == from)) return;
+      if (AttachThreadInput(from, to, true)) attached.Add(Tuple.Create(from, to));
+    };
     try {
+      attach(self, fore);
+      attach(self, target);
+      attach(fore, target);
       return SetForegroundWindow(h);
     } finally {
-      if (attached) AttachThreadInput(self, fore, false);
+      for (int i = attached.Count - 1; i >= 0; i--)
+        AttachThreadInput(attached[i].Item1, attached[i].Item2, false);
     }
   }
 
   public static long ForegroundId() {
     return GetForegroundWindow().ToInt64();
+  }
+
+  /**
+   * Windows lets a background process take the foreground only right after it sent input. A
+   * long-running helper otherwise loses to the window in front, such as this app's own window the
+   * person just sent from: a Store app (Calculator, Settings) behind it stayed FOCUS_FAILED
+   * (Windows VM, 2026-10-21). A zero-distance relative move is input with no visible effect. A
+   * refused SendInput (an elevated window in front) leaves the activation to fail as before.
+   */
+  public static bool NudgeForeground() {
+    try { Send(new INPUT[] { Mouse(MOUSEEVENTF_MOVE, 0, 0, 0) }); return true; } catch { return false; }
   }
 
   /**
@@ -513,6 +539,10 @@ ${WINDOWS_APP_IDENTITY_SOURCE}
 
 ${WINDOWS_CAPTURE_BOOTSTRAP}
 
+# The app passes its process id so its own windows are never listed or targeted. A helper
+# started without it, as in tests, sees every window.
+if ($env:COS_APP_PID -match '^[0-9]+$') { [Clf]::OwnPid = [uint32]$env:COS_APP_PID }
+
 # Requests arrive as one JSON object per stdin line. The process stays alive, so the
 # expensive Add-Type/C# compilation above happens once instead of on every MCP call.
 # Model-supplied text is data parsed by ConvertFrom-Json and is never evaluated as
@@ -550,22 +580,35 @@ function Get-ScreenRect {
 
 function Try-Focus([int64]$id) {
   if ([Clf]::InputIsFocused($id)) { return $true }
-  $null = [Clf]::Focus($id)
-  # Activation is asynchronous for some windows. Confirm the actual foreground state and
-  # stop as soon as it lands, including when SetForegroundWindow returned false. That
-  # immediate result does not replace the target's actual foreground postcondition.
-  $timer = [Diagnostics.Stopwatch]::StartNew()
-  do {
-    if ([Clf]::InputIsFocused($id)) { return $true }
-    Start-Sleep -Milliseconds 10
-  } while ($timer.ElapsedMilliseconds -lt 250)
+  # A second attempt follows one input nudge: Windows refuses a background helper the
+  # foreground until it has sent input (see NudgeForeground).
+  # The app logs each note (desktop focus: …) from the reply's focusNotes.
+  $nudged = $false
+  foreach ($attempt in 0, 1) {
+    if ($attempt -eq 1) { $nudged = [Clf]::NudgeForeground() }
+    $null = [Clf]::Focus($id)
+    # Activation is asynchronous for some windows. Confirm the actual foreground state and
+    # stop as soon as it lands, including when SetForegroundWindow returned false. That
+    # immediate result does not replace the target's actual foreground postcondition.
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+      if ([Clf]::InputIsFocused($id)) {
+        if ($attempt -eq 1 -and $null -ne $script:FocusNotes) { [void]$script:FocusNotes.Add("window $id came forward only after an input nudge; Windows refused the first activation") }
+        return $true
+      }
+      Start-Sleep -Milliseconds 10
+    } while ($timer.ElapsedMilliseconds -lt 250)
+  }
+  if ($null -ne $script:FocusNotes) {
+    [void]$script:FocusNotes.Add($(if ($nudged) { "window $id stayed behind after a retry with an input nudge" } else { "window $id stayed behind; Windows refused the input nudge (an elevated window may be in front)" }))
+  }
   return $false
 }
 
 function Assert-Focused([int64]$id) {
   if (-not (Try-Focus $id)) {
     $foreground = [Clf]::ForegroundId()
-    throw "FOCUS_FAILED: requested $id but foreground is $foreground after asking Windows to activate it. Another window is holding focus; click it away or retry."
+    throw "FOCUS_FAILED: requested $id but foreground is $foreground after asking Windows to activate it. Inspect list_windows and the target's owned dialogs before retrying."
   }
 }
 
@@ -858,10 +901,14 @@ function Find-UiElements($request) {
         $matches = $matches -and (-not $role -or $control.ToLowerInvariant().Contains($role))
         if ($matches) {
           $r = $current.BoundingRectangle
-          if ($r.Width -gt 0 -and $r.Height -gt 0) {
+          $hasBounds = $r.Width -gt 0 -and $r.Height -gt 0 -and -not [double]::IsInfinity($r.X) -and -not [double]::IsInfinity($r.Y)
+          $availableActions = @()
+          try { $availableActions = @(Get-UiActions $element $current) } catch { }
+          # UIA Invoke/Toggle/Select/Scroll can work without a drawable rectangle,
+          # for example in minimized windows or virtualized lists. Retain their
+          # exact semantic identity; zero bounds never authorize a physical click.
+          if ($hasBounds -or $availableActions.Count -gt 0) {
             $runtimeKey = Ui-RuntimeKey $element
-            $availableActions = @()
-            try { $availableActions = @(Get-UiActions $element $current) } catch { }
             $entry = @{
               runtimeKey = $runtimeKey
               name = $name
@@ -872,10 +919,10 @@ function Find-UiElements($request) {
               focused = [bool]$current.HasKeyboardFocus
               depth = $depth
               actions = $availableActions
-              bounds = @{
+              bounds = if ($hasBounds) { @{
                 x = [int][Math]::Round($r.X); y = [int][Math]::Round($r.Y)
                 width = [int][Math]::Round($r.Width); height = [int][Math]::Round($r.Height)
-              }
+              } } else { @{ x = 0; y = 0; width = 0; height = 0 } }
             }
             try {
               $selected = $element.GetCachedPropertyValue([System.Windows.Automation.SelectionItemPattern]::IsSelectedProperty, $true)
@@ -887,7 +934,7 @@ function Find-UiElements($request) {
             # Select within this traversal, then read just one provider. Browser
             # toolbar editors precede the page and must never become document_text.
             # Native editors remain useful when no Document provider is observed.
-            $priority = if ($current.IsPassword) { 0 }
+            $priority = if (-not $hasBounds -or $current.IsPassword) { 0 }
               elseif ($control -eq 'Document') { 3 }
               elseif ($browserDocument) { 0 }
               elseif ($current.HasKeyboardFocus) { 2 }
@@ -965,7 +1012,7 @@ function Capture-Target($request, [Nullable[int64]]$forcedWindow) {
     $w = [int]$request.region.width; $h = [int]$request.region.height
   } elseif ($null -ne $id) {
     try { $r = [Clf]::Rect([int64]$id) -split ',' } catch {
-      throw "WINDOW_NOT_FOUND: window $id is no longer open, so there is nothing to capture. Call observe what=windows for the current windows."
+      throw "WINDOW_NOT_FOUND: window $id is no longer open, so there is nothing to capture. Call list_windows for the current windows."
     }
     $x = [int]$r[0]; $y = [int]$r[1]; $w = [int]$r[2]; $h = [int]$r[3]
     $windowGeometry = @{ x = $x; y = $y; width = $w; height = $h }
@@ -1132,8 +1179,17 @@ function Handle-Request($request) {
         $result.relatedWindows = @([Clf]::RelatedWindows($id) | ForEach-Object { Convert-WindowRow $_ })
       }
       if ($request.includeScreenshot) {
-        $capture = Capture-Target $request ([Nullable[int64]]$id)
-        foreach ($key in $capture.Keys) { $result[$key] = $capture[$key] }
+        try {
+          $capture = Capture-Target $request ([Nullable[int64]]$id)
+          foreach ($key in $capture.Keys) { $result[$key] = $capture[$key] }
+        } catch {
+          $message = $_.Exception.GetBaseException().Message
+          # A missing compositor surface does not invalidate this window's UIA provider.
+          # Keep both channels in this transaction; never restore/focus the user's window.
+          # Geometry, identity and screenshot-only failures still require a fresh observation.
+          if (-not $request.includeUi -or $message -notmatch '^CAPTURE_FAILED:') { throw }
+          $result.screenshotUnavailable = @{ code = 'CAPTURE_FAILED'; message = $message.Substring(0, [Math]::Min(500, $message.Length)) }
+        }
       }
       if ($request.includeUi) {
         $uiRequest = @{
@@ -1158,6 +1214,9 @@ function Handle-Request($request) {
           $result.uiUnavailable = @{ code = 'UIA_FAILED'; message = $_.Exception.Message }
           $result.elements = @()
         }
+      }
+      if ($result.screenshotUnavailable -and $result.uiUnavailable) {
+        throw ($result.screenshotUnavailable.message + '; UIA_FAILED: ' + $result.uiUnavailable.message)
       }
     }
     'focus' {
@@ -1264,8 +1323,10 @@ function Handle-Request($request) {
   return $result
 }
 
+$script:FocusNotes = New-Object 'System.Collections.Generic.List[string]'
 while (($line = [Console]::In.ReadLine()) -ne $null) {
   if ([string]::IsNullOrWhiteSpace($line)) { continue }
+  $script:FocusNotes.Clear()
   try {
     $request = $line | ConvertFrom-Json
     $reply = Handle-Request $request
@@ -1278,6 +1339,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
     }
     $reply = @{ ok = $false; error_code = $code; message = $message }
   }
+  if ($script:FocusNotes.Count -gt 0 -and $reply -is [hashtable]) { $reply.focusNotes = @($script:FocusNotes) }
   [Console]::Out.WriteLine(($reply | ConvertTo-Json -Depth 8 -Compress))
   [Console]::Out.Flush()
 }

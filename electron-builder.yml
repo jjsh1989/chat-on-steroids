@@ -13,6 +13,13 @@ files:
   - package.json
   - '!node_modules/@img/sharp-*/**/*'
   - '!node_modules/@img/sharp-libvips-*/**/*'
+  - '!node_modules/@koromix/koffi-*/**/*'
+  - '!node_modules/koffi/build/**/*'
+  # PDF.js is bundled into the renderer (including its worker). Its optional @napi-rs/canvas
+  # dependency is a Node-only fallback and is neither imported nor needed by the Electron UI.
+  - '!node_modules/pdfjs-dist/**/*'
+  - '!node_modules/@napi-rs/canvas/**/*'
+  - '!node_modules/@napi-rs/canvas-*/**/*'
   # node-pty prefers build/Release over prebuilds. npm may leave a host-native build there,
   # which would silently override the target prebuild in a cross-arch package.
   - '!node_modules/node-pty/build/**/*'
@@ -32,6 +39,12 @@ extraResources:
     to: LICENSE.electron.txt
   - from: node_modules/electron/dist/LICENSES.chromium.html
     to: LICENSES.chromium.html
+  - from: pets
+    to: pets
+    filter:
+      - '*/pet.json'
+      - '*/atlas.png'
+      - '*/animations.json'
   - from: extension
     to: extension
     filter:
@@ -44,6 +57,7 @@ npmRebuild: false
 afterPack: scripts/afterpack-macos-adhoc-seal.mjs
 
 asarUnpack:
+  - '**/node_modules/@koromix/koffi-*/**'
   - '**/node_modules/node-pty/**'
   - '**/node_modules/sharp/**'
   - '**/node_modules/@img/**'
@@ -77,6 +91,9 @@ win:
 
 nsis:
   include: scripts/windows-installer-acl.nsh
+  # Drawn by scripts/make-icon.mjs from the app icon: the installer an update shows is CoS's own.
+  installerHeader: build/installerHeader.bmp
+  installerSidebar: build/installerSidebar.bmp
   oneClick: false
   perMachine: false
   buildUniversalInstaller: false
@@ -98,6 +115,7 @@ mac:
   extendInfo:
     NSUserNotificationAlertStyle: alert
     NSScreenCaptureUsageDescription: Chat On Steroids captures a display or window only when the enabled Desktop connector asks to observe it.
+    NSLocalNetworkUsageDescription: Chat On Steroids connects to devices and services on your local network when you run approved tools or commands.
   # v2.0.2 intentionally ships unsigned/unnotarized macOS artifacts. Make that policy
   # deterministic instead of depending on whatever identities or Apple env vars happen to be
   # present on a hosted runner. Remove these two lines when real signing credentials are wired.

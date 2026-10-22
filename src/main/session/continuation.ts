@@ -43,15 +43,16 @@
  * ended while the write was in flight — and a run that no longer exists has no prime left in
  * chat A to be inconsistent with.
  *
- * The state is flipped to `committing` *synchronously*, before the first await, so two
- * replacement chats racing to commit cannot both pass the check; the loser is refused and
- * the winner's failure restores the state for a retry. Nothing else may move the state
+ * The commit owner is reserved synchronously, before its durable state is published, so two
+ * replacement chats racing to commit cannot both pass the check. Checkpoint serialization
+ * also orders cancellation against that write. Nothing else may move the state
  * backwards out of `committing` — see {@link claimContinuationNow}, which is monotonic for
  * exactly that reason.
  */
 
 import { randomBytes } from 'node:crypto';
-import { isReasoningEffort, type Handoff, type ReasoningEffort } from '../../shared/session.js';
+import { isProModel } from '../../shared/chat-models.js';
+import { continuationMarkerOf, isReasoningEffort, type Handoff, type ReasoningEffort } from '../../shared/session.js';
 import { logInfo, logWarn } from '../logger.js';
 import {
   PRIME_ID,
@@ -65,9 +66,9 @@ import {
 import { clearChatWorkspace, moveChatWorkspace, workspaceForChat } from '../workspace.js';
 import { clearGoalObjective, clearGoalSwitch, goalObjectiveFor, goalSwitchFor, moveGoalObjective, moveGoalSwitch, retireGoalDraftsFor } from '../goal.js';
 import { writeDurableNow, writeDurableSoon } from '../durable.js';
-import { prepareHandoff, resumeBootstrapMatches } from './handoff.js';
+import { handoffContinuationId, handoffMatchesContinuation, prepareHandoff, resumeBootstrapMatches } from './handoff.js';
 import { ensureHandoffRecorded, recordHandoff, recordNote, rebindConversation } from './recorder.js';
-import { endResumeClaim, noteResumeClaim, resetResumeGate } from './resume-gate.js';
+import { endResumeClaim, noteResumeClaim, noteResumeDispatch, resetResumeGate } from './resume-gate.js';
 import {
   ensureCommittedResumeHandoff,
   findSessionByConversation,
@@ -88,6 +89,27 @@ import {
 export const CONTINUATION_TTL_MS = 10 * 60_000;
 
 /**
+ * The normal writing deadline for a manual handoff brief.
+ *
+ * The browser gets three recovery pickups five minutes apart while ChatGPT is writing the
+ * brief. Keep this phase open long enough for all three attempts plus a reconnect window;
+ * once a brief is captured, app-paced phases return to CONTINUATION_TTL_MS.
+ */
+export const CONTINUATION_WRITING_TTL_MS = 30 * 60_000;
+
+/**
+ * The longer writing deadline for a manual ticket whose frozen source selection is Pro.
+ *
+ * Pro reasoning is not part of the visible transcript, so a brief it spends twenty minutes
+ * thinking about produces no text growth and never renews `touchedAt` — the ordinary clock
+ * then sweeps a perfectly healthy generation as "took too long". Only the `awaiting-summary`
+ * phase uses this: once the brief is captured, opening chat B is app-paced work that keeps
+ * the ordinary clock. An unobserved (null) selection keeps the ordinary clock too, because
+ * unknown identity never widens a deadline.
+ */
+export const CONTINUATION_PRO_WRITING_TTL_MS = 60 * 60_000;
+
+/**
  * How long an automatic handover may run once it has actually been asked for.
  *
  * An auto-compaction ticket has no clock while it is only intended: the chat may be mid-turn
@@ -106,7 +128,7 @@ export type ContinuationState =
   | 'awaiting-chat'
   /** A replacement chat has claimed it and is being opened. */
   | 'claimed'
-  /** The rebind is in flight. Set synchronously so two commits cannot race. */
+  /** The durable commit intent has landed; the rebind is in flight. */
   | 'committing'
   | 'committed'
   | 'aborted';
@@ -131,7 +153,17 @@ export interface ContinuationSendCheckpoint {
   state: ContinuationSendState;
   /** ChatGPT's stable server-authored user-message id, once the marked prompt is visible. */
   messageId: string | null;
+  /**
+   * Source only, from the dispatch: the chat's newest user message just before the click, and
+   * when the click was armed. A later document that still shows that same message as the newest
+   * proves the click never reached ChatGPT (see releaseUndeliveredSourceDispatchNow).
+   */
+  before?: string | null;
+  dispatchedAt?: number;
 }
+
+/** How long after the armed click a document may prove that ChatGPT never received it. */
+export const SOURCE_UNDELIVERED_AFTER_MS = 15_000;
 
 export interface ContinuationDestinationCheckpoint extends ContinuationSendCheckpoint {
   /** Chat B, learned from the page that contains the marked bootstrap message. */
@@ -194,7 +226,9 @@ interface Continuation {
    * compaction itself as an eligible turn, stopped it, and started another one.
    *
    * Renewed only by real forward progress. A token that has genuinely gone quiet for a full TTL
-   * still expires, so this lengthens nothing for a stalled handoff.
+   * still expires, so this lengthens nothing for a stalled handoff. Pro reasoning is not visible
+   * text, so it produces no growth to renew on: while a Pro brief is being written the deadline
+   * itself is longer instead — see CONTINUATION_PRO_WRITING_TTL_MS.
    */
   touchedAt: number;
   sourceProgress: number;
@@ -209,7 +243,7 @@ interface Continuation {
   /**
    * The capture in flight, or the settled one. The single-flight lock for {@link attachSummary}.
    */
-  capture: Promise<Handoff> | null;
+  capture: Promise<Handoff | null> | null;
   /**
    * The stored handoff, kept so a repeated capture can be answered with the same success.
    *
@@ -403,6 +437,8 @@ export interface ContinuationRecoveryHooks {
    * repair hook; ordinary callers must never receive a model-callable adoption path.
    */
   repairPrimeTransfer?: (fromConversationId: string, toConversationId: string) => boolean;
+  /** Whether a sub-agent fleet is led from this chat: only then is a missed move worth a word. */
+  hasPrimeFleet?: (conversationId: string) => boolean;
 }
 
 let recoveryHooks: ContinuationRecoveryHooks = {};
@@ -456,14 +492,27 @@ const handoffAsked = (entry: Continuation): boolean =>
   entry.sourceSend.state === 'sent';
 
 /**
+ * The waiting deadline for a manual ticket. The extended budget exists only while its brief
+ * is being written: later phases are app-paced and keep the ordinary clock.
+ */
+const manualWaitingTtlMs = (state: ContinuationState, requested: RequestedModel | null): number =>
+  state === 'awaiting-summary'
+    ? requested !== null && isProModel(requested.model, requested.reasoningEffort ?? undefined)
+      ? CONTINUATION_PRO_WRITING_TTL_MS
+      : CONTINUATION_WRITING_TTL_MS
+    : CONTINUATION_TTL_MS;
+
+/**
  * Whether a nonterminal continuation has outlived its wait. A manual one gets
- * CONTINUATION_TTL_MS from opening; an automatic one has no clock until it is asked for and
- * AUTOMATIC_HANDOVER_TTL_MS from then.
+ * CONTINUATION_TTL_MS from its last sign of progress after the brief is captured;
+ * CONTINUATION_WRITING_TTL_MS while an ordinary manual brief is being written;
+ * CONTINUATION_PRO_WRITING_TTL_MS while a Pro brief is being written. An automatic one has no
+ * clock until it is asked for and AUTOMATIC_HANDOVER_TTL_MS from then.
  */
 const expired = (entry: Continuation, now = Date.now()): boolean =>
   entry.automatic
     ? entry.askedAt !== null && now - entry.askedAt >= AUTOMATIC_HANDOVER_TTL_MS
-    : now - entry.touchedAt >= CONTINUATION_TTL_MS;
+    : now - entry.touchedAt >= manualWaitingTtlMs(entry.state, entry.requestedModel);
 
 const isOpen = (entry: Continuation): boolean =>
   entry.state !== 'committed' && entry.state !== 'aborted' && !expired(entry);
@@ -475,7 +524,7 @@ function sweep(): void {
     // that is about to land — the write would still complete, on a transaction that had been
     // declared dead and had released the very handover it was carrying. The deadline applies
     // to *waiting*, and once the durable phase starts there is nothing left to wait for.
-    if (entry.state === 'committing') continue;
+    if (entry.state === 'committing' || commitLocks.has(entry.token) || checkpointLocks.has(entry.token)) continue;
     if (entry.state === 'committed' || entry.state === 'aborted') {
       // Kept briefly so a repeated ack can be answered with "already done" rather than with
       // a fresh transaction, then forgotten.
@@ -496,6 +545,15 @@ export function continuationForSession(sessionId: string): ContinuationView | nu
   sweep();
   for (const entry of byToken.values()) {
     if (entry.sessionId === sessionId && isOpen(entry)) return view(entry);
+  }
+  return null;
+}
+
+/** The still-open transfer intent for a source chat, including a ticket before its brief Send. */
+export function continuationForSourceConversation(conversationId: string): ContinuationView | null {
+  sweep();
+  for (const entry of byToken.values()) {
+    if (entry.from === conversationId && isOpen(entry)) return view(entry);
   }
   return null;
 }
@@ -779,8 +837,9 @@ export async function openContinuationNow(
 
 async function withCheckpointLock<T>(token: string, work: () => Promise<T>): Promise<T> {
   const prior = checkpointLocks.get(token);
-  if (prior) await prior.catch(() => undefined);
-  const current = work();
+  // Reserve each waiter immediately; several callers must not all resume from the
+  // same predecessor and overwrite one another's staged durable transition.
+  const current = prior ? prior.then(work, work) : work();
   checkpointLocks.set(token, current);
   try {
     return await current;
@@ -828,16 +887,49 @@ export async function beginContinuationSourceSendNow(
  * have reached ChatGPT — the click happens first and acceptance is observed seconds later — so
  * this app never offers the prompt again. The transaction ends at ChatGPT's marker or a cancel.
  */
-export async function dispatchContinuationSourceSendNow(token: string): Promise<boolean> {
+export async function dispatchContinuationSourceSendNow(token: string, before?: string | null): Promise<boolean> {
   return withCheckpointLock(token, async () => {
     const entry = byToken.get(token);
     if (!entry || !isOpen(entry) || entry.state !== 'awaiting-summary') return false;
     if (entry.sourceSend.state !== 'attempted-unresolved') return false;
     await transitionNow(entry, (current) => ({
       ...current,
-      sourceSend: { state: 'dispatched-unresolved', messageId: null }
+      sourceSend: {
+        state: 'dispatched-unresolved', messageId: null,
+        before: typeof before === 'string' && before ? before.slice(0, 200) : null,
+        dispatchedAt: Date.now()
+      }
     }));
     return true;
+  });
+}
+
+/**
+ * Hands an armed source Send back when ChatGPT provably never received it.
+ *
+ * The dispatch fence is never replayed on doubt, and its only ends were ChatGPT's marker or a
+ * cancel. A click that never reached ChatGPT has no marker, so the handoff waited forever with
+ * nothing on screen (measured 2026-10-10: a manual Compact & resume stayed `awaiting-summary` across
+ * an app restart and three pickups). The proof is ChatGPT's own history: a document loaded after
+ * the click, once ChatGPT is idle, shows the marked prompt as the newest user message if it was
+ * accepted. Still showing the very message that was newest before the click means it was not,
+ * so the fence returns to `attempted-unresolved` and the next Send is the first one.
+ */
+export async function releaseUndeliveredSourceDispatchNow(
+  token: string, newestUserMessage: string | null, documentSince: number
+): Promise<ContinuationSendCheckpoint | null> {
+  return withCheckpointLock(token, async () => {
+    const entry = byToken.get(token);
+    if (!entry || !isOpen(entry) || entry.state !== 'awaiting-summary') return null;
+    const send = entry.sourceSend;
+    if (send.state !== 'dispatched-unresolved' || typeof send.before !== 'string' || !send.before ||
+        typeof send.dispatchedAt !== 'number' || newestUserMessage !== send.before ||
+        !(documentSince > send.dispatchedAt) || Date.now() - send.dispatchedAt < SOURCE_UNDELIVERED_AFTER_MS) return null;
+    await transitionNow(entry, (current) => ({
+      ...current,
+      sourceSend: { state: 'attempted-unresolved', messageId: null }
+    }));
+    return { ...entry.sourceSend };
   });
 }
 
@@ -932,6 +1024,7 @@ export async function dispatchContinuationDestinationSendNow(token: string): Pro
       ...current,
       destinationSend: { state: 'dispatched-unresolved', conversationId: null, messageId: null }
     }));
+    noteResumeDispatch(entry.token, entry.sessionId);
     return true;
   });
 }
@@ -966,6 +1059,7 @@ export async function releaseContinuationDestinationSendNow(token: string, unatt
       claimedBy: null,
       destinationSend: { state: 'not-attempted', conversationId: null, messageId: null }
     }));
+    endResumeClaim(entry.token);
     return true;
   });
 }
@@ -991,7 +1085,11 @@ export async function bindContinuationDestinationMessageNow(
         entry.destinationSend.messageId === messageId
       );
     }
-    if (!isOpen(entry)) return false;
+    // B's first attributed tool call can commit the transaction before the page reports the
+    // message it typed. Recording that message for the committed destination moves nothing, and
+    // it is the resume boundary the page feed needs (where A's rows stop).
+    const committedHere = entry.state === 'committed' && entry.to === conversationId;
+    if (!isOpen(entry) && !committedHere) return false;
     if (entry.destinationSend.state !== 'dispatched-unresolved') return false;
     await transitionNow(entry, (current) => ({
       ...current,
@@ -1021,9 +1119,57 @@ export async function attachSummary(token: string, text: string): Promise<Handof
   return capture(token, brief, async (entry) =>
     prepareHandoff({
       sessionId: entry.sessionId,
-      text: brief
+      text: brief,
+      continuationToken: entry.token,
+      sourceConversationId: entry.from,
+      sourceTurnId: entry.sourceTurnId
     })
   );
+}
+
+/** The plan notice prepareHandoff appends; a reused brief gets the current one instead. */
+const PLAN_NOTICE_HEAD = '\n\nSaved task plan at handoff (reported progress, not verification evidence):\n';
+
+/**
+ * Opens a new Compact & Resume from the summary an abandoned one already captured (#1215).
+ *
+ * The summary was written by ChatGPT for this session's current chat, so no new compaction
+ * prompt goes there: the source send is recorded as sent, which is what produced that summary.
+ * The brief then goes through {@link attachSummary} as a fresh handoff bound to this
+ * continuation, so its provenance, recording and restart recovery are the ordinary ones, and
+ * the replacement chat is claimed and committed exactly as after any capture. Refused (null)
+ * unless it is the session's latest handoff, written in its current chat, with nothing open.
+ */
+export async function reopenWithHandoffNow(sessionId: string, handoffId: string): Promise<ContinuationView | null> {
+  sweep();
+  const session = await getSession(sessionId);
+  if (!session?.conversationId || session.lastHandoffId !== handoffId) return null;
+  if ([...byToken.values()].some((entry) => entry.sessionId === sessionId && isOpen(entry))) return null;
+  const saved = await readHandoff(sessionId, handoffId);
+  if (!saved || (saved.provenance && saved.provenance.sourceConversationId !== session.conversationId)) return null;
+  const cut = saved.text.lastIndexOf(PLAN_NOTICE_HEAD);
+  const brief = (cut >= 0 ? saved.text.slice(0, cut) : saved.text).trim();
+  if (!brief) return null;
+  // Chat B belongs beside chat A: reuse the Project the abandoned run carried, when it is still known.
+  const prior = saved.provenance?.continuationId
+    ? [...byToken.values()].find((entry) => handoffContinuationId(entry.token) === saved.provenance?.continuationId)
+    : undefined;
+  const opened = await openContinuationNow(sessionId, session.conversationId, false, prior?.project ?? null);
+  const entry = byToken.get(opened.token);
+  if (!entry || opened.state !== 'awaiting-summary') return null;
+  const marked = await withCheckpointLock(entry.token, async () => {
+    if (!isOpen(entry) || entry.state !== 'awaiting-summary' || entry.sourceSend.state !== 'not-attempted') return false;
+    await transitionNow(entry, (current) => ({ ...current, sourceSend: { state: 'sent', messageId: null } }));
+    return true;
+  });
+  if (!marked) return null;
+  const handoff = await attachSummary(entry.token, brief);
+  if (!handoff) {
+    await abortContinuationNow(entry.token, 'the saved summary could not be stored again');
+    return null;
+  }
+  logInfo(`continuation ${entry.token.slice(0, 8)} reopened from handoff ${handoffId} as ${handoff.id}`);
+  return view(entry);
 }
 
 /**
@@ -1055,7 +1201,8 @@ async function capture(
         entry.sessionId,
         entry.handoff.id,
         entry.handoff.text.length,
-        'compact and resume'
+        'compact and resume',
+        entry.token
       );
     } catch (err) {
       // The WAL already committed this handoff. A retry is another chance to repair the
@@ -1071,21 +1218,26 @@ async function capture(
   if (entry.state !== 'awaiting-summary') return null;
   entry.capture = (async () => {
     const handoff = await produce(entry);
-    await transitionNow(entry, (current) => ({
-      ...current,
-      summary: handoff.text,
-      handoffId: handoff.id,
-      state: 'awaiting-chat',
-      error: null
-    }));
+    const accepted = await withCheckpointLock(token, async () => {
+      if (!isOpen(entry) || entry.state !== 'awaiting-summary') return false;
+      await transitionNow(entry, (current) => ({
+        ...current,
+        summary: handoff.text,
+        handoffId: handoff.id,
+        state: 'awaiting-chat',
+        error: null
+      }));
+      entry.handoff = handoff;
+      return true;
+    });
+    if (!accepted) return null;
     // The handoff file was written before the continuation WAL record, but it is deliberately
     // *not* in the session timeline yet. The WAL is the semantic commit for this capture: only
     // after it lands may `lastHandoffId` advertise the brief to unrelated recovery callers.
     // This closes the old inverse ordering where a rejected WAL transition had already made
     // its handoff discoverable and the retry produced a second handoff.
-    entry.handoff = handoff;
     try {
-      await recordHandoff(entry.sessionId, handoff.id, handoff.text.length, 'compact and resume');
+      await recordHandoff(entry.sessionId, handoff.id, handoff.text.length, 'compact and resume', entry.token);
     } catch (err) {
       // The continuation is already durable and can safely proceed. Recovery has the handoff
       // id in that WAL and repairs this presentation/discovery event idempotently on restart.
@@ -1107,7 +1259,7 @@ async function capture(
  * again" — rather than a resolved null for one and a rejected promise for the others, which
  * would surface to a retrying page as a tool error for a step that merely has to be redone.
  */
-async function settle(entry: Continuation, capture: Promise<Handoff>): Promise<Handoff | null> {
+async function settle(entry: Continuation, capture: Promise<Handoff | null>): Promise<Handoff | null> {
   try {
     return await capture;
   } catch (err) {
@@ -1140,21 +1292,33 @@ async function settle(entry: Continuation, capture: Promise<Handoff>): Promise<H
  */
 export async function claimContinuationNow(token: string, claimant: string): Promise<{ summary: string } | null> {
   sweep();
-  const entry = byToken.get(token);
-  if (!entry || !isOpen(entry)) return null;
-  if (entry.state === 'awaiting-summary') return null;
-  if (entry.claimedBy !== null && entry.claimedBy !== claimant) return null;
-  if (entry.state === 'awaiting-chat') {
-    await transitionNow(entry, (current) => ({ ...current, claimedBy: claimant, state: 'claimed' }));
-  } else if (entry.state === 'claimed' && entry.claimedBy === null) {
-    await transitionNow(entry, (current) => ({ ...current, claimedBy: claimant }));
+  // A retry by the current claimant is read-only while its commit owns the write.
+  const committing = byToken.get(token);
+  if (committing && commitLocks.has(token) && isOpen(committing) && committing.claimedBy === claimant) {
+    return { summary: committing.summary };
   }
-  // After the transition, never before it. A throw here leaves nothing claimed, and arming
-  // first would have made every unrelated new chat wait out the window for a claim that
-  // does not exist.
-  if (entry.state === 'claimed') noteResumeClaim(entry.token);
-  // A same-owner redeem racing a commit is read-only. `committing` remains monotonic.
-  return { summary: entry.summary };
+  return withCheckpointLock(token, async () => {
+    const entry = byToken.get(token);
+    if (!entry || !isOpen(entry)) return null;
+    if (entry.state === 'awaiting-summary') return null;
+    if (entry.claimedBy !== null && entry.claimedBy !== claimant) return null;
+    if (entry.state === 'awaiting-chat') {
+      await transitionNow(entry, (current) => ({ ...current, claimedBy: claimant, state: 'claimed' }));
+    } else if (entry.state === 'claimed' && entry.claimedBy === null) {
+      await transitionNow(entry, (current) => ({ ...current, claimedBy: claimant }));
+    }
+    // After the transition, never before it. A throw here leaves nothing claimed, and arming
+    // first would have made every unrelated new chat wait out the window for a claim that
+    // does not exist.
+    if (entry.state === 'claimed') {
+      if (entry.destinationSend.state === 'dispatched-unresolved' || entry.destinationSend.state === 'sent') {
+        noteResumeDispatch(entry.token, entry.sessionId);
+      } else {
+        noteResumeClaim(entry.token);
+      }
+    }
+    return { summary: entry.summary };
+  });
 }
 
 function publishCommittedProjection(
@@ -1168,11 +1332,11 @@ function publishCommittedProjection(
   moveGoalSwitch(entry.from, toConversationId);
   // A's final is superseded, never a completed turn in B. B earns its own debt.
   retireGoalDraftsFor(entry.from);
-  if (swarm === 'frozen') {
+  if (swarm === 'frozen' || swarm === 'absent') {
     if (!commitPrimeTransfer(entry.from, toConversationId)) {
       // The frozen handover cannot expire. A miss here means the run ended outright while
       // the session write was in flight; there is no live prime left in A to split from.
-      logWarn(`continuation ${entry.token.slice(0, 8)} committed after its run ended; no prime to move`);
+      if (swarm === 'frozen') logWarn(`continuation ${entry.token.slice(0, 8)} committed after its run ended; no prime to move`);
     }
   } else if (swarm === 'recovery') {
     // Normal commitPrimeTransfer intentionally requires the ephemeral frozen transfer. After
@@ -1180,7 +1344,13 @@ function publishCommittedProjection(
     // continuation WAL may repair the broker's derived A→B prime projection.
     const repaired = recoveryHooks.repairPrimeTransfer?.(entry.from, toConversationId) ?? false;
     if (!repaired && !commitPrimeTransfer(entry.from, toConversationId)) {
-      logWarn(`continuation ${entry.token.slice(0, 8)} recovered without a broker prime repair hook`);
+      // Every app start replays the committed handoffs it still keeps. A chat that never led
+      // sub-agents has no fleet to move, and saying otherwise on each start was only noise.
+      if (!recoveryHooks.repairPrimeTransfer) {
+        logWarn(`continuation ${entry.token.slice(0, 8)} recovered without a broker prime repair hook`);
+      } else if (recoveryHooks.hasPrimeFleet?.(entry.from)) {
+        logWarn(`continuation ${entry.token.slice(0, 8)} recovered, but its sub-agent fleet is still led from ${entry.from}`);
+      }
     }
   }
 }
@@ -1416,13 +1586,50 @@ export async function commitContinuationResult(
   // Ephemeral single-flight lock, separate from the durable record. Staged WAL persistence
   // deliberately does not publish `committing` before its write succeeds, so this lock is what
   // closes the tiny concurrent-ACK window without reintroducing mutation-before-await.
-  const work = commitContinuationUnlocked(entry, toConversationId);
+  const work = withCheckpointLock(token, () => commitContinuationUnlocked(entry, toConversationId));
   commitLocks.set(token, { to: toConversationId, promise: work });
   try {
     return await work;
   } finally {
     if (commitLocks.get(token)?.promise === work) commitLocks.delete(token);
   }
+}
+
+/**
+ * Recover a lost /compact destination checkpoint from the extension's independent
+ * durable /events journal. The journal can outlive the content script, its HTTP response,
+ * or a browser reload. A token alone is not proof: require the *entire* recorded prompt
+ * to match the stored handoff, a claimed and dispatched send, and a stable message id.
+ *
+ * This is another witness for the SAME continuation transaction, not an alternative
+ * session-reassignment API. The regular commit still checks the source attachment and
+ * refuses a destination owned by another session; an ambiguous journal row does nothing.
+ */
+export async function recoverContinuationFromRecordedBootstrap(
+  toConversationId: string,
+  messageId: string,
+  recorded: string
+): Promise<ContinuationCommitResult | null> {
+  if (!toConversationId || !messageId || messageId.length > 200 || !recorded) return null;
+  const marker = continuationMarkerOf(recorded);
+  if (marker?.kind !== 'RESUME') return null;
+  sweep();
+  const entry = byToken.get(marker.token);
+  if (!entry || !entry.handoffId || !entry.claimedBy || toConversationId === entry.from ||
+      !resumeBootstrapMatches(recorded, entry.summary)) return null;
+  if (entry.state !== 'claimed' && entry.state !== 'committing' && entry.state !== 'committed') return null;
+  if (entry.destinationSend.state !== 'dispatched-unresolved' && entry.destinationSend.state !== 'sent') return null;
+  // Never stamp a different destination onto a commit that is already in flight or
+  // complete. The authoritative commit may have selected B before this journal for C
+  // arrived, and writing C's message receipt first would poison later recovery.
+  if ((entry.state === 'committing' || entry.state === 'committed') &&
+      entry.to !== toConversationId) {
+    return { status: 'rejected', reason: 'another replacement chat already owns the continuation' };
+  }
+  if (!await bindContinuationDestinationMessageNow(marker.token, toConversationId, messageId)) {
+    return { status: 'rejected', reason: 'the recorded resume message conflicts with the destination checkpoint' };
+  }
+  return commitContinuationResult(marker.token, toConversationId);
 }
 
 export async function commitContinuation(token: string, toConversationId: string): Promise<boolean> {
@@ -1440,7 +1647,7 @@ export async function commitContinuation(token: string, toConversationId: string
  */
 export function abortContinuation(token: string, reason: string): boolean {
   const entry = byToken.get(token);
-  if (!entry || entry.state === 'committing') return false;
+  if (!entry || entry.state === 'committing' || commitLocks.has(token) || checkpointLocks.has(token)) return false;
   if (entry.state === 'committed' || entry.state === 'aborted') return false;
   entry.state = 'aborted';
   entry.error = reason;
@@ -1463,14 +1670,24 @@ function noteAbandoned(entry: Continuation, reason: string): void {
 
 /** Durable abort for user-visible cancellation paths. */
 export async function abortContinuationNow(token: string, reason: string): Promise<boolean> {
-  const entry = byToken.get(token);
-  if (!entry || entry.state === 'committing') return false;
-  if (entry.state === 'committed' || entry.state === 'aborted') return false;
-  await transitionNow(entry, (current) => ({ ...current, state: 'aborted', error: reason }));
-  cancelPrimeTransfer(entry.from);
-  logWarn(`continuation ${entry.token.slice(0, 8)} durably abandoned — ${reason}`);
-  noteAbandoned(entry, reason);
-  return true;
+  return withCheckpointLock(token, async () => {
+    const entry = byToken.get(token);
+    if (!entry || entry.state === 'committing') return false;
+    if (entry.state === 'committed' || entry.state === 'aborted') return false;
+    if (entry.automatic) {
+      const source = await getSession(entry.sessionId);
+      // The dispatched handoff may already be a new turn. Refuse that current
+      // source turn before retiring the ticket; later authored work can rearm it.
+      if (source?.conversationId === entry.from) {
+        await refuseAutomaticCompactionNow(entry.sessionId, entry.from, source.activeTurnId ?? entry.sourceTurnId);
+      }
+    }
+    await transitionNow(entry, (current) => ({ ...current, state: 'aborted', error: reason }));
+    cancelPrimeTransfer(entry.from);
+    logWarn(`continuation ${entry.token.slice(0, 8)} durably abandoned — ${reason}`);
+    noteAbandoned(entry, reason);
+    return true;
+  });
 }
 
 const SEND_STATES = new Set<ContinuationSendState>([
@@ -1502,16 +1719,21 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
     'aborted'
   ]);
   for (const raw of snapshot.entries.slice(0, 32)) {
+    if (!raw) continue;
+    // The retention window scales with the same per-ticket deadline the live sweep uses:
+    // a Pro brief still inside its longer writing clock must survive a restart within it
+    // rather than vanish silently at twice the ordinary TTL.
+    const retentionMs = manualWaitingTtlMs(raw.state, requestedModel(raw.requestedModel)) * 2;
+    const lastTouchedAt = Number.isFinite(raw.touchedAt) && raw.touchedAt! <= now ? raw.touchedAt! : raw.openedAt;
     if (
-      !raw ||
       !/^[A-Za-z0-9_-]{16,64}$/.test(raw.token) ||
       !/^[0-9a-z-]{8,64}$/i.test(raw.sessionId) ||
       typeof raw.from !== 'string' ||
       raw.from.length === 0 || raw.from.length > 256 ||
       !validStates.has(raw.state) ||
       !Number.isFinite(raw.openedAt) ||
-      ((raw.state === 'committed' || raw.state === 'aborted') && now - (Number.isFinite(raw.touchedAt) && raw.touchedAt! <= now ? raw.touchedAt! : raw.openedAt) >= CONTINUATION_TTL_MS * 2) ||
-      (raw.automatic !== true && now - (Number.isFinite(raw.touchedAt) && raw.touchedAt! <= now ? raw.touchedAt! : raw.openedAt) >= CONTINUATION_TTL_MS * 2)
+      ((raw.state === 'committed' || raw.state === 'aborted') && now - lastTouchedAt >= retentionMs) ||
+      (raw.automatic !== true && now - lastTouchedAt >= retentionMs)
     ) {
       continue;
     }
@@ -1540,7 +1762,10 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
           ? {
               state: raw.sourceSend.state as ContinuationSendState,
               messageId:
-                typeof raw.sourceSend.messageId === 'string' ? raw.sourceSend.messageId.slice(0, 200) : null
+                typeof raw.sourceSend.messageId === 'string' ? raw.sourceSend.messageId.slice(0, 200) : null,
+              ...(raw.sourceSend.state === 'dispatched-unresolved' && typeof raw.sourceSend.before === 'string' &&
+                Number.isFinite(raw.sourceSend.dispatchedAt)
+                ? { before: raw.sourceSend.before.slice(0, 200), dispatchedAt: Number(raw.sourceSend.dispatchedAt) } : {})
             }
           : {
               // The retired `armed` flag was raised around the click, not before it, so it
@@ -1571,9 +1796,17 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
       entry.askedAt = typeof raw.askedAt === 'number' && Number.isFinite(raw.askedAt) ? raw.askedAt : now;
     }
     const waitingExpired = entry.state !== 'committed' && entry.state !== 'aborted' && expired(entry, now);
+    let handoffProvenanceConflict = false;
     if (entry.handoffId) {
       try {
         entry.handoff = await readHandoff(entry.sessionId, entry.handoffId);
+        if (entry.handoff && !handoffMatchesContinuation(entry.handoff, entry.token, entry.from, entry.sourceTurnId)) {
+          handoffProvenanceConflict = true;
+          logWarn(
+            `continuation ${entry.token.slice(0, 8)} refused handoff ${entry.handoff.id}: stored provenance belongs to another transaction`
+          );
+          entry.handoff = null;
+        }
       } catch (err) {
         logWarn(`continuation ${entry.token.slice(0, 8)} handoff recovery failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -1584,7 +1817,8 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
           entry.sessionId,
           entry.handoff.id,
           entry.handoff.text.length,
-          'compact and resume'
+          'compact and resume',
+          entry.token
         );
       } catch (err) {
         // A missing timeline event is recoverable presentation metadata. The continuation WAL
@@ -1604,7 +1838,7 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
         logWarn(`continuation ${entry.token.slice(0, 8)} session recovery failed: ${err instanceof Error ? err.message : String(err)}`);
       }
       if (session && entry.to && session.conversationId === entry.to) {
-        if (entry.handoffId) {
+        if (entry.handoffId && !handoffProvenanceConflict) {
           try {
             await ensureCommittedResumeHandoff(entry.sessionId, entry.to, entry.handoffId);
           } catch (err) {
@@ -1620,7 +1854,14 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
         entry.error = null;
         logInfo(`continuation ${entry.token.slice(0, 8)} recovered after durable commit`);
       } else if (entry.state === 'committing' && session && session.conversationId === entry.from) {
-        if (waitingExpired) {
+        if (!entry.handoff) {
+          entry.state = 'aborted';
+          entry.to = null;
+          entry.error = handoffProvenanceConflict
+            ? 'The saved handoff belongs to a different continuation.'
+            : 'The saved handoff could not be recovered.';
+          cancelPrimeTransfer(entry.from);
+        } else if (waitingExpired) {
           // The WAL proves the durable session move never landed. Restart must not turn an
           // already-expired ten-minute transaction into a fresh one merely because its
           // ephemeral transfer lock disappeared with the process.
@@ -1658,7 +1899,9 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
       // handoff data is not an empty valid brief and must not be typed into a new chat.
       } else if (entry.state !== 'awaiting-summary' && !entry.handoff) {
         entry.state = 'aborted';
-        entry.error = 'The saved handoff could not be recovered.';
+        entry.error = handoffProvenanceConflict
+          ? 'The saved handoff belongs to a different continuation.'
+          : 'The saved handoff could not be recovered.';
         cancelPrimeTransfer(entry.from);
       } else {
         beginPrimeTransfer(entry.from);
@@ -1670,7 +1913,13 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
     // collision it exists to prevent would be wide open for exactly the restart that is most
     // likely to hit it. Re-armed from now rather than from the original claim, because what
     // matters is how long from *here* that chat still has to appear.
-    if (entry.state === 'claimed') noteResumeClaim(entry.token);
+    if (entry.state === 'claimed') {
+      if (entry.destinationSend.state === 'dispatched-unresolved' || entry.destinationSend.state === 'sent') {
+        noteResumeDispatch(entry.token, entry.sessionId);
+      } else {
+        noteResumeClaim(entry.token);
+      }
+    }
     byToken.set(entry.token, entry);
   }
   try {

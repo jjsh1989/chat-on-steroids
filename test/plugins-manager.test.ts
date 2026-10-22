@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { createServer } from 'node:http';
-import { Client } from '@modelcontextprotocol/client';
+import { Client, SdkError, SdkErrorCode } from '@modelcontextprotocol/client';
 import { zipSync, strToU8 } from 'fflate';
 import sharp from 'sharp';
 import { makeTempDir, removeTempDir } from './helpers.js';
@@ -18,6 +18,7 @@ vi.mock('../src/main/secrets.js', () => ({
 }));
 import { initDurableStore } from '../src/main/durable.js';
 import { getSecret } from '../src/main/secrets.js';
+import * as configModule from '../src/main/config.js';
 import { PluginManager } from '../src/main/plugins/manager.js';
 import { PluginOAuth, PluginNeedsAuth } from '../src/main/plugins/oauth.js';
 import * as pluginInstaller from '../src/main/plugins/installer.js';
@@ -26,7 +27,7 @@ import * as durableModule from '../src/main/durable.js';
 
 const fixture = `const readline=require('node:readline');
 const tools=[{name:'Echo.Mixed',description:'Echo fixture',inputSchema:{type:'object',properties:{value:{type:'string'}},required:['value'],additionalProperties:false},annotations:{readOnlyHint:true,destructiveHint:false,openWorldHint:false},outputSchema:{type:'object',properties:{value:{type:'string'}},required:['value']}}];
-readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;let result;if(m.method==='initialize')result={protocolVersion:'2025-11-25',capabilities:{tools:{}},serverInfo:{name:'CoS test fixture',version:'1'}};else if(m.method==='tools/list')result={tools};else if(m.method==='tools/call')result={content:[{type:'text',text:process.env.TEST_SECRET||m.params.arguments.value}],structuredContent:{value:m.params.arguments.value},isError:m.params.arguments.value==='error'};else result={};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');});`;
+readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;if(m.method==='tools/call'&&m.params.arguments.value==='rpc-error'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,error:{code:-32603,message:'invalid tool arguments'}})+'\\n');return;}let result;if(m.method==='initialize')result={protocolVersion:'2025-11-25',capabilities:{tools:{}},serverInfo:{name:'CoS test fixture',version:'1'}};else if(m.method==='tools/list')result={tools};else if(m.method==='tools/call')result={content:[{type:'text',text:process.env.TEST_SECRET||m.params.arguments.value}],structuredContent:{value:m.params.arguments.value},isError:m.params.arguments.value==='error'};else result={};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');});`;
 let dir: string, manager: PluginManager, entry: string;
 beforeEach(async () => {
   dir = await makeTempDir('plugins-test-');
@@ -44,17 +45,75 @@ afterEach(async () => {
   await removeTempDir(dir);
 });
 describe('external plugin authority', () => {
-  it('classifies an unknown Plugins name without dispatching or implying a disabled Core permission', async () => {
+  it.each(['read', 'exec_command', 'write_stdin', 'agents'] as const)('names the Core connector for %s without dispatching or implying a disabled permission', async (name) => {
     const upstream = vi.spyOn(Client.prototype, 'callTool');
     const outcome = vi.fn();
-    const result = await manager.call('read', { path: 'example.txt' }, outcome);
-    expect(JSON.stringify(result)).toContain('UNKNOWN_TOOL');
-    expect(JSON.stringify(result)).toContain('current Plugins catalog');
-    expect(JSON.stringify(result)).not.toContain('PLUGIN_DISABLED');
-    expect(JSON.stringify(result)).toContain('This call was not dispatched.');
-    expect(result.isError).toBe(true);
+    const result = await manager.call(name, { path: 'example.txt' }, outcome);
+    const text = JSON.stringify(result);
+    expect(text).toContain('UNKNOWN_TOOL');
+    expect(text).toContain('current Plugins catalog');
+    expect(text).toContain('Chat On Steroids Core');
+    expect(text).toContain('Discover or select');
+    expect(text).not.toContain('PLUGIN_DISABLED');
+    expect(text).not.toContain('is connected');
+    expect(text).not.toContain('is enabled');
+    expect(text).not.toContain('already ran');
+    expect(text).not.toContain('already completed');
+    expect(text).not.toContain('safe to replay');
+    expect(text).toContain('This call was not dispatched.');
+    expect(result).toEqual({ isError: true, content: [{ type: 'text', text: expect.stringContaining('UNKNOWN_TOOL') }] });
     expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
     expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it('names the current installation Core connector and follows a suffix change', async () => {
+    const previous = configModule.getConfig();
+    const suffix = vi.spyOn(configModule, 'getConfig');
+    try {
+      suffix.mockReturnValue({ ...previous, connectorSuffix: 'Alpha' });
+      const first = JSON.stringify(await manager.call('exec_command'));
+      expect(first).toContain('Chat On Steroids Core (Alpha)');
+      expect(first).toContain('UNKNOWN_TOOL');
+      expect(first).toContain('This call was not dispatched.');
+      suffix.mockReturnValue({ ...previous, connectorSuffix: 'Beta' });
+      const second = JSON.stringify(await manager.call('write_stdin'));
+      expect(second).toContain('Chat On Steroids Core (Beta)');
+      expect(second).not.toContain('Alpha');
+      expect(second).toContain('UNKNOWN_TOOL');
+      expect(second).not.toContain('is connected');
+      expect(second).not.toContain('already ran');
+    } finally {
+      suffix.mockRestore();
+    }
+  });
+
+  it.each(['not_a_real_tool', 'Exec_Command', 'exec'] as const)('keeps generic unknown-tool guidance for %s', async (name) => {
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const outcome = vi.fn();
+    const text = JSON.stringify(await manager.call(name, {}, outcome));
+    expect(text).toContain('UNKNOWN_TOOL: This tool name is not in the current Plugins catalog. It may be stale or belong to another connector. Check the current Plugins tool list.');
+    expect(text).not.toContain('Chat On Steroids Core');
+    expect(text).not.toContain('Discover or select');
+    expect(text).toContain('This call was not dispatched.');
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it('keeps an external exec_command on its plugin and refuses PLUGIN_DISABLED after disable', async () => {
+    await fs.writeFile(entry, fixture.replaceAll('Echo.Mixed', 'exec_command'));
+    const row = (await manager.install({ name: 'Fixture', source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    expect((await manager.call('exec_command', { value: 'hello' })).structuredContent).toEqual({ value: 'hello' });
+    expect(upstream).toHaveBeenCalledTimes(1);
+    await manager.setEnabled(row.id, false);
+    const outcome = vi.fn();
+    const disabled = JSON.stringify(await manager.call('exec_command', { value: 'blocked' }, outcome));
+    expect(disabled).toContain('PLUGIN_DISABLED');
+    expect(disabled).not.toContain('Chat On Steroids Core');
+    expect(disabled).not.toContain('UNKNOWN_TOOL');
+    expect(disabled).toContain('This call was not dispatched.');
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
+    expect(upstream).toHaveBeenCalledTimes(1);
   });
 
   it('uses exposure conflicts for refused calls even while either claimant is disabled', async () => {
@@ -90,6 +149,26 @@ describe('external plugin authority', () => {
     expect(upstream).toHaveBeenCalledTimes(1);
   });
 
+  it('installs a server with more tools than ChatGPT gets, publishes what fits, and lets switched-off tools make room (#1313)', async () => {
+    // 300 tools of about 4.5 KB each: 1.3 MB of schema, over the old 256-tool / 1 MB discovery refusal.
+    const tools = Array.from({ length: 300 }, (_, index) => ({
+      name: `big_${index}`, description: 'x'.repeat(4500), inputSchema: { type: 'object' },
+    }));
+    await fs.writeFile(entry, fixture.replace(/const tools=.*?;\n/, `const tools=${JSON.stringify(tools)};\n`));
+    const snapshot = await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+    const id = snapshot.plugins.at(-1)!.id;
+    const published = manager.tools().map(tool => tool.name);
+    // The connector's own budget decides what ChatGPT gets, as for any plugin.
+    expect(published.length).toBeGreaterThan(0);
+    expect(published.length).toBeLessThan(300);
+    expect(published[0]).toBe('big_0');
+    const firstLeftOut = `big_${published.length}`;
+    expect(JSON.stringify(await manager.call(firstLeftOut))).toContain('schema size limit');
+    // Switching tools off frees room for the next ones.
+    await manager.setToolEnabled(id, 'big_0', false);
+    expect(manager.tools().map(tool => tool.name)).toContain(firstLeftOut);
+  });
+
   it('keeps a server failure distinct from a disabled tool on subsequent cached calls', async () => {
     const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
     const upstream = vi.spyOn(Client.prototype, 'callTool').mockRejectedValueOnce(new Error('private transport details'));
@@ -110,6 +189,167 @@ describe('external plugin authority', () => {
     expect(disabled).toContain('This call was not dispatched.');
     expect(disabled).not.toContain('Restart this plugin');
     expect(upstream).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a plugin ready after a JSON-RPC tool error response', async () => {
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+
+    const outcome = vi.fn();
+    const failed = await manager.call('Echo.Mixed', { value: 'rpc-error' }, outcome);
+    expect(failed.isError).toBe(true);
+    expect(JSON.stringify(failed)).toContain('PLUGIN_TOOL_ERROR');
+    expect(JSON.stringify(failed)).toContain('invalid tool arguments');
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_execution_error');
+    expect(manager.snapshot().plugins[0]?.status).toBe('ready');
+
+    expect(JSON.stringify(await manager.call('Echo.Mixed', { value: 'still connected' }))).toContain('still connected');
+    expect(manager.snapshot().plugins[0]?.status).toBe('ready');
+  });
+
+  it('keeps per-plugin Longest call independent, durable and effective without reconnect', async () => {
+    const first = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const secondEntry = path.join(dir, 'second.cjs');
+    await fs.writeFile(secondEntry, fixture.replaceAll('Echo.Mixed', 'Other.Echo'));
+    const second = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [secondEntry] }, longestCallSeconds: 900 })).plugins[1]!;
+    expect(first.longestCallSeconds).toBe(120);
+    expect(second.longestCallSeconds).toBe(900);
+    const dispatched = vi.spyOn(Client.prototype, 'callTool');
+    expect((await manager.call('Echo.Mixed', { value: 'before' })).isError).not.toBe(true);
+    const client = dispatched.mock.instances[0];
+    await manager.configure(first.id, { longestCallSeconds: 480 });
+    expect(manager.snapshot().plugins.find(p => p.id === first.id)?.status).toBe('ready');
+    expect((await manager.call('Echo.Mixed', { value: 'after' })).isError).not.toBe(true);
+    expect(dispatched.mock.instances[1]).toBe(client);
+    expect(dispatched.mock.calls[1]?.[1]).toMatchObject({ timeout: 480_000, maxTotalTimeout: 480_000, resetTimeoutOnProgress: true });
+    expect(dispatched.mock.calls[1]?.[1]?.onprogress).toBeTypeOf('function');
+    expect((await manager.call('Other.Echo', { value: 'peer' })).isError).not.toBe(true);
+    expect(dispatched.mock.calls[2]?.[1]).toMatchObject({ timeout: 900_000, maxTotalTimeout: 900_000, resetTimeoutOnProgress: true });
+    expect(manager.snapshot().plugins.find(p => p.id === second.id)?.longestCallSeconds).toBe(900);
+    await manager.close(); manager = new PluginManager(); await manager.initialize(dir);
+    await vi.waitFor(() => expect(manager.snapshot().plugins.every(p => p.status === 'ready')).toBe(true), { timeout: 10_000 });
+    expect(manager.snapshot().plugins.map(p => p.longestCallSeconds)).toEqual([480, 900]);
+  });
+
+  it('loads legacy plugin limits with 120 s fallback and sanitizes corrupt stored values', async () => {
+    const one = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const otherEntry = path.join(dir, 'legacy.cjs');
+    await fs.writeFile(otherEntry, fixture.replaceAll('Echo.Mixed', 'Legacy.Echo'));
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [otherEntry] } });
+    await manager.close();
+    const file = path.join(dir, 'state', 'plugins.json');
+    const records = JSON.parse(await fs.readFile(file, 'utf8'));
+    delete records[0].longestCallSeconds;
+    records[1].longestCallSeconds = 'very long';
+    await fs.writeFile(file, JSON.stringify(records));
+    manager = new PluginManager(); await manager.initialize(dir);
+    await vi.waitFor(() => expect(manager.snapshot().plugins.every(p => p.status === 'ready')).toBe(true), { timeout: 10_000 });
+    expect(manager.snapshot().plugins.find(p => p.id === one.id)?.longestCallSeconds).toBe(120);
+    expect(manager.snapshot().plugins.map(p => p.longestCallSeconds)).toEqual([120, 120]);
+  });
+
+  it('validates Longest call seconds without changing plugin state on bad input', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    for (const invalid of [0, -1, 1801, 2.5, NaN, Infinity, '300', null]) {
+      await expect(manager.configure(row.id, { longestCallSeconds: invalid as number })).rejects.toThrow('Longest call');
+      expect(manager.snapshot().plugins[0]?.longestCallSeconds).toBe(120);
+      expect(manager.snapshot().plugins[0]?.status).toBe('ready');
+    }
+    await manager.configure(row.id, { longestCallSeconds: 1800 });
+    expect(manager.snapshot().plugins[0]?.longestCallSeconds).toBe(1800);
+    await manager.configure(row.id, { longestCallSeconds: 1 });
+    expect(manager.snapshot().plugins[0]?.longestCallSeconds).toBe(1);
+  });
+
+  it('enforces the absolute Longest call limit even after progress extends the SDK idle timer', async () => {
+    const delayed = `if(m.method==='tools/call'&&m.params.arguments.value==='progress'){
+      setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/progress',params:{progressToken:m.params._meta.progressToken,progress:1,total:2}})+'\\n'),800);
+      setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{content:[{type:'text',text:'late'}],structuredContent:{value:'late'}}})+'\\n'),1400);
+      return;
+    }`;
+    await fs.writeFile(entry, fixture.replace("if(m.method==='tools/call'&&m.params.arguments.value==='rpc-error'){", `${delayed}if(m.method==='tools/call'&&m.params.arguments.value==='rpc-error'){`));
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] }, longestCallSeconds: 1 });
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const outcome = vi.fn();
+    const timedOut = await manager.call('Echo.Mixed', { value: 'progress' }, outcome);
+    expect(timedOut.isError).toBe(true);
+    expect(JSON.stringify(timedOut)).toContain('PLUGIN_CALL_TIMEOUT');
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_execution_error');
+    expect(upstream.mock.calls[0]?.[1]).toMatchObject({ timeout: 1000, maxTotalTimeout: 1000, resetTimeoutOnProgress: true });
+    expect(upstream.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+    expect(manager.snapshot().plugins[0]?.status).toBe('ready');
+    expect((await manager.call('Echo.Mixed', { value: 'next call' })).structuredContent).toEqual({ value: 'next call' });
+    expect(upstream.mock.instances[0]).toBe(upstream.mock.instances[1]);
+  });
+
+  it.each(['timeout', 'abort'] as const)('keeps a plugin ready after SDK %s and cancels only that request', async (failure) => {
+    const callsLog = path.join(dir, 'calls.jsonl');
+    const cancelsLog = path.join(dir, 'cancels.jsonl');
+    await fs.writeFile(entry, fixture
+      .replace('if(m.id===undefined)return;',
+        "if(m.method==='notifications/cancelled'){require('node:fs').appendFileSync(process.env.CANCELS_LOG,JSON.stringify(m.params)+'\\n');return;}if(m.id===undefined)return;")
+      .replace("if(m.method==='tools/call'&&m.params.arguments.value==='rpc-error'){",
+        "if(m.method==='tools/call'){require('node:fs').appendFileSync(process.env.CALLS_LOG,JSON.stringify(m)+'\\n');if(m.params.arguments.value==='hang')return;}if(m.method==='tools/call'&&m.params.arguments.value==='rpc-error'){"));
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] },
+      config: { CALLS_LOG: callsLog, CANCELS_LOG: cancelsLog } })).plugins[0]!;
+    const realCallTool = Client.prototype.callTool;
+    const failures: unknown[] = [];
+    const clients: Client[] = [];
+    const controller = new AbortController();
+    const upstream = vi.spyOn(Client.prototype, 'callTool').mockImplementation(async function (this: Client, params, options) {
+      clients.push(this);
+      try {
+        // Keep real SDK request, deadline/abort and notifications/cancelled; only shorten the test deadline.
+        const limited = params.arguments?.value === 'hang'
+          ? failure === 'timeout' ? { ...options, timeout: 500 } : { ...options, signal: controller.signal }
+          : options;
+        return await realCallTool.call(this, params, limited);
+      } catch (error) { failures.push(error); throw error; }
+    });
+
+    const outcome = vi.fn();
+    const hanging = manager.call('Echo.Mixed', { value: 'hang' }, outcome);
+    const sibling = manager.call('Echo.Mixed', { value: 'concurrent' });
+    if (failure === 'abort') {
+      await vi.waitFor(async () => {
+        const lines = (await fs.readFile(callsLog, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+        expect(lines.some(line => line.params.arguments.value === 'hang')).toBe(true);
+      });
+      controller.abort(new Error('Caller cancelled'));
+    }
+    expect((await sibling).structuredContent).toEqual({ value: 'concurrent' });
+    const timedOut = await hanging;
+    expect(failures).toEqual([expect.any(SdkError)]);
+    expect((failures[0] as SdkError).code).toBe(SdkErrorCode.RequestTimeout);
+    expect(timedOut.isError).toBe(true);
+    expect(JSON.stringify(timedOut)).toContain('PLUGIN_CALL_TIMEOUT');
+    expect(JSON.stringify(timedOut)).toContain('may have completed');
+    expect(JSON.stringify(timedOut)).toContain('CoS did not retry');
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_execution_error');
+    expect(manager.snapshot().plugins[0]?.status).toBe('ready');
+    expect((await manager.call('Echo.Mixed', { value: 'after cancellation' })).structuredContent).toEqual({ value: 'after cancellation' });
+    expect(manager.snapshot().plugins[0]?.id).toBe(row.id);
+    expect(upstream).toHaveBeenCalledTimes(3);
+    expect(new Set(clients).size).toBe(1); // No reconnect; healthy sibling and next call reuse the same client.
+
+    const calls = (await fs.readFile(callsLog, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    const original = calls.filter(call => call.params.arguments.value === 'hang');
+    expect(original).toHaveLength(1); // No retry, even if the server completes the operation later.
+    await vi.waitFor(async () => expect((await fs.readFile(cancelsLog, 'utf8')).trim().split('\n')).toHaveLength(1));
+    const cancelled = JSON.parse((await fs.readFile(cancelsLog, 'utf8')).trim());
+    expect(cancelled.requestId).toBe(original[0].id);
+  });
+
+  it('marks a real MCP transport disconnect fatal instead of treating it as a call timeout', async () => {
+    await fs.writeFile(entry, fixture.replace("if(m.method==='tools/call'&&m.params.arguments.value==='rpc-error'){",
+      "if(m.method==='tools/call'&&m.params.arguments.value==='disconnect')process.exit(1);if(m.method==='tools/call'&&m.params.arguments.value==='rpc-error'){"));
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+    const failed = await manager.call('Echo.Mixed', { value: 'disconnect' });
+    expect(failed.isError).toBe(true);
+    expect(JSON.stringify(failed)).toContain('PLUGIN_CALL_FAILED');
+    await vi.waitFor(() => expect(manager.snapshot().plugins[0]?.status).toBe('error'));
+    const outcome = vi.fn();
+    expect(JSON.stringify(await manager.call('Echo.Mixed', { value: 'must not reconnect' }, outcome))).toContain('PLUGIN_UNAVAILABLE');
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
   });
 
   it('preserves accepted protocol results and treats upstream error text only as execution output', async () => {
@@ -389,6 +629,22 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     expect(row.error).toContain('page/time limit');
     await manager.uninstall(row.id);
     expect(manager.snapshot().plugins).toEqual([]);
+  });
+  it('finishes an uninstall whose folder the stopped server still holds (Windows EBUSY)', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const realRm = fs.rm.bind(fs);
+    const rm = vi.spyOn(fs, 'rm').mockImplementation(async (target, options) => {
+      if (String(target).endsWith(row.id)) throw Object.assign(new Error('EBUSY: resource busy or locked, rmdir'), { code: 'EBUSY' });
+      return realRm(target, options);
+    });
+    try {
+      // The record and its credentials are already gone; a locked leftover folder is logged, not an error.
+      await expect(manager.uninstall(row.id)).resolves.toBeDefined();
+      expect(manager.snapshot().plugins).toEqual([]);
+      expect(rm).toHaveBeenCalledWith(expect.stringContaining(row.id), expect.objectContaining({ maxRetries: 10, retryDelay: 200 }));
+    } finally {
+      rm.mockRestore();
+    }
   });
   it('refuses queued replacement work once shutdown begins', async () => {
     const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
@@ -831,6 +1087,19 @@ describe('enabled plugin process ownership', () => {
     expect(await h.pids()).toHaveLength(1);
   });
 
+  it('changes Longest call during an in-flight tool without interrupting or restarting its server', async () => {
+    const h = await trackedFixture();
+    const original = (await h.pids())[0]!;
+    const call = manager.call('Echo.Mixed', { value: 'hold' });
+    await manager.configure(h.row.id, { longestCallSeconds: 480 });
+    expect(manager.snapshot().plugins[0]?.status).toBe('ready');
+    expect(alive(original.pid)).toBe(true);
+    await fs.writeFile(h.releaseFile, 'finish');
+    expect((await call).isError).not.toBe(true);
+    expect(await h.pids()).toHaveLength(1);
+    expect(manager.snapshot().plugins[0]?.longestCallSeconds).toBe(480);
+  });
+
   it.each(['disable', 'uninstall', 'close'] as const)('%s ends the owned process and refuses later calls', async action => {
     const h = await trackedFixture(process.platform === 'win32');
     await manager.call('Echo.Mixed', { value: 'first' });
@@ -909,4 +1178,11 @@ describe('enabled plugin process ownership', () => {
     expect(await h.pids()).toHaveLength(2);
     expect(alive((await h.pids())[1]!.pid)).toBe(true);
   });
+});
+
+// #1255 follow-up: the app's proxy leaves remote plugins the system reaches directly alone.
+it('lists the addresses of remote plugins, and only those', async () => {
+  await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+  await manager.install({ source: { kind: 'remote', url: 'https://mcp.lan.example/mcp', auth: 'oauth' } });
+  expect(manager.remoteEndpoints()).toEqual(['https://mcp.lan.example/mcp']);
 });

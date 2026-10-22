@@ -23,6 +23,9 @@
 
 import type { Capabilities } from '../../shared/types.js';
 import { desktopAutomationSupported } from '../platform.js';
+import { getConfig } from '../config.js';
+import { CONNECTOR_BRAND, connectorName } from '../../shared/connector-names.js';
+import { learnedConnectorName } from '../connector-identity.js';
 import { WINDOWS_COMPUTER_METHODS, WINDOWS_COMPUTER_READ_METHODS, WINDOWS_COMPUTER_INPUT_METHODS } from '../../shared/windows-computer.js';
 import { BROWSER_TOOLS, BROWSER_READ_TOOLS, BROWSER_WRITE_TOOLS } from '../../shared/browser-control.js';
 
@@ -36,7 +39,7 @@ export type SurfaceId = (typeof SURFACE_IDS)[number];
  * name and the setup cards, and those three drifting apart is how a user ends up with
  * a connector whose name does not match the thing the instructions told them to type.
  */
-export const CONNECTOR_BRAND = 'Chat On Steroids';
+export { CONNECTOR_BRAND };
 
 export interface SurfaceDefinition {
   id: SurfaceId;
@@ -104,9 +107,9 @@ const CORE: SurfaceDefinition = {
     'and saving images and files ChatGPT generates onto this computer. ' +
     'Also displays task plans and — when the user has ' +
     'enabled it — spawns and coordinates worker agents, subagents or a parallel swarm across several ChatGPT conversations.',
-  cardSummary: 'Files, patches and the terminal. Required — this is the coding connector.',
+  cardSummary: 'Files, patches and terminal.',
   required: true,
-  tools: ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'update_plan', 'agents', 'session_finish', 'exec']
+  tools: ['read', 'view_image', 'find', 'apply_patch', 'save_image', 'exec_command', 'write_stdin', 'update_plan', 'agents', 'session_finish', 'usage', 'exec']
 };
 
 /**
@@ -129,8 +132,7 @@ const DESKTOP: SurfaceDefinition = {
     'Use for: listing and launching apps, taking background window screenshots, reading what is on screen, listing and finding windows, inspecting buttons, fields and other UI controls, ' +
     'clicking, typing, pressing keys, scrolling and dragging in native applications, ' +
     'and reading the clipboard or copying and pasting text between programs.',
-  cardSummary:
-    'Browser tabs, DOM, console, network and background screenshots; native apps, input and clipboard where supported.',
+  cardSummary: 'Browser and desktop apps.',
   required: false,
   tools: [...BROWSER_TOOLS, ...WINDOWS_COMPUTER_METHODS, 'read_clipboard', 'write_clipboard', 'observe', 'computer', 'exec']
 };
@@ -149,8 +151,28 @@ export const SURFACES: Record<SurfaceId, SurfaceDefinition> = { core: CORE, desk
 
 export const SURFACE_LIST: readonly SurfaceDefinition[] = [CORE, DESKTOP, PLUGINS];
 
+/**
+ * A surface as this install presents it to the model. The connector name is the live one (a
+ * rename in ChatGPT is followed once a served call proves it), else the configured name with this
+ * computer's suffix
+ * (Settings › Setup), read at every call so a saved change reaches the Setup cards, the server
+ * instructions and plugin refresh without a restart. `SURFACES` keeps the plain names.
+ */
 export function surfaceDefinition(id: SurfaceId): SurfaceDefinition {
-  return SURFACES[id];
+  return { ...SURFACES[id], connectorName: liveConnectorName(id) };
+}
+
+/** The name this install tells the user to give the connector, and serves as its resource name. */
+export function configuredConnectorName(id: SurfaceId): string {
+  return connectorName(id, getConfig().connectorSuffix);
+}
+
+/**
+ * What ChatGPT currently calls this surface's connector: the name proven by a served call
+ * (connector-identity.ts; it follows a rename), else the configured one. Model-facing text uses this.
+ */
+export function liveConnectorName(id: SurfaceId): string {
+  return learnedConnectorName(id) ?? configuredConnectorName(id);
 }
 
 /** Platform/capability projection used by setup; each registrar enforces the same split. */
@@ -192,9 +214,4 @@ export function surfaceIsUseful(
     );
   }
   return true;
-}
-
-/** Surfaces worth connecting under these capabilities, in setup order. */
-export function usefulSurfaces(caps: Capabilities): SurfaceDefinition[] {
-  return SURFACE_LIST.filter((surface) => surfaceIsUseful(surface.id, caps));
 }

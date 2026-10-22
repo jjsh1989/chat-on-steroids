@@ -6,14 +6,14 @@ const handlers = new Map<string, Handler>();
 vi.mock('electron', () => ({
   ipcMain: { handle: (name: string, handler: Handler) => handlers.set(name, handler), removeHandler: (name: string) => handlers.delete(name) },
   BrowserWindow: class {}, clipboard: {}, dialog: {}, shell: {}, nativeTheme: { themeSource: 'system' },
-  app: { getPath: () => '', getVersion: () => '0.0.0', getAppPath: () => process.cwd(), isPackaged: false },
+  app: { on: vi.fn(), once: vi.fn(), getPath: () => '', getVersion: () => '0.0.0', getAppPath: () => process.cwd(), isPackaged: false },
   safeStorage: {
     isAsyncEncryptionAvailable: async () => true, getSelectedStorageBackend: () => 'gnome_libsecret',
     encryptStringAsync: async (text: string) => Buffer.from(text),
     decryptStringAsync: async (data: Buffer) => ({ result: data.toString(), shouldReEncrypt: false })
   }
 }));
-vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd() }));
+vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd(), shippedExtensionBuild: () => null, extensionUpdateOffer: () => null, prepareExtensionUpdate: () => null }));
 vi.mock('../src/main/connection.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/main/connection.js')>();
   return { ...actual, connect: async () => {}, getStatus: () => ({ ...actual.getStatus(), state: 'connected' }) };
@@ -123,13 +123,14 @@ it('retires an unowned Pro final immediately across reloads without requiring a 
   expect((await sessionControlsFor(session.id)).activeTurnId).toBe('next-generation');
 });
 
+// Pro keeps tool injection; a GPT-5.6 turn takes the message through the composer (#1231).
 it.each([false, true])('settles the last injected message from its exact final across restart and admits a new browser message (legacy=%s)', async legacy => {
   const { recordToolCall } = await import('../src/main/session/recorder.js');
   const { trackInFlight, emptyEvidence } = await import('../src/main/mcp/call-context.js');
   const { findSessionByConversation, upsertMessageEvent } = await import('../src/main/session/store.js');
   const conversationId = randomUUID(), requestId = randomUUID(), at = Date.now();
   await post('/events', { conversationId, events: [
-    { kind: 'model_selection', time: at, model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+    { kind: 'model_selection', time: at, model: 'gpt-5.6-pro', reasoningEffort: 'high' },
     { kind: 'user_message', time: at, messageId: 'question', text: 'Inspect this' },
     { kind: 'turn_start', time: at + 1, turnId: 'injected-turn' },
     { kind: 'tool_evidence', time: at + 2, calls: [{ messageId: 'last-call', tool: 'read', order: 0, answered: false, requestId }] }

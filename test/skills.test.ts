@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
   importSkillFile,
+  importSkillPackage,
   initSkillsPath,
   listSkills,
   readSkill,
@@ -11,6 +12,8 @@ import {
   skillsDirectory
 } from '../src/main/skills.js';
 import { MAX_SKILL_BYTES, MAX_SKILLS } from '../src/shared/skills.js';
+import { defaultConfig, getConfig, initConfigPath, saveConfig } from '../src/main/config.js';
+import { rawPromises as rawFs } from '../src/main/rawfs.js';
 
 let userData = '';
 let sources = '';
@@ -19,6 +22,8 @@ beforeEach(async () => {
   userData = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'cos-skills-')));
   sources = path.join(userData, 'sources');
   await fs.mkdir(sources);
+  initConfigPath(userData);
+  await saveConfig(defaultConfig());
   await initSkillsPath(userData);
 });
 
@@ -70,7 +75,8 @@ describe('managed Skills store', () => {
     expect(await readSkill(summary.id)).toEqual({ summary, text });
     expect(await fs.readFile(path.join(userData, 'skills', summary.id, 'SKILL.md'), 'utf8')).toBe(text);
     const advertised = skillCatalogInstructions();
-    expect(advertised).toContain(JSON.stringify(summary));
+    expect(advertised).toContain(JSON.stringify({ id: summary.id, name: summary.name, description: summary.description }));
+    expect(advertised).not.toContain(JSON.stringify(summary.path));
     expect(advertised).not.toContain('Use the entire file');
     expect(advertised).toContain(JSON.stringify(path.join(userData, 'skills')));
   });
@@ -95,8 +101,44 @@ describe('managed Skills store', () => {
     });
   });
 
+  it.each(['>-', '|', '>+', '|-'])('publishes bounded YAML %s descriptions instead of body fallback', async scalar => {
+    const text = [
+      '\uFEFF---',
+      'name: Code Review',
+      `description: ${scalar}`,
+      '  Review source code',
+      '  for correctness and maintainability.',
+      '...',
+      '# A different body title',
+      '',
+      'BODY_ONLY_MUST_NOT_REPLACE_METADATA'
+    ].join('\r\n');
+    const source = await sourceFile('code-review.md', text);
+    const summary = await importSkillFile(source);
+    expect(summary).toMatchObject({
+      id: 'code-review', name: 'Code Review',
+      description: 'Review source code for correctness and maintainability.'
+    });
+    expect(skillCatalogInstructions()).toContain(JSON.stringify({ id: summary.id, name: summary.name, description: summary.description }));
+    expect(skillCatalogInstructions()).not.toContain('BODY_ONLY_MUST_NOT_REPLACE_METADATA');
+    // Rebuilding the published catalog uses the same parsed metadata. The text decoder
+    // already strips a BOM; the stored source bytes still retain it and the original CRLF.
+    await initSkillsPath(userData);
+    expect(await listSkills()).toEqual([summary]);
+    expect((await readSkill(summary.id)).text).toBe(text.replace(/^\uFEFF/, ''));
+    expect(await fs.readFile(path.join(userData, 'skills', summary.id, 'SKILL.md'), 'utf8')).toBe(text);
+  });
+
+  it('keeps legacy fallback for invalid YAML rather than evaluating tags or adopting duplicate values', async () => {
+    const source = await sourceFile('invalid.md', [
+      '---', 'name: First', 'name: Second', 'description: !!js/function value', '---',
+      '# Legacy title', '', 'Safe fallback prose.'
+    ].join('\n'));
+    expect(await importSkillFile(source)).toMatchObject({ name: 'Legacy title', description: 'Safe fallback prose.' });
+  });
+
   it('derives a stable ID from a plain text filename and refuses duplicate publication', async () => {
-    const one = await sourceFile('My useful skill.txt', 'Plain instructions without a heading.\nContinue here.');
+    const one = await sourceFile('My useful skill.md', 'Plain instructions without a heading.\nContinue here.');
     const two = await sourceFile('my-useful-skill.md', '# Replacement\n\nMust not replace the first file.');
     expect((await importSkillFile(one)).id).toBe('my-useful-skill');
     await expect(importSkillFile(two)).rejects.toThrow(/already exists/i);
@@ -118,9 +160,9 @@ describe('managed Skills store', () => {
     const nul = await sourceFile('zero.md', 'before\0after');
     const oversized = await sourceFile('large.md', Buffer.alloc(MAX_SKILL_BYTES + 1, 0x61));
     const tooManyCharacters = await sourceFile('characters.md', 'a'.repeat(96_001));
-    const invalid = await sourceFile('...txt', 'text');
+    const invalid = await sourceFile('...md', 'text');
     const prompt = await sourceFile('prompt.md', 'reserved alias');
-    const windows = await sourceFile('con.txt', 'reserved device');
+    const windows = await sourceFile('con.md', 'reserved device');
     const windowsExt = await sourceFile('LPT1.notes.md', 'reserved device with extension');
     const folder = path.join(sources, 'folder.md');
     await fs.mkdir(folder);
@@ -159,14 +201,148 @@ describe('managed Skills store', () => {
     await expect(readSkill('nested')).rejects.toThrow(/not found/i);
   });
 
-  it('fails closed instead of silently omitting a valid 65th skill', async () => {
+  it('discovers a linked package only while its target belongs to an approved root', async () => {
+    const approved = path.join(userData, 'approved');
+    const packageDirectory = path.join(approved, 'shared-review');
+    await fs.mkdir(path.join(packageDirectory, 'references'), { recursive: true });
+    await fs.writeFile(path.join(packageDirectory, 'SKILL.md'), '# Shared review\n\nRead the linked package.');
+    await fs.writeFile(path.join(packageDirectory, 'references', 'notes.md'), 'Package resource.');
+    await fs.symlink(packageDirectory, path.join(userData, 'skills', 'shared-review'), process.platform === 'win32' ? 'junction' : 'dir');
+
+    expect(await listSkills()).toEqual([]);
+    const previous = getConfig();
+    await saveConfig({ ...previous, roots: [{ name: 'approved', path: approved }] });
+    try {
+      expect(await listSkills()).toEqual([{
+        id: 'shared-review',
+        name: 'Shared review',
+        description: 'Read the linked package.',
+        path: '/skills/shared-review/SKILL.md'
+      }]);
+      expect((await readSkill('shared-review')).text).toContain('Read the linked package.');
+      const readDisabled = { ...getConfig(), capabilities: { ...getConfig().capabilities, read: false } };
+      await saveConfig(readDisabled);
+      expect(await listSkills()).toEqual([]);
+      await expect(readSkill('shared-review')).rejects.toThrow(/not found/i);
+      await saveConfig({ ...readDisabled, capabilities: { ...readDisabled.capabilities, read: true } });
+      expect(await listSkills()).toHaveLength(1);
+    } finally {
+      await saveConfig(previous);
+    }
+    expect(await listSkills()).toEqual([]);
+    await expect(readSkill('shared-review')).rejects.toThrow(/not found/i);
+  });
+
+  it('never opens an unapproved target when a linked package is retargeted mid-scan', async () => {
+    const approved = path.join(userData, 'approved-race');
+    const approvedPackage = path.join(approved, 'race-review');
+    const unapprovedPackage = path.join(userData, 'unapproved-race', 'race-review');
+    await fs.mkdir(approvedPackage, { recursive: true });
+    await fs.mkdir(unapprovedPackage, { recursive: true });
+    await fs.writeFile(path.join(approvedPackage, 'SKILL.md'), '# Approved race\n\nSAFE_TEXT');
+    await fs.writeFile(path.join(unapprovedPackage, 'SKILL.md'), '# Unapproved race\n\nSECRET_TEXT');
+    const link = path.join(userData, 'skills', 'race-review');
+    await fs.symlink(approvedPackage, link, process.platform === 'win32' ? 'junction' : 'dir');
+    const previous = getConfig();
+    await saveConfig({ ...previous, roots: [{ name: 'approved-race', path: approved }] });
+
+    const originalLstat = rawFs.lstat.bind(rawFs);
+    const originalOpen = rawFs.open.bind(rawFs);
+    const aliasFile = path.resolve(path.join(link, 'SKILL.md'));
+    const maliciousFile = path.resolve(path.join(unapprovedPackage, 'SKILL.md'));
+    const opened: string[] = [];
+    let retargeted = false;
+    const lstatSpy = vi.spyOn(rawFs, 'lstat').mockImplementation((async (target: Parameters<typeof rawFs.lstat>[0], ...args: unknown[]) => {
+      const candidate = path.resolve(String(target));
+      const same = process.platform === 'win32'
+        ? candidate.toLowerCase() === aliasFile.toLowerCase()
+        : candidate === aliasFile;
+      if (!retargeted && same) {
+        retargeted = true;
+        await fs.unlink(link);
+        await fs.symlink(unapprovedPackage, link, process.platform === 'win32' ? 'junction' : 'dir');
+      }
+      return (originalLstat as (...values: unknown[]) => ReturnType<typeof rawFs.lstat>)(target, ...args);
+    }) as typeof rawFs.lstat);
+    const openSpy = vi.spyOn(rawFs, 'open').mockImplementation((async (target: Parameters<typeof rawFs.open>[0], ...args: unknown[]) => {
+      opened.push(path.resolve(String(target)));
+      return (originalOpen as (...values: unknown[]) => ReturnType<typeof rawFs.open>)(target, ...args);
+    }) as typeof rawFs.open);
+    try {
+      const outcome = await listSkills().then(skills => ({ skills }), (error: unknown) => ({ error }));
+      // Never, on any platform: the unapproved target is not opened.
+      expect(opened.some(file => process.platform === 'win32'
+        ? file.toLowerCase() === maliciousFile.toLowerCase()
+        : file === maliciousFile)).toBe(false);
+      if (retargeted) {
+        // The scan followed the link and saw it retargeted: it must refuse, not read through.
+        expect('error' in outcome ? String(outcome.error) : '').toMatch(/managed Skills folder changed/i);
+      } else {
+        // The Windows arm64 release runner did not list the junction-linked package at all
+        // (2.1.25 publish, twice, same image and Node as the passing 2.1.24 run). Then the race
+        // cannot happen there; the package must simply be absent, never read through the link.
+        expect('skills' in outcome ? outcome.skills.map(skill => skill.name) : []).not.toContain('race-review');
+      }
+    } finally {
+      lstatSpy.mockRestore();
+      openSpy.mockRestore();
+      await saveConfig(previous);
+    }
+  });
+
+  it('loads a 114-skill managed library without the legacy 64-skill ceiling', async () => {
+    const root = path.join(userData, 'skills');
+    for (let index = 0; index < 114; index++) {
+      const id = `skill-${String(index).padStart(3, '0')}`;
+      await fs.mkdir(path.join(root, id));
+      await fs.writeFile(path.join(root, id, 'SKILL.md'), `# ${id}\n\nInstruction ${index}.`);
+    }
+    await expect(listSkills()).resolves.toHaveLength(114);
+  });
+
+  it('bounds connector Skill catalog instructions with 128 maximum-description skills', async () => {
+    const root = path.join(userData, 'skills');
+    const description = 'x'.repeat(240);
+    for (let index = 0; index < MAX_SKILLS; index++) {
+      const id = `skill-${String(index).padStart(3, '0')}`;
+      await fs.mkdir(path.join(root, id));
+      await fs.writeFile(path.join(root, id, 'SKILL.md'), `---\nname: ${id}\ndescription: ${description}\n---\n`);
+    }
+    await expect(listSkills()).resolves.toHaveLength(MAX_SKILLS);
+    const instructions = skillCatalogInstructions();
+    expect(instructions.length).toBeLessThan(8_000);
+    expect(instructions).toMatch(/more skills are installed; read \/skills to list them\./);
+  });
+
+  it('rejects file and package imports beyond 128 with the translated limit key', async () => {
+    const root = path.join(userData, 'skills');
+    for (let index = 0; index < MAX_SKILLS; index++) {
+      const id = `skill-${String(index).padStart(3, '0')}`;
+      await fs.mkdir(path.join(root, id));
+      await fs.writeFile(path.join(root, id, 'SKILL.md'), `# ${id}\n\nInstruction ${index}.`);
+    }
+    await expect(listSkills()).resolves.toHaveLength(MAX_SKILLS);
+
+    const limitError = 'The Skills library supports at most 128 skills';
+    const file = await sourceFile('overflow-file.md', '# Overflow file\n\nMust not be imported.');
+    await expect(importSkillFile(file)).rejects.toThrow(limitError);
+
+    const packageRoot = path.join(sources, 'overflow-package');
+    await fs.mkdir(packageRoot);
+    await fs.writeFile(path.join(packageRoot, 'SKILL.md'), [
+      '---', 'name: Overflow Package', 'description: Must not be imported.', '---', '', 'Body.'
+    ].join('\n'));
+    await expect(importSkillPackage(packageRoot)).rejects.toThrow(limitError);
+  });
+
+  it('fails closed instead of silently omitting a valid over-cap skill', async () => {
     const root = path.join(userData, 'skills');
     for (let index = 0; index <= MAX_SKILLS; index++) {
       const id = `skill-${String(index).padStart(2, '0')}`;
       await fs.mkdir(path.join(root, id));
       await fs.writeFile(path.join(root, id, 'SKILL.md'), `# ${id}\n\nInstruction ${index}.`);
     }
-    await expect(listSkills()).rejects.toThrow(/64 skills/i);
+    await expect(listSkills()).rejects.toThrow(/128 skills/i);
   });
 
   it('bounds unrelated directory enumeration instead of scanning an arbitrary library', async () => {

@@ -2,16 +2,25 @@ import path from 'node:path';
 import { readFileStream } from '../codex/filesystem.js';
 import { effectiveCapabilities, getConfig } from '../config.js';
 import { currentCoreInstructions } from '../mcp/instructions.js';
-import { getSessionProject, projectWorkspace } from '../projects.js';
+import { getSessionProject, localProjectPath, projectWorkspace, serverRootOf } from '../projects.js';
+import { fsForRoot } from '../remote/project-fs.js';
 import { resolvePath } from '../sandbox.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, prependUserPrompt } from '../../shared/user-prompt.js';
 import { selectedSkillInstructions, type SelectedSkill } from './skill-prompt.js';
+import { listSkillLibrary } from '../skill-library.js';
+import type { RoutedSkillSelection } from '../../shared/skill-routing.js';
 
-type PromptScope = { sessionId?: string | null; projectId?: string | null };
+type PromptScope = { sessionId?: string | null; projectId?: string | null; autoSkills?: readonly RoutedSkillSelection[];
+  /** Verified broker-owned worker checkout; the selected project is only the source of instructions. */
+  workingDirectory?: string;
+};
 export type PromptLimits = { maxChars: number; maxBytes: number };
 type ProjectInstructions = { directory: string; text: string; truncated: boolean };
 const limits: PromptLimits = { maxChars: MAX_CHATGPT_MESSAGE_CHARS, maxBytes: Infinity };
 const cutNotice = '\n\n[Cut off because of the message limit. Read AGENTS.md yourself for the remaining instructions.]';
+
+const promptFolder = (scope: PromptScope) => scope.sessionId ? getSessionProject(scope.sessionId)
+  : scope.projectId ? projectWorkspace(scope.projectId) : Promise.resolve(null);
 
 /** One selected folder, never cwd inference, global discovery or a recursive document scan. */
 async function projectInstructions(scope: PromptScope): Promise<ProjectInstructions | null> {
@@ -22,15 +31,19 @@ async function projectInstructions(scope: PromptScope): Promise<ProjectInstructi
   if (!folder) return null;
   const directoryOnly = { directory: folder.virtual, text: '', truncated: false };
   if (!effectiveCapabilities(getConfig()).read) return directoryOnly;
-  const filename = path.join(folder.real, 'AGENTS.md');
+  // A folder on a server (#1469) keeps its AGENTS.md there: it is resolved by its virtual path,
+  // inside the same containment checks, and read over that server's SFTP session.
+  const server = serverRootOf(folder.virtual);
+  const filename = server ? `${folder.virtual.replace(/\/+$/, '')}/AGENTS.md` : path.join(folder.real, 'AGENTS.md');
+  const where = server ? { remote: true } : {};
   try {
-    const resolved = await resolvePath(getConfig().roots, filename, { allowMissing: true });
+    const resolved = await resolvePath(getConfig().roots, filename, { allowMissing: true, ...where });
     // At most four UTF-8 bytes per available UTF-16 code unit, plus one byte to detect overflow.
     // Stream a bounded prefix so even a gigabyte AGENTS.md never becomes a gigabyte allocation.
     const budget = MAX_CHATGPT_MESSAGE_CHARS * 4;
     const chunks: Buffer[] = [];
     let bytes = 0;
-    for await (const chunk of readFileStream(resolved.real)) {
+    for await (const chunk of server ? fsForRoot(server).readFileStream(resolved.real) : readFileStream(resolved.real)) {
       const kept = chunk.subarray(0, Math.max(0, budget + 1 - bytes));
       chunks.push(kept);
       bytes += kept.length;
@@ -42,7 +55,7 @@ async function projectInstructions(scope: PromptScope): Promise<ProjectInstructi
     if (text.includes('\0')) throw new Error('AGENTS.md must be a UTF-8 text file');
     // Permission/path changes during the asynchronous read cannot publish another folder's text.
     const current = scope.sessionId ? await getSessionProject(scope.sessionId) : await projectWorkspace(scope.projectId!);
-    const checked = await resolvePath(getConfig().roots, filename);
+    const checked = await resolvePath(getConfig().roots, filename, where);
     if (!current || current.real !== folder.real || checked.real !== resolved.real || !effectiveCapabilities(getConfig()).read)
       throw new Error('Project instructions changed location or permission while being read');
     return { directory: current.virtual, text: text.trim() ? text : '', truncated: bytes > budget };
@@ -57,10 +70,12 @@ async function projectInstructions(scope: PromptScope): Promise<ProjectInstructi
 }
 
 /** Preserve Core/task; reduce AGENTS to 5k before sharing remaining space across Skills. */
-export function fitSessionPrompt(text: string, core: string, agents: ProjectInstructions | null = null, budget = limits, skills: SelectedSkill[] = []): string {
+export function fitSessionPrompt(text: string, core: string, agents: ProjectInstructions | null = null, budget = limits, skills: SelectedSkill[] = [], workingDirectory?: string): string {
   const fits = (value: string): boolean => value.length <= Math.min(MAX_CHATGPT_MESSAGE_CHARS, budget.maxChars) &&
     Buffer.byteLength(value, 'utf8') <= budget.maxBytes;
-  const projectHeader = agents ? `Selected project directory: ${agents.directory}\nUse this directory as your default working directory and keep task work there unless the user or task requires another approved location. This project association grants no additional filesystem permissions.` : '';
+  const projectHeader = workingDirectory
+    ? `Worker working directory (allocated Git worktree): ${workingDirectory}\nUse this directory as your default working directory and keep worker task changes in this allocated worktree. The source project's AGENTS.md supplies instructions only; never use the source project as your working directory. This worktree grants no additional filesystem permissions.`
+    : agents ? `Selected project directory: ${agents.directory}\nUse this directory as your default working directory and keep task work there unless the user or task requires another approved location. This project association grants no additional filesystem permissions.` : '';
   const mandatory = [core, projectHeader].filter(Boolean).join('\n\n');
   const base = prependUserPrompt(text, mandatory);
   if (!fits(base)) throw new Error('The message and main instructions exceed the delivery limit (maximum 96,000 characters). Shorten the message or standing instructions.');
@@ -72,11 +87,12 @@ export function fitSessionPrompt(text: string, core: string, agents: ProjectInst
   const render = (length: number, skillCap = Infinity): string => {
     const sections = skills.map(skill => {
       const body = prefix(skill.text, skillCap);
+      const filename = skill.path ?? `/skills/${skill.id}/SKILL.md`;
       const notice = body.length < skill.text.length
-        ? `\n\n[Shortened to fit the message. Read /skills/${skill.id}/SKILL.md for the remaining instructions.]` : '';
-      return `# Selected skill: /${skill.id}\n\n<SKILL_INSTRUCTIONS>\n${body}${notice}\n</SKILL_INSTRUCTIONS>`;
+        ? `\n\n[Shortened to fit the message. Read ${filename} for the remaining instructions.]` : '';
+      return `# Selected skill: /${skill.id}\nPath: ${filename}\n\n<SKILL_INSTRUCTIONS>\n${body}${notice}\n</SKILL_INSTRUCTIONS>`;
     });
-    if (agents && content) sections.push(`${projectHeader}\n\n# AGENTS.md instructions for ${agents.directory}\n\n<INSTRUCTIONS>\n${prefix(content, length)}${length < content.length || agents.truncated ? cutNotice : ''}\n</INSTRUCTIONS>`);
+    if (agents && content) sections.push(`${projectHeader}\n\n${workingDirectory ? '# Source project AGENTS.md instructions (reference only; not a working directory)' : `# AGENTS.md instructions for ${agents.directory}`}\n\n<INSTRUCTIONS>\n${prefix(content, length)}${length < content.length || agents.truncated ? cutNotice : ''}\n</INSTRUCTIONS>`);
     else if (projectHeader) sections.push(projectHeader);
     return prependUserPrompt(text, [core, ...sections].filter(Boolean).join('\n\n'));
   };
@@ -107,14 +123,24 @@ export function fitSessionPrompt(text: string, core: string, agents: ProjectInst
 /** Opening normal/worker messages only. Callers own first-message eligibility;
  * follow-ups, helpers, handoff requests and resumed bootstraps never call this. */
 export async function prepareSessionPrompt(text: string, scope: PromptScope = {}, budget = limits, authored = text): Promise<string> {
-  const core = await currentCoreInstructions();
-  const skills = await selectedSkillInstructions(authored);
-  fitSessionPrompt(text, core, null, budget); // Only Core/task overflow is mandatory.
-  return fitSessionPrompt(text, core, await projectInstructions(scope), budget, skills);
+  const folder = await promptFolder(scope);
+  const skillScope = { projectPath: localProjectPath(folder) };
+  // Automatic routing has already frozen its decision from the app's published Skill catalog at
+  // admission, so those Skills come from that catalog: only the selected body is read below. Every
+  // other Skill the chat can use is still listed, exactly as without routing.
+  const library = await listSkillLibrary(scope.autoSkills !== undefined ? { ...skillScope, managedFromCatalog: true } : skillScope);
+  const core = await currentCoreInstructions(library);
+  const skills = await selectedSkillInstructions(authored, skillScope, library, scope.autoSkills);
+  fitSessionPrompt(text, core, null, budget, [], scope.workingDirectory); // Only Core/task overflow is mandatory.
+  const agents = await projectInstructions(scope);
+  if ((await promptFolder(scope))?.real !== folder?.real) throw new Error('The selected project changed during Skill preparation');
+  return fitSessionPrompt(text, core, agents, budget, skills, scope.workingDirectory);
 }
 
 /** Explicit follow-up selection adds Skills only, never repeats opening setup. */
-export async function prepareSkillFollowup(text: string, authored: string, budget = limits): Promise<string> {
-  const skills = await selectedSkillInstructions(authored);
+export async function prepareSkillFollowup(text: string, authored: string, budget = limits, scope: PromptScope = {}): Promise<string> {
+  const folder = await promptFolder(scope);
+  const skills = await selectedSkillInstructions(authored, { projectPath: localProjectPath(folder) }, undefined, scope.autoSkills);
+  if ((await promptFolder(scope))?.real !== folder?.real) throw new Error('The selected project changed during Skill preparation');
   return skills.length ? fitSessionPrompt(text, '', null, budget, skills) : text;
 }

@@ -1,11 +1,14 @@
 import type { InputEntry } from './input.js';
-import { browserInputModel } from '../../shared/input.js';
+import { estimateTokens } from '../../shared/session.js';
+import { authoredTextOf, browserInputModel } from '../../shared/input.js';
 import { getSession, observeSessionModel, readAsset, readEvents, upsertMessageEvent, writeAsset } from './store.js';
 import { validateInputImages } from './input-images.js';
 import sharp from 'sharp';
+import { positionOf } from '../../shared/chronology.js';
+import { notifyChanged } from './recorder.js';
 
 /** Project a tool handout or proven delivery into history, never the enqueue intent. */
-export async function recordDeliveredInput(entry: Readonly<InputEntry>, anchorCommitted?: () => void): Promise<boolean> {
+export async function recordDeliveredInput(entry: Readonly<InputEntry>, anchorCommitted?: (seq: number) => void): Promise<boolean> {
   const sessionId = entry.sessionId ?? entry.deliveredSessionId;
   const offered = entry.state === 'tool' && !!entry.owner && Number.isFinite(entry.offeredAt);
   const confirmed = ['sent', 'cancelled'].includes(entry.state) && !!entry.messageId && Number.isFinite(entry.deliveredAt);
@@ -26,7 +29,8 @@ export async function recordDeliveredInput(entry: Readonly<InputEntry>, anchorCo
     time, source: 'app' as const, kind: 'user_message' as const,
     // Browser delivery uses its exact native key, so a later page echo updates this row.
     // Tool delivery has no native user row and keeps the stable input id as its key.
-    messageId, inputId: entry.id, inputDelivery: offered ? 'offered' as const : 'confirmed' as const, authoredText: entry.text,
+    messageId, inputId: entry.id, inputDelivery: offered ? 'offered' as const : 'confirmed' as const, authoredText: authoredTextOf(entry),
+    wireTokenEstimate: estimateTokens(text),
     ...(messageId.startsWith('input:') && entry.toolTurnId ? { turnId: entry.toolTurnId } : {}),
     ...(entry.attachments?.length && entry.transportIntent !== 'tool' ? { attachments: entry.attachments } : {}),
     // Injection does not change the running model. Only the native send path verifies
@@ -38,8 +42,10 @@ export async function recordDeliveredInput(entry: Readonly<InputEntry>, anchorCo
   };
   // Delivery and its chronology do not depend on optional preview storage. This
   // stable row survives a quota failure; retry only enriches the same origin.
-  await upsertMessageEvent(sessionId, message);
-  anchorCommitted?.();
+  const committed = await upsertMessageEvent(sessionId, message);
+  anchorCommitted?.(positionOf(committed.event));
+  // Offered → confirmed revises this row in place; count and time cannot reveal it.
+  notifyChanged(sessionId);
   if (images.length) {
     await validateInputImages(images);
     const assets = [];
@@ -47,6 +53,7 @@ export async function recordDeliveredInput(entry: Readonly<InputEntry>, anchorCo
       assets.push(await writeAsset(sessionId, Buffer.from(image.dataUrl.split(',')[1]!, 'base64'), 'image/webp'));
     }
     await upsertMessageEvent(sessionId, { ...message, assets });
+    notifyChanged(sessionId);
   }
   return true;
 }

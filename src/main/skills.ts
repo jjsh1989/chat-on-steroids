@@ -1,13 +1,20 @@
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { rawPromises as fs, rawRealpathNative } from './rawfs.js';
+import { effectiveCapabilities, getConfig } from './config.js';
+import { approvedManagedSkillLink, sameSkillLink, type ApprovedSkillLink } from './skill-links.js';
+import { parseSkillFrontmatter } from './skill-metadata.js';
 import {
   MAX_SKILL_BYTES,
   MAX_SKILL_CHARS,
   MAX_SKILL_DESCRIPTION_CHARS,
   MAX_SKILL_NAME_CHARS,
   MAX_SKILLS,
+  SKILL_ORIGIN_FILENAME,
   SKILL_ID_PATTERN,
+  validGitHubSkillOrigin,
+  type GitHubSkillOrigin,
+  type ManagedSkill,
   type SkillSummary
 } from '../shared/skills.js';
 
@@ -34,6 +41,7 @@ const SIMPLE_SCALAR_UNSAFE = /^(?:[\[\]{}|>&*!%@`]|[-?:]\s)|:\s/;
 
 let root: string | null = null;
 let catalog: SkillSummary[] = [];
+let catalogRevisions = new Map<string, string>();
 let operations: Promise<unknown> = Promise.resolve();
 
 function serial<T>(work: () => Promise<T>): Promise<T> {
@@ -89,7 +97,7 @@ function slugSkillId(value: string): string {
 
 function importId(sourcePath: string): string {
   const extension = path.extname(sourcePath).toLowerCase();
-  if (extension !== '.md' && extension !== '.txt') throw new Error('Choose one Markdown or text skill file');
+  if (extension !== '.md') throw new Error('Choose one Markdown (.md) skill file');
   const filename = path.basename(sourcePath);
   const sourceName = filename.toLowerCase() === 'skill.md'
     ? path.basename(path.dirname(sourcePath))
@@ -109,7 +117,8 @@ function oneLine(value: string, limit: number): string {
 
 function simpleScalar(value: string): string | null {
   value = value.trim();
-  if (!value || SIMPLE_SCALAR_UNSAFE.test(value)) return null;
+  if (!value) return null;
+  // Quoted scalars may contain ": "; only a plain scalar is ambiguous with a nested mapping.
   if (value.startsWith('"') || value.endsWith('"')) {
     if (!(value.startsWith('"') && value.endsWith('"'))) return null;
     try {
@@ -121,7 +130,7 @@ function simpleScalar(value: string): string | null {
     if (!(value.startsWith("'") && value.endsWith("'"))) return null;
     return value.slice(1, -1).replace(/''/g, "'");
   }
-  return value;
+  return SIMPLE_SCALAR_UNSAFE.test(value) ? null : value;
 }
 
 function markdownBodyAndMetadata(text: string): { lines: string[]; name: string | null; description: string | null } {
@@ -174,6 +183,16 @@ function fallbackMetadata(lines: string[], id: string): { name: string; descript
 }
 
 function metadataFor(text: string, id: string): { name: string; description: string } {
+  // Publish the same bounded YAML metadata that discovered Skills use. The older simple
+  // scalar reader treats valid folded/literal descriptions as absent and substitutes body
+  // prose, so metadata-only consumers see a different Skill from the explicit picker.
+  try {
+    const metadata = parseSkillFrontmatter(text);
+    return {
+      name: oneLine(metadata.name, MAX_SKILL_NAME_CHARS),
+      description: oneLine(metadata.description, MAX_SKILL_DESCRIPTION_CHARS)
+    };
+  } catch { /* Plain Markdown and incomplete/invalid legacy headers keep their existing fallback. */ }
   const parsed = markdownBodyAndMetadata(text);
   const fallback = fallbackMetadata(parsed.lines, id);
   const name = parsed.name === null ? fallback.name : oneLine(parsed.name, MAX_SKILL_NAME_CHARS);
@@ -225,20 +244,39 @@ async function recordAt(candidateRoot: string, id: string): Promise<SkillRecord 
   const filename = path.join(directory, SKILL_FILENAME);
   try {
     const directoryStat = await fs.lstat(directory);
-    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) return null;
-    const directoryReal = process.platform === 'win32' ? await rawRealpathNative(directory) : await fs.realpath(directory);
-    if (!sameNativePath(directoryReal, directory)) return null;
+    let linked: ApprovedSkillLink | null = null;
+    let directoryReal: string;
+    if (directoryStat.isSymbolicLink()) {
+      const config = getConfig();
+      if (!effectiveCapabilities(config).read) return null;
+      linked = await approvedManagedSkillLink(candidateRoot, id, config.roots);
+      if (!linked) return null;
+      directoryReal = linked.real;
+    } else {
+      if (!directoryStat.isDirectory()) return null;
+      directoryReal = process.platform === 'win32' ? await rawRealpathNative(directory) : await fs.realpath(directory);
+      if (!sameNativePath(directoryReal, directory)) return null;
+    }
     const fileStat = await fs.lstat(filename);
     if (!fileStat.isFile() || fileStat.isSymbolicLink()) return null;
     const fileReal = process.platform === 'win32' ? await rawRealpathNative(filename) : await fs.realpath(filename);
-    if (!sameNativePath(fileReal, filename)) return null;
-    const snapshot = await readTextSnapshot(filename);
+    if (!sameNativePath(fileReal, path.join(directoryReal, SKILL_FILENAME))) return null;
+    // Once a linked package has been approved, read the canonical file itself. Opening through
+    // the alias here would leave a retarget window between realpath() and open(). The alias is
+    // still checked again below so a concurrent retarget invalidates the record.
+    const snapshot = await readTextSnapshot(fileReal);
     const currentFile = identityOf(await fs.lstat(filename));
     const currentDirectory = identityOf(await fs.lstat(directory));
     if (!sameIdentity(snapshot.identity, currentFile) ||
         !sameIdentity(identityOf(directoryStat), currentDirectory)) return null;
     const currentReal = process.platform === 'win32' ? await rawRealpathNative(filename) : await fs.realpath(filename);
-    if (!sameNativePath(currentReal, filename)) return null;
+    if (!sameNativePath(currentReal, path.join(directoryReal, SKILL_FILENAME))) return null;
+    if (linked) {
+      const config = getConfig();
+      if (!effectiveCapabilities(config).read) return null;
+      const currentLink = await approvedManagedSkillLink(candidateRoot, id, config.roots);
+      if (!currentLink || !sameSkillLink(linked, currentLink)) return null;
+    }
     const metadata = metadataFor(snapshot.text, id);
     return {
       summary: { id, ...metadata, path: `/skills/${id}/${SKILL_FILENAME}` },
@@ -273,7 +311,7 @@ async function scan(candidateRoot: string): Promise<SkillRecord[]> {
     const record = await recordAt(candidateRoot, name);
     if (!record) continue;
     records.push(record);
-    if (records.length > MAX_SKILLS) throw new Error('The Skills library supports at most 64 skills');
+    if (records.length > MAX_SKILLS) throw new Error('The Skills library supports at most 128 skills');
   }
   const rootAfter = await assertManagedRoot(candidateRoot);
   if (!sameIdentity(rootBefore, rootAfter)) throw new Error('The managed Skills folder changed while being read');
@@ -281,24 +319,60 @@ async function scan(candidateRoot: string): Promise<SkillRecord[]> {
   return records;
 }
 
+async function originAt(candidateRoot: string, id: string): Promise<GitHubSkillOrigin | null> {
+  const filename = path.join(candidateRoot, id, SKILL_ORIGIN_FILENAME);
+  try {
+    const stat = await fs.lstat(filename);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4096) return null;
+    const real = process.platform === 'win32' ? await rawRealpathNative(filename) : await fs.realpath(filename);
+    if (!sameNativePath(real, filename)) return null;
+    const snapshot = await readTextSnapshot(filename);
+    const value: unknown = JSON.parse(snapshot.text);
+    return validGitHubSkillOrigin(value) ? value : null;
+  } catch { return null; }
+}
+
+/** A crash between the two directory renames restores the old package before catalog scan. */
+async function recoverSkillBackups(candidateRoot: string): Promise<void> {
+  for (const name of await directoryNames(candidateRoot)) {
+    const match = /^\.backup-(.+)-([0-9a-f]{8}-[0-9a-f-]{27})$/.exec(name);
+    if (!match || !validSkillId(match[1]!)) continue;
+    const destination = path.join(candidateRoot, match[1]!);
+    try { await fs.lstat(destination); continue; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    const backup = path.join(candidateRoot, name);
+    const stat = await fs.lstat(backup);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || !sameNativePath(await fs.realpath(backup), backup)) continue;
+    if (!(await originAt(candidateRoot, name))) continue;
+    await fs.rename(backup, destination);
+  }
+}
+
 function publish(records: SkillRecord[]): void {
   catalog = records.map(record => ({ ...record.summary }));
+  catalogRevisions = new Map(records.map(record => [record.summary.id, record.revision]));
 }
 
 export function skillsDirectory(): string | null {
   return root;
 }
 
+/** Shared bounded snapshot reader for discovered metadata and explicit package imports. */
+export async function readSkillTextSnapshot(filename: string): Promise<{ bytes: Buffer; text: string; identity: FileIdentity }> {
+  return readTextSnapshot(filename);
+}
+
 export function initSkillsPath(userData: string): Promise<void> {
   return serial(async () => {
     if (!path.isAbsolute(userData)) throw new Error('Skills storage requires an absolute user-data path');
-    root = null; catalog = [];
+    root = null; catalog = []; catalogRevisions = new Map();
     await fs.mkdir(userData, { recursive: true });
     const realUserData = process.platform === 'win32' ? await rawRealpathNative(userData) : await fs.realpath(userData);
     const candidate = path.join(realUserData, 'skills');
     try { await fs.mkdir(candidate); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
     await assertManagedRoot(candidate);
+    await recoverSkillBackups(candidate);
     const records = await scan(candidate);
     root = candidate;
     publish(records);
@@ -314,6 +388,27 @@ export function listSkills(): Promise<SkillSummary[]> {
   });
 }
 
+/** Metadata already published by init/import/update. Never rescans SKILL.md at send time. */
+export function skillCatalogSnapshot(): Array<SkillSummary & { revision: string }> {
+  return catalog.flatMap(summary => {
+    const revision = catalogRevisions.get(summary.id);
+    return revision ? [{ ...summary, revision }] : [];
+  });
+}
+
+export function listManagedSkills(): Promise<ManagedSkill[]> {
+  return serial(async () => {
+    if (!root) return [];
+    const candidateRoot = requiredRoot();
+    const records = await scan(candidateRoot);
+    const result: ManagedSkill[] = [];
+    for (const record of records) result.push({ ...record.summary, origin: await originAt(candidateRoot, record.summary.id) });
+    await assertManagedRoot(candidateRoot);
+    publish(records);
+    return result;
+  });
+}
+
 export function readSkill(id: string): Promise<SkillDocument> {
   return serial(async () => {
     assertSkillId(id);
@@ -322,6 +417,21 @@ export function readSkill(id: string): Promise<SkillDocument> {
     const record = await recordAt(directory, id);
     if (!sameIdentity(before, await assertManagedRoot(directory))) throw new Error('The managed Skills folder changed while being read');
     if (!record) throw new Error(`Skill "${id}" was not found or is invalid`);
+    return { summary: { ...record.summary }, text: record.text };
+  });
+}
+
+/** Read exactly one routed body and prove it still matches the metadata snapshot that selected it. */
+export function readSkillAtRevision(id: string, expectedRevision: string): Promise<SkillDocument> {
+  return serial(async () => {
+    assertSkillId(id);
+    if (!/^[0-9a-f]{64}$/i.test(expectedRevision)) throw new Error('Auto-selected Skill revision is invalid');
+    const directory = requiredRoot();
+    const before = await assertManagedRoot(directory);
+    const record = await recordAt(directory, id);
+    if (!sameIdentity(before, await assertManagedRoot(directory))) throw new Error('The managed Skills folder changed while being read');
+    if (!record) throw new Error(`Auto-selected Skill "${id}" was removed or became invalid`);
+    if (record.revision !== expectedRevision) throw new Error(`Auto-selected Skill "${id}" changed after routing; send the message again`);
     return { summary: { ...record.summary }, text: record.text };
   });
 }
@@ -341,7 +451,7 @@ export function importSkillFile(sourcePath: string): Promise<SkillSummary> {
     const source = await readTextSnapshot(sourcePath);
     const candidateRoot = requiredRoot();
     const current = await scan(candidateRoot);
-    if (current.length >= MAX_SKILLS) throw new Error('The Skills library supports at most 64 skills');
+    if (current.length >= MAX_SKILLS) throw new Error('The Skills library supports at most 128 skills');
     const names = await directoryNames(candidateRoot);
     if (names.some(name => name.toLowerCase() === id.toLowerCase())) throw new Error(`Skill "${id}" already exists`);
 
@@ -389,6 +499,223 @@ export function importSkillFile(sourcePath: string): Promise<SkillSummary> {
   });
 }
 
+async function packageDocument(sourcePath: string): Promise<{ id: string; bytes: Buffer; revision: string }> {
+  if (!path.isAbsolute(sourcePath)) throw new Error('Choose an absolute skill package folder');
+  const sourceDirectory = await fs.lstat(sourcePath);
+  if (!sourceDirectory.isDirectory() || sourceDirectory.isSymbolicLink()) throw new Error('Choose a real skill package folder');
+  const id = slugSkillId(path.basename(sourcePath));
+  const sourceFile = path.join(sourcePath, SKILL_FILENAME);
+  const sourceStat = await fs.lstat(sourceFile);
+  if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error('A skill package needs a regular SKILL.md');
+  const document = await readTextSnapshot(sourceFile);
+  const { parseSkillFrontmatter } = await import('./skill-metadata.js');
+  parseSkillFrontmatter(document.text);
+  return { id, bytes: document.bytes, revision: createHash('sha256').update(document.bytes).digest('hex') };
+}
+
+function originBytes(origin: GitHubSkillOrigin | undefined, revision: string): Buffer | undefined {
+  if (!origin) return undefined;
+  if (!validGitHubSkillOrigin(origin) || origin.skillSha256 !== revision) throw new Error('GitHub skill origin does not match SKILL.md');
+  return Buffer.from(JSON.stringify(origin), 'utf8');
+}
+
+export function skillPackageRevision(files: Array<{ relative: string; sha: string; size: number }>): string {
+  const ordered = [...files].sort((left, right) => left.relative < right.relative ? -1 : left.relative > right.relative ? 1 : 0)
+    .map(file => ({ relative: file.relative, sha: file.sha, size: file.size }));
+  return createHash('sha256').update(JSON.stringify(ordered)).digest('hex');
+}
+
+/** Link an existing local package without replacing its files or claiming missing resources are current. */
+export function linkSkillPackage(id: string, source: GitHubSkillOrigin): Promise<void> {
+  return serial(async () => {
+    assertSkillId(id);
+    if (!validGitHubSkillOrigin(source)) throw new Error('Invalid GitHub skill source');
+    const name = source.directory.split('/').filter(Boolean).at(-1) ?? new URL(source.url).pathname.split('/')[2]!;
+    if (slugSkillId(name) !== id) throw new Error('The GitHub folder name does not match this skill');
+    const candidateRoot = requiredRoot();
+    await assertManagedRoot(candidateRoot);
+    const record = await recordAt(candidateRoot, id);
+    if (!record) throw new Error('The local skill was removed or changed');
+    if (await originAt(candidateRoot, id)) throw new Error('This skill already has a GitHub source');
+    if (record.revision !== source.skillSha256) throw new Error('The local SKILL.md does not match this GitHub source');
+    const directory = path.join(candidateRoot, id);
+    const beforeDirectory = identityOf(await fs.lstat(directory));
+    const files: Array<{ relative: string; sha: string; size: number }> = [];
+    let folders = 0, entries = 0, bytes = 0;
+    const collect = async (folder: string, relative: string, depth: number): Promise<void> => {
+      if (++folders > 12 || depth > 10) throw new Error('The local skill has too many nested folders');
+      const before = identityOf(await fs.lstat(folder));
+      const directory = await fs.opendir(folder);
+      try { for await (const entry of directory) {
+        if (++entries > 52) throw new Error('The local skill exceeds GitHub update limits');
+        if (relative === '' && entry.name === SKILL_ORIGIN_FILENAME)
+          throw new Error('The local skill already contains origin metadata');
+        const nextRelative = [relative, entry.name].filter(Boolean).join('/');
+        const filename = path.join(folder, entry.name);
+        const stat = await fs.lstat(filename);
+        if (stat.isSymbolicLink()) throw new Error('The local skill contains a linked resource');
+        if (stat.isDirectory()) { await collect(filename, nextRelative, depth + 1); continue; }
+        if (!stat.isFile()) throw new Error('The local skill contains an unsupported resource');
+        if (files.length >= 40 || (bytes += stat.size) > 32 * 1024 * 1024)
+          throw new Error('The local skill exceeds GitHub update limits');
+        const handle = await fs.open(filename, 'r');
+        let content: Buffer;
+        try {
+          if (!sameIdentity(identityOf(stat), identityOf(await handle.stat())))
+            throw new Error('The local skill changed while linking');
+          content = Buffer.alloc(stat.size);
+          let offset = 0;
+          while (offset < content.length) {
+            const read = await handle.read(content, offset, content.length - offset, offset);
+            if (!read.bytesRead) throw new Error('The local skill changed while linking');
+            offset += read.bytesRead;
+          }
+          if (!sameIdentity(identityOf(stat), identityOf(await handle.stat())))
+            throw new Error('The local skill changed while linking');
+        } finally { await handle.close(); }
+        if (!sameIdentity(identityOf(stat), identityOf(await fs.lstat(filename))))
+          throw new Error('The local skill changed while linking');
+        files.push({ relative: nextRelative, size: content.length,
+          sha: createHash('sha1').update(`blob ${content.length}\0`).update(content).digest('hex') });
+      } } finally { await directory.close().catch(() => undefined); }
+      if (!sameIdentity(before, identityOf(await fs.lstat(folder))))
+        throw new Error('The local skill changed while linking');
+    };
+    await collect(directory, '', 0);
+    const current = await recordAt(candidateRoot, id);
+    if (!current || current.revision !== record.revision || !sameIdentity(beforeDirectory, identityOf(await fs.lstat(directory))))
+      throw new Error('The local skill changed while linking');
+    await assertManagedRoot(candidateRoot);
+    const origin = { ...source, revision: skillPackageRevision(files) };
+    const filename = path.join(directory, SKILL_ORIGIN_FILENAME);
+    let owned: FileIdentity | null = null;
+    try {
+      const directoryReal = process.platform === 'win32' ? await rawRealpathNative(directory) : await fs.realpath(directory);
+      if (!sameIdentity(beforeDirectory, identityOf(await fs.lstat(directory))) || !sameNativePath(directoryReal, directory))
+        throw new Error('The local skill changed while linking');
+      const handle = await fs.open(filename, 'wx', 0o600);
+      try { await handle.writeFile(JSON.stringify(origin)); await handle.sync(); owned = identityOf(await handle.stat()); }
+      catch (error) { owned = identityOf(await handle.stat()); throw error; }
+      finally { await handle.close(); }
+      if ((await originAt(candidateRoot, id))?.revision !== origin.revision ||
+          (await recordAt(candidateRoot, id))?.revision !== record.revision)
+        throw new Error('The GitHub source could not be verified');
+    } catch (error) {
+      await removeOwnedFile(filename, owned);
+      throw error;
+    }
+  });
+}
+
+/** Publish a complete selected package using the same serialized managed-library owner. */
+export function importSkillPackage(sourcePath: string, origin?: GitHubSkillOrigin): Promise<SkillSummary> {
+  return serial(async () => {
+    const document = await packageDocument(sourcePath);
+    const id = document.id;
+    const candidateRoot = requiredRoot();
+    const current = await scan(candidateRoot);
+    if (current.length >= MAX_SKILLS) throw new Error('The Skills library supports at most 128 skills');
+    const names = await directoryNames(candidateRoot);
+    if (names.some(name => name.toLowerCase() === id.toLowerCase())) throw new Error(`Skill "${id}" already exists`);
+    const { publishSkillPackage } = await import('./skill-package.js');
+    await publishSkillPackage(sourcePath, candidateRoot, id, document.bytes, originBytes(origin, document.revision));
+    const records = await scan(candidateRoot);
+    const installed = records.find(record => record.summary.id === id);
+    if (!installed) throw new Error('The imported package changed during publication');
+    publish(records);
+    return { ...installed.summary };
+  });
+}
+
+/** Replace exactly one GitHub-owned package; old contents remain recoverable in OS Trash. */
+export function updateSkillPackage(
+  id: string,
+  expectedOrigin: GitHubSkillOrigin,
+  sourcePath: string,
+  nextOrigin: GitHubSkillOrigin,
+  moveToTrash: (directory: string) => Promise<void>
+): Promise<{ updated: boolean; warning?: string }> {
+  return serial(async () => {
+    assertSkillId(id);
+    const candidateRoot = requiredRoot();
+    const document = await packageDocument(sourcePath);
+    if (document.id !== id) throw new Error('GitHub skill folder no longer matches the installed skill');
+    const metadata = originBytes(nextOrigin, document.revision);
+    if (!metadata || !validGitHubSkillOrigin(expectedOrigin) || nextOrigin.url !== expectedOrigin.url)
+      throw new Error('GitHub skill source changed');
+    await assertManagedRoot(candidateRoot);
+    const old = await recordAt(candidateRoot, id);
+    const oldOrigin = await originAt(candidateRoot, id);
+    if (!old || !oldOrigin || oldOrigin.url !== expectedOrigin.url || oldOrigin.revision !== expectedOrigin.revision)
+      throw new Error('The skill changed while checking for updates; reload the library');
+    if (nextOrigin.revision === oldOrigin.revision) return { updated: false };
+    if (old.revision !== oldOrigin.skillSha256)
+      throw new Error('SKILL.md has local edits; preserve them before updating from GitHub');
+    const oldDirectory = identityOf(await fs.lstat(path.join(candidateRoot, id)));
+
+    const operation = randomUUID();
+    const stage = path.join(candidateRoot, `.update-${id}-${operation}`);
+    const backup = path.join(candidateRoot, `.backup-${id}-${operation}`);
+    const destination = path.join(candidateRoot, id);
+    const { publishSkillPackage } = await import('./skill-package.js');
+    await publishSkillPackage(sourcePath, candidateRoot, path.basename(stage), document.bytes, metadata);
+    const stageDirectory = identityOf(await fs.lstat(stage));
+    let oldMoved = false, nextMoved = false;
+    try {
+      const current = await recordAt(candidateRoot, id);
+      const currentOrigin = await originAt(candidateRoot, id);
+      if (!current || current.revision !== old.revision || !currentOrigin || currentOrigin.revision !== oldOrigin.revision ||
+          !sameIdentity(oldDirectory, identityOf(await fs.lstat(destination))))
+        throw new Error('The skill changed before update; reload the library');
+      await assertManagedRoot(candidateRoot);
+      await fs.rename(destination, backup); oldMoved = true;
+      await fs.rename(stage, destination); nextMoved = true;
+      const installed = await recordAt(candidateRoot, id);
+      const installedOrigin = await originAt(candidateRoot, id);
+      if (!installed || installed.revision !== document.revision || installedOrigin?.revision !== nextOrigin.revision)
+        throw new Error('The updated skill could not be verified');
+      publish(await scan(candidateRoot));
+    } catch (error) {
+      let restored = true;
+      if (nextMoved) try { await fs.rename(destination, stage); } catch { restored = false; }
+      if (oldMoved) try { await fs.rename(backup, destination); } catch { restored = false; }
+      if (restored) {
+        try {
+          if (sameFileObject(stageDirectory, identityOf(await fs.lstat(stage)))) await moveToTrash(stage);
+        } catch { /* Keep an unclaimed stage rather than trashing another path. */ }
+      }
+      if (!restored) throw new Error('Skill update could not restore the previous version; its backup was kept in Skills storage', { cause: error });
+      throw error;
+    }
+    try {
+      const stored = identityOf(await fs.lstat(backup));
+      if (!sameFileObject(oldDirectory, stored)) throw new Error('The previous skill folder changed before cleanup');
+      await moveToTrash(backup);
+    }
+    catch { return { updated: true, warning: 'Updated, but the previous version could not be moved to Trash' }; }
+    return { updated: true };
+  });
+}
+
+/** The caller supplies the OS Trash operation; removing a skill includes all package resources. */
+export function removeSkill(id: string, moveToTrash: (directory: string) => Promise<void>): Promise<void> {
+  return serial(async () => {
+    assertSkillId(id);
+    const candidateRoot = requiredRoot();
+    await assertManagedRoot(candidateRoot);
+    const record = await recordAt(candidateRoot, id);
+    if (!record) throw new Error(`Skill "${id}" was not found or is invalid`);
+    const directory = path.join(candidateRoot, id);
+    const before = identityOf(await fs.lstat(directory));
+    const current = await recordAt(candidateRoot, id);
+    await assertManagedRoot(candidateRoot);
+    if (!current || record.revision !== current.revision || !sameIdentity(before, identityOf(await fs.lstat(directory))))
+      throw new Error('The skill changed before removal; reload the library');
+    await moveToTrash(directory);
+    publish(await scan(candidateRoot));
+  });
+}
+
 /** Synchronous projection for MCP/opening instructions; async owners refresh it first. */
 export function skillCatalogInstructions(): string {
   const directory = root;
@@ -402,6 +729,26 @@ export function skillCatalogInstructions(): string {
     'Install or maintain requested skills with existing filesystem and command capabilities under current guards. Skills add no tools, hooks or permissions and never change the project working directory.'
   ];
   if (!catalog.length) lines.push('No skills are installed.');
-  else lines.push(...catalog.map(summary => `- ${JSON.stringify(summary)}`));
+  else {
+    const rowsBudget = 7_000;
+    let rowsChars = 0;
+    for (let index = 0; index < catalog.length; index++) {
+      const summary = catalog[index]!;
+      const line = `- ${JSON.stringify({
+        id: summary.id,
+        name: summary.name,
+        description: oneLine(summary.description, 160)
+      })}`;
+      const remaining = catalog.length - index - 1;
+      const omitted = remaining > 0 ? `- ${remaining} more skills are installed; read /skills to list them.` : '';
+      const added = (rowsChars ? 1 : 0) + line.length + (omitted ? 1 + omitted.length : 0);
+      if (rowsChars + added > rowsBudget) {
+        lines.push(`- ${catalog.length - index} more skills are installed; read /skills to list them.`);
+        break;
+      }
+      lines.push(line);
+      rowsChars += (rowsChars ? 1 : 0) + line.length;
+    }
+  }
   return lines.join('\n');
 }

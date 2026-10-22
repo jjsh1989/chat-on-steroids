@@ -47,6 +47,20 @@ the disclosure and verifies calculations still update. Known feature quotas use
 human labels (Deep research, File uploads, Pasted text files, Image generation),
 and missing model balance text no longer assumes a position for the quota rows.
 
+## ChatGPT GPT-6 lanes, 7 October 2026
+
+The account catalog lists GPT-6 as two lanes, and messages record them as such:
+`gpt-6` (the picker's Instant, effort `none`) and `gpt-6-thinking` (Medium, High).
+`gpt-6` is ChatGPT's automatic lane: a message sent with it can be answered by
+`gpt-6-thinking`, so the answer's model, not the selection, says which lane ran
+(observed 2026-10-08). GPT-5.6 and
+GPT-5.5 appear the same way (`gpt-5-6-instant` / `gpt-5-6-thinking`). Both lanes
+count toward their generation in the weekly message split. `gpt-5-6-instant`
+joins the existing `gpt-5-6` and `gpt-5-6-thinking` aliases of `gpt-5.6-sol`.
+No official API identity or rate has been established for ChatGPT's `gpt-6`
+lanes, so they stay unpriced (a manual rate can be entered) rather than being
+equated with `gpt-6-sol` or Astra.
+
 ## Official rate verification, 5 September 2026
 
 The following official pages were searched and opened directly. These are Standard
@@ -94,3 +108,9 @@ The screenshot's `gpt-5-6-thinking` row was unpriced because the comparison and 
 Official Standard short-context cached-input rates were checked on 7 September 2026: [Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol) $0.40, [Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra) $0.20, [Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) $0.02, [Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) $1.00 and [GPT-5.5](https://developers.openai.com/api/docs/models/gpt-5.5) $0.50 per million tokens. Terra and Luna exact API IDs now have defaults. No speculative provider aliases were added. These remain editable comparison prices, with the existing context-length/service-tier limitations above.
 
 The four model keys present in the current usage cache are `gpt-5-6-thinking`, `gpt-5.6`, `gpt-5.6-sol`, and `gpt-6-pro`; all now have a baseline. The screenshot's 427245 tokens project to $0.2050776, displayed as $0.21 at the default formula. The regression first failed with all 427245 tokens unpriced; then shared/renderer tests passed, including raw ID retention, unknown IDs, explicit rates, and clearing/reloading an alias rate without rereading recordings. Source and tests only; no package, installation or live UI proof was performed for this change.
+
+## Rates rechecked 2026-09-27
+
+Official Standard short-context cached-input rates were rechecked on 27 September 2026. Sol ($0.40), Terra ($0.20), Luna ($0.02), Astra ($1.00) and GPT-5.5 ($0.50) are unchanged. Two new models were added under their exact API IDs: [GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol) at $0.20 and [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) at $0.01.
+
+The ChatGPT IDs `gpt-5-5-instant` and `gpt-5-5-thinking`, labelled "5.5" in the live model catalog, were unpriced. They now alias `gpt-5.5`, the one GPT-5.5 API model with a cached-input rate. ChatGPT's plain `gpt-6` still has no alias, because which API model it corresponds to is not established.

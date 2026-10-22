@@ -13,22 +13,24 @@ beforeEach(() => {
 });
 afterEach(() => dom.window.close());
 
-it('keeps the real compact reminder at the end of Setup and only shows once after acknowledgement', async () => {
-  const { initToolApprovalNotice } = await import('../src/renderer/tool-approval.js');
+it('keeps the real reminder in the ChatGPT step of Setup and only shows once after acknowledgement', async () => {
   let opening!: () => void;
-  initToolApprovalNotice(listener => { opening = listener; return () => {}; });
-  const permanent = document.getElementById('toolApprovalSetup')!;
-  expect(permanent.previousElementSibling?.classList.contains('advanced')).toBe(true);
-  expect(permanent.textContent).toContain('Always allow');
-  const image = permanent.querySelector('img')!;
+  Object.defineProperty(window, 'api', { configurable: true, value: { onToolApprovalNotice: (listener: () => void) => { opening = listener; return () => {}; } } });
+  const { initSetupGuide } = await import('../src/renderer/setup-guide.js');
+  initSetupGuide();
+  // The approval prompt is the last picture of the step that creates the plugin, named by its move.
+  const permanent = document.querySelector('[data-setup-guide="plugin"]')!;
+  expect([...document.querySelectorAll('#pluginMoves .guide-move')].at(-1)?.textContent).toContain('always for this plugin');
+  const image = [...permanent.querySelectorAll('img')].at(-1)!;
   expect(image.src).toContain('tool-approval.jpg');
-  expect(createHash('sha256').update(readFileSync('src/renderer/setup-images/tool-approval.jpg')).digest('hex')).toBe('cec727494000b9bfd87352e9248f448ddc54c042a19ffbd3b20acad8dccdb83f');
+  expect(createHash('sha256').update(readFileSync('src/renderer/setup-images/tool-approval.jpg')).digest('hex')).toBe('0cfa0aa71e896eb5201253e565442fa792c3e60070adcaffd7033167c546ef87');
   const dialog = document.querySelector('.tool-approval-dialog') as HTMLDialogElement;
   expect(dialog.open).toBe(false); opening(); expect(dialog.open).toBe(true);
   expect(window.localStorage.getItem('cos.tool-approval-notice.v1')).toBeNull();
   (dialog.querySelector('button') as HTMLButtonElement).click();
   expect(dialog.open).toBe(false); opening(); expect(dialog.open).toBe(false);
-  expect(permanent.querySelector('img')).toBe(image);
+  expect([...permanent.querySelectorAll('img')].at(-1)).toBe(image);
+  const { initToolApprovalNotice } = await import('../src/renderer/tool-approval.js');
   initToolApprovalNotice(listener => { opening = listener; return () => {}; });
   opening(); expect([...document.querySelectorAll('dialog')].some(item => item.open)).toBe(false);
 });

@@ -21,30 +21,47 @@ import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { effectiveCapabilities, defaultConfig } from '../src/main/config.js';
+import * as identity from '../src/main/connector-identity.js';
+import { connectorName } from '../src/shared/connector-names.js';
+import { effectiveCapabilities, defaultConfig, getConfig } from '../src/main/config.js';
+import { EXEC_COMMAND_CMD_DESCRIPTION, LAUNCHES_WINDOWS_POWERSHELL_5, WINDOWS_SHELL_GUIDANCE } from '../src/main/codex/tool-specs.js';
+import { skillCatalogInstructions } from '../src/main/skills.js';
 import { lastRequestAt, selfTestHeaders, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from '../src/main/mcp/server.js';
 import { lastToolCallAt, type ToolContext } from '../src/main/mcp/tools.js';
+import { publishPluginSurface, pluginRefreshStatuses, resetPluginRefreshForTests } from '../src/main/plugin-refresh.js';
 import { friendlyError } from '../src/main/mcp/kernel.js';
+import { serverInstructions } from '../src/main/mcp/instructions.js';
 import { SURFACE_LIST, surfaceDefinition, type SurfaceId } from '../src/main/mcp/surfaces.js';
 import {
   createSession,
   initSessionStore,
+  readRecentEvents,
   rebindSession,
   readSessionPlan
 } from '../src/main/session/store.js';
+import {
+  bindConversation,
+  onSpawnRequest,
+  onSwarmPersistNow,
+  resetAgentsForTests,
+  spawn
+} from '../src/main/agents.js';
 import { resetWorkspaces, setWorkspaceFor } from '../src/main/workspace.js';
 import { DEFAULT_CAPABILITIES, type Capabilities, type Root } from '../src/shared/types.js';
-import type { ToolOutcome } from '../src/shared/session.js';
+import { foldProgress, type ToolOutcome } from '../src/shared/session.js';
 import { emptyEvidence, noteExec, noteOutcome, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
 import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { WINDOWS_COMPUTER_METHODS, WINDOWS_COMPUTER_READ_METHODS } from '../src/shared/windows-computer.js';
 import { BROWSER_TOOLS, BROWSER_READ_TOOLS } from '../src/shared/browser-control.js';
 import { resetBlockedChatsForTests, setChatBlocked } from '../src/main/session/blocked-chats.js';
+import { resetTrustedChatsForTests, setChatTrusted } from '../src/main/session/trusted-chats.js';
 import {
   abortContinuation,
   attachSummary,
   dispatchContinuationSourceSendNow,
   beginContinuationSourceSendNow,
+  claimContinuationNow,
+  commitContinuation,
   openContinuationNow,
   resetContinuationsForTests
 } from '../src/main/session/continuation.js';
@@ -59,6 +76,7 @@ import {
   UNATTENDED_EXEC_NOTICE_MS
 } from '../src/main/codex/ownership.js';
 import { unifiedExecManager } from '../src/main/codex/manager.js';
+import * as execHints from '../src/main/exec-hints.js';
 import { locateRipgrep } from '../src/main/ripgrep.js';
 import { IS_WINDOWS, makeTempDir, removeTempDir, writeTree } from './helpers.js';
 
@@ -232,6 +250,13 @@ let outside: string;
 let endpoint: McpEndpoint;
 let ctx: ToolContext;
 
+/**
+ * Characters of Core server instructions, measured with everything switched on. There is no
+ * provider limit behind it; it keeps the text read at the start of every chat from growing
+ * unnoticed, so raise it only together with a deliberate addition.
+ */
+const CORE_INSTRUCTIONS_BUDGET = 21_500;
+
 function withCaps(overrides: Partial<Capabilities>): Capabilities {
   return { ...DEFAULT_CAPABILITIES, ...overrides };
 }
@@ -293,6 +318,8 @@ beforeEach(async () => {
   ctx.roots = [{ name: 'workspace', path: approved }];
   ctx.sessionTools = false;
   ctx.agentTools = false;
+  getConfig().multiAgent.strictChatAllowlist = false;
+  resetTrustedChatsForTests();
   // A fresh endpoint gives every test a fresh ChatGPT tool-surface snapshot. Tests
   // that change permissions mid-flight still exercise the real live-config path.
   endpoint = await startMcpServer(() => ctx);
@@ -412,6 +439,19 @@ describe('endpoint hardening', () => {
     expect(lastToolCallAt()).not.toBeNull();
   });
 
+  it('counts only successful provider calls as current-publication working evidence', async () => {
+    resetPluginRefreshForTests();
+    publishPluginSurface('core', 'Chat On Steroids Core', 'test', '', [{ name: 'read', description: 'Read', inputSchema: { type: 'object' } }]);
+    try {
+      await rawPost(endpoint.urls.core, JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } } }), selfTestHeaders());
+      expect((await pluginRefreshStatuses()).core?.responding).toBeUndefined();
+      await core('tools/call', { name: 'read', arguments: { paths: ['/workspace/missing-file'] } });
+      expect((await pluginRefreshStatuses()).core?.responding).toBeUndefined();
+      await core('tools/call', { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } });
+      expect((await pluginRefreshStatuses()).core).toMatchObject({ responding: true });
+    } finally { resetPluginRefreshForTests(); }
+  });
+
   it('counts a request to either surface as ChatGPT reaching this PC', async () => {
     expect(lastRequestAt()).toBeNull();
     await desktop('tools/list');
@@ -477,6 +517,19 @@ describe('endpoint hardening', () => {
       tunnelProbeHeaders()
     );
     expect(lastRequestAt()).toBeNull();
+  });
+
+  it('keeps serving the configured name as resource_name after a rename was learned', async () => {
+    identity.noteServedRequest('prm-rename', 'core');
+    identity.noteAppSightings([{ requestId: 'prm-rename', appId: 'asdk_app_prm', linkId: 'link_prm', appName: 'My tools' }]);
+    try {
+      const url = new URL(endpoint.urls.core);
+      url.pathname = `/.well-known/oauth-protected-resource${url.pathname}`;
+      const metadata = JSON.parse((await rawGet(url.toString())).text);
+      expect(metadata.resource_name).toBe(connectorName('core', getConfig().connectorSuffix));
+    } finally {
+      identity.resetConnectorIdentityForTests();
+    }
   });
 
   it('serves protected resource metadata per surface, naming that surface', async () => {
@@ -594,7 +647,7 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await core('tools/list'));
     // find is absent because exec_command is present — they are mutually exclusive.
-    expect(names).toEqual(['agents', 'apply_patch', 'exec', 'exec_command', 'read', 'update_plan', 'view_image', 'write_stdin']);
+    expect(names).toEqual(['agents', 'apply_patch', 'exec', 'exec_command', 'read', 'save_image', 'update_plan', 'usage', 'view_image', 'write_stdin']);
     for (const name of surfaceDefinition('desktop').tools.filter(name => name !== 'exec')) expect(names, name).not.toContain(name);
   });
 
@@ -671,6 +724,63 @@ describe('surface boundaries', () => {
     for (const field of ['model', 'reasoning_effort']) {
       expect(worker.properties[field].description, field).toMatch(/app settings/i);
     }
+  });
+
+  // #1417 again (2.1.41, VM): ChatGPT's approval classifier flagged the earlier imperative wording
+  // ("Use status once … before finalizing", "Never poll repeatedly") as "behaviour and completion
+  // rules for the classifier". The same guidance is now stated as facts about the tool.
+  it('preserves the existing agents guidance while adding only the cross-prime address parameter', async () => {
+    everything();
+    const agentsTool = toolList(await core('tools/list')).find((tool) => tool.name === 'agents')!;
+    expect(agentsTool.description).toBe(
+      'Runs ChatGPT workers. Without model/reasoning_effort, saved app defaults apply; they are set only for a user’s explicit request. A suitable sleeping worker is reused with message, not respawned. ' +
+      'message: prime↔worker. Reports arrive with tool results, not by restarting an idle prime. ' +
+      'status: your active, sleeping/revivable and terminal workers, incl. parked families, and pending reports; one call before a final answer collects them. Repeated polling adds nothing. finish: records the report, then normally sleeps.'
+    );
+    expect(agentsTool.inputSchema.properties.run_id.description).toBe(
+      'Select your returned worker family when status lists several; never grants another caller’s workers.'
+    );
+    expect(agentsTool.inputSchema.properties.context.description).toBe(
+      'spawn: shared instructions prepended to every task, e.g. repo, conventions, edit limits and validation.'
+    );
+    expect(agentsTool.inputSchema.properties.workers.description).toBe(
+      'spawn: fresh workers; status lists sleeping workers that message can revive instead.'
+    );
+    expect(agentsTool.inputSchema.properties.messages.description).toBe(
+      'message: atomic batch for several recipients in one call.'
+    );
+    expect(agentsTool.inputSchema.properties.to.description).toBe(
+      'message: one recipient; messaging a sleeping worker wakes it.'
+    );
+    expect(agentsTool.inputSchema.properties.result.description).toBe(
+      'finish: factual handoff under RESULT / CHANGES / VALIDATION / BLOCKERS.'
+    );
+    const targetRun = agentsTool.inputSchema.properties.target_run_id;
+    expect(targetRun.description).toBe(
+      'message: existing prime run id; prime-only, no worker/status access.'
+    );
+    expect(targetRun).toMatchObject({ type: 'string', minLength: 1, maxLength: 36 });
+    const worker = agentsTool.inputSchema.properties.workers.items;
+    // The prime is asked to name every worker: the Sub-agents list shows that name, or a generic "Worker 2".
+    expect(worker.properties.label.description).toBe('Name its job in 1-3 words, e.g. "Tests"; shown to the user.');
+    expect(worker.properties.task.description).toBe(
+      'This worker\'s job: objective, relevant files, constraints and expected handoff.'
+    );
+    expect(worker.properties.model.description).toBe(
+      'Only for a model the user asked for; app settings supply the default. An exact account-observed model id or provider alias. Invalid overrides return observed ids before opening; the browser checks availability before Send.'
+    );
+    expect(worker.properties.reasoning_effort.description).toBe(
+      'Only for an effort the user asked for; app settings supply the default. Selects reasoning only, never a model.'
+    );
+    const targetRunOverhead = Buffer.byteLength(
+      `,"target_run_id":${JSON.stringify(agentsTool.inputSchema.properties.target_run_id)}`,
+      'utf8'
+    );
+    expect(targetRunOverhead).toBe(148);
+    // A sleeping worker woken for new work can be renamed for it (the Sub-agents list shows the name).
+    const revivalLabel = agentsTool.inputSchema.properties.messages.items.properties.label;
+    expect(revivalLabel.description).toBe('New job name when waking.');
+    expect(Buffer.byteLength(`,"label":${JSON.stringify(revivalLabel)}`, 'utf8')).toBe(97);
   });
 
   it('removes the agents tool entirely once multi-agent is switched off', async () => {
@@ -803,13 +913,74 @@ describe('surface boundaries', () => {
     }
   });
 
+  it('reads the user\'s own Skills read-only through /user-skills, and nothing else in their homes', async () => {
+    everything();
+    const home = path.join(base, 'user-skills-home');
+    await fs.mkdir(path.join(home, '.claude/skills/review'), { recursive: true });
+    await fs.writeFile(path.join(home, '.claude/skills/review/SKILL.md'), '---\nname: Review\n---\nRead the whole diff first.');
+    await fs.mkdir(path.join(home, '.codex'), { recursive: true });
+    await fs.writeFile(path.join(home, '.codex/auth.json'), '{"token":"secret-token"}');
+    vi.stubEnv('HOME', home); vi.stubEnv('USERPROFILE', home); vi.stubEnv('CLAUDE_CONFIG_DIR', ''); vi.stubEnv('CODEX_HOME', '');
+    try {
+      const reply = await core('tools/call', { name: 'read', arguments: { paths: ['/user-skills/claude/skills/review/SKILL.md'] } });
+      expect(reply.body.result?.isError).toBeFalsy();
+      expect(JSON.stringify(reply.body.result?.content)).toContain('Read the whole diff first.');
+      const listing = await core('tools/call', { name: 'read', arguments: { paths: ['/user-skills/claude/skills'] } });
+      expect(JSON.stringify(listing.body.result?.content)).toContain('review');
+      const secret = await core('tools/call', { name: 'read', arguments: { paths: ['/user-skills/codex/auth.json'] } });
+      expect(JSON.stringify(secret.body.result?.content)).not.toContain('secret-token');
+      const patch = '*** Begin Patch\n*** Update File: /user-skills/claude/skills/review/SKILL.md\n@@\n-Read the whole diff first.\n+Skip the diff.\n*** End Patch';
+      const patched = await core('tools/call', { name: 'apply_patch', arguments: { patch } });
+      expect(patched.body.result?.isError).toBe(true);
+      expect(await fs.readFile(path.join(home, '.claude/skills/review/SKILL.md'), 'utf8')).toContain('Read the whole diff first.');
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('answers usage without the identity notice, which only matters for chat-bound work', async () => {
+    everything();
+    // usage reads nothing that belongs to a chat. It answers before the page's evidence for its
+    // request arrives, so it always looked unattributed, and the notice reached the model each time.
+    const usage = JSON.stringify((await core('tools/call', { name: 'usage', arguments: {} })).body.result?.content);
+    expect(usage).toContain('ChatGPT limits');
+    expect(usage).not.toContain('Identity notice');
+    // The same harness still marks chat-bound tools, so the call above really was unattributed.
+    const read = JSON.stringify((await core('tools/call', { name: 'read', arguments: { paths: ['/workspace'] } })).body.result?.content);
+    expect(read).toContain('Identity notice');
+  });
+
+  it('describes write_stdin by what it does, never by how its output should be treated', async () => {
+    everything();
+    // ChatGPT's safety check flagged "including automatic delivery; never reruns work" as a
+    // "Suspicious Instruction" and held a long run on an approval card (VM, 2026-10-15).
+    const tool = toolList(await core('tools/list')).find((entry) => entry.name === 'write_stdin');
+    expect(tool?.description).toBeTruthy();
+    expect(tool!.description).not.toMatch(/automatic(ally)? deliver|never reruns|delivered automatically/i);
+  });
+
+  it('saves a generated image only for a call it can tie to its chat (#889)', async () => {
+    everything();
+    const tool = toolList(await core('tools/list')).find((entry) => entry.name === 'save_image');
+    // No string that names an image: ChatGPT fills one with the generated picture's `file_…` id, and
+    // then fails the call internally before it reaches the app (measured live 2026-10-05, 3 of 3).
+    expect(Object.keys(tool?.inputSchema?.properties ?? {})).toEqual(['path', 'nth']);
+    expect(tool?.inputSchema?.properties?.nth).toMatchObject({ type: 'integer', minimum: 1 });
+    expect(tool?.inputSchema?.required).toEqual(['path']);
+    const reply = await core('tools/call', { name: 'save_image', arguments: { path: '/workspace/out.png' } });
+    expect(reply.body.result?.isError).toBe(true);
+    const refusal = JSON.stringify(reply.body.result?.content);
+    expect(refusal).toContain('could not tell which chat this save_image call came from');
+    // It names the Core that answered, so a call sent to another computer's Core says so (#1097).
+    expect(refusal).toContain('Chat On Steroids Core could not tell');
+    expect(refusal).toContain('If the chat belongs to another computer');
+  });
+
   it('keeps the worst-case no-query discovery of each surface small', async () => {
     everything();
     const coreTools = toolList(await core('tools/list'));
     const desktopTools = toolList(await desktop('tools/list'));
 
     // Each populated surface includes code mode; find and the shell exec pair remain exclusive.
-    expect(coreTools).toHaveLength(8);
+    expect(coreTools).toHaveLength(10);
     expect(desktopTools).toHaveLength(BROWSER_TOOLS.length + (IS_WINDOWS ? 16 : process.platform === 'darwin' ? 3 : 1));
 
     // And the size, which is what a discovery pull actually costs the model on every
@@ -831,7 +1002,18 @@ describe('surface boundaries', () => {
     // shared context once instead of per worker, to batch messages into one call, and to
     // hand back RESULT/CHANGES/VALIDATION/BLOCKERS — bytes spent once at discovery to save
     // a great many in every run that follows.
+    // #1417: ChatGPT's approval reviewer stopped long runs with "Suspicious instruction: the tool
+    // description tries to dictate the classification and the handling of sensitive or suspicious
+    // content". What we declare describes; it does not rule on risk. (Checked on the constant as
+    // well, because the Windows text is only part of the declaration on Windows.)
+    const RULES_ON_RISK = /safety rules|\bbenign|harmless|suspicious/i;
+    expect(WINDOWS_SHELL_GUIDANCE).not.toMatch(RULES_ON_RISK);
+    // The Windows notes were a list of prohibitions; other tools use these words to describe what they do.
+    expect(WINDOWS_SHELL_GUIDANCE).not.toMatch(/\bnever\b|\bdo not\b|\bdestructive\b/i);
+    // The advice itself stays.
+    for (const fact of ['-LiteralPath', 'Remove-Item', 'Move-Item', '-WindowStyle Hidden', 'cmd /c']) expect(WINDOWS_SHELL_GUIDANCE).toContain(fact);
     for (const tool of [...coreTools, ...desktopTools]) {
+      expect(JSON.stringify(tool), `${tool.name} declaration`).not.toMatch(RULES_ON_RISK);
       const bytes = Buffer.byteLength(JSON.stringify(tool), 'utf8');
       const budget =
         (BROWSER_TOOLS as readonly string[]).includes(tool.name)
@@ -845,11 +1027,13 @@ describe('surface boundaries', () => {
           : tool.name === 'apply_patch'
             ? 5_000
             : tool.name === 'agents'
-              ? 3_400
+              // Main's 3,400-byte guardrail plus the measured 148-byte target_run_id property and
+              // the measured 97-byte revival label (messages[].label).
+              ? 3_645
               : tool.name === 'exec_command'
                 // Windows carries `WINDOWS_SHELL_GUIDANCE` in the same description, and that text
-                // is quoted verbatim from Codex's own shell spec — it is not ours to trim to fit a
-                // budget. The non-Windows number is the one that says whether *our* additions have
+                // carries Codex's own shell advice in full (reworded for #1417) — it is not ours
+                // to trim to fit a budget. The non-Windows number is the one that says whether *our* additions have
                 // grown, so both are asserted rather than one loose bound covering both.
                 ? (process.platform === 'win32' ? 3_800 : 3_500)
                 : 3_000;
@@ -932,7 +1116,38 @@ describe('2025-era clients', () => {
     expect(instructions).toContain('/skills/<id>/SKILL.md');
     // The requested upstream collaboration prose replaces the old minimal tool preamble.
     expect(instructions).toContain('User authorization and preferences persist across turns.');
-    expect(instructions.length).toBeLessThan(18_000);
+    expect(instructions).toContain(
+      'Current Core authority (informational; live guards decide): ' +
+      'browse=on search=on read=on metadata=on create=off edit=off move=off delete=off command=on; ' +
+      'read-only=off; plans=off; workers=off.'
+    );
+    expect(instructions).not.toContain(approved);
+    // Budget the actual native-platform payload, including the full Skills catalogue.
+    // PowerShell 5.1 syntax guidance is already present in exec_command's own schema:
+    // duplicating it here used to add exactly 80 characters on 5.1-only hosts.
+    expect(instructions).toBe(serverInstructions(ctx, 'core', process.platform));
+    expect(instructions).toContain(skillCatalogInstructions());
+    expect(instructions.length).toBeLessThan(CORE_INSTRUCTIONS_BUDGET);
+    // The budget counts what a real install sends: every capability, plans, workers and the
+    // finish tool on (a fresh install's defaults), for each platform from every CI host.
+    // Windows carries the most shell guidance; this test's partial context once hid it crossing.
+    const everything = { ...ctx, caps: allCaps(), readOnly: false, sessionTools: true, agentTools: true, exposedFinishTool: true };
+    for (const platform of ['win32', 'darwin', 'linux'] as const) {
+      expect(serverInstructions(everything, 'core', platform).length, platform).toBeLessThan(CORE_INSTRUCTIONS_BUDGET);
+    }
+    if (LAUNCHES_WINDOWS_POWERSHELL_5) {
+      expect(instructions).not.toContain('This is Windows PowerShell 5.1, without && or ||.');
+      expect(EXEC_COMMAND_CMD_DESCRIPTION).toContain('This shell is Windows PowerShell 5.1, which has no && or ||');
+    }
+  });
+
+  it('keeps full Skills metadata in the platform-native instructions budget', () => {
+    const catalog = skillCatalogInstructions();
+    const extraCatalog = `${catalog}\n${'- test Skill metadata '.repeat(250)}`;
+    const native = serverInstructions(ctx, 'core', process.platform, catalog);
+    const expanded = serverInstructions(ctx, 'core', process.platform, extraCatalog);
+    expect(expanded.length - native.length).toBe(extraCatalog.length - catalog.length);
+    expect(expanded.length).toBeGreaterThan(CORE_INSTRUCTIONS_BUDGET);
   });
 
   it('points at the other connector rather than pretending the capability does not exist', async () => {
@@ -1039,7 +1254,7 @@ describe('capability gating', () => {
     ctx.caps = effectiveCapabilities(config);
     ctx.readOnly = true;
 
-    expect(toolNames(await core('tools/list'))).toEqual(['exec', 'find', 'read', 'view_image']);
+    expect(toolNames(await core('tools/list'))).toEqual(['exec', 'find', 'read', 'usage', 'view_image']);
   });
 
   it('offers apply_patch only when a writing permission is on', async () => {
@@ -1141,12 +1356,47 @@ describe('capability gating', () => {
     const instructions: string = initialized.body.result.instructions ?? '';
     expect(instructions).toMatch(/Reuse\s+a sleeping worker for related follow-up work before spawning a replacement/);
     expect(instructions).toContain('Only terminal workers whose context is full need replacing');
+    expect(instructions).toContain('Reports arrive only with tool results; they do not restart an idle prime');
+    expect(instructions).toContain('do not claim delegated verification is complete before reading its report');
 
     const tools = await core('tools/list');
     const agentsDescription = (tools.body.result.tools as Array<{ name: string; description?: string }>).find(
       (tool) => tool.name === 'agents'
     )?.description;
-    expect(agentsDescription).toContain('Reuse a suitable sleeping worker with message before spawn');
+    expect(agentsDescription).toContain('A suitable sleeping worker is reused with message, not respawned');
+    expect(agentsDescription).toContain('one call before a final answer collects them');
+    // Facts about the tool, not orders to whoever reads the description.
+    expect(agentsDescription).not.toMatch(/\b(Never|Do not|Omit|Use status once)\b/);
+  });
+
+  // #1417, third time (2.1.41, Windows VM, 2 of 4 runs): ChatGPT's approval card said the tool
+  // documentation "tries to override or influence the risk assessment with its own rules". Orders
+  // were still left in the parameter texts, and the instructions told the model not to ask the user
+  // to confirm. Every text the classifier reads about agents is a fact, and none speaks of confirming.
+  it('words everything about agents as facts, with no orders and nothing about confirming', async () => {
+    ctx.agentTools = true;
+    const initialized = await core('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test-client', version: '1.0.0' } });
+    const instructions: string = initialized.body.result.instructions ?? '';
+    const workers = instructions.slice(instructions.indexOf('# Workers'));
+    expect(workers).toContain('# Workers');
+    expect(workers).not.toMatch(/confirm/i);
+    const agentsTool = toolList(await core('tools/list')).find((tool) => tool.name === 'agents')!;
+    const texts: string[] = [agentsTool.description];
+    const collect = (node: unknown): void => {
+      if (!node || typeof node !== 'object') return;
+      for (const [key, value] of Object.entries(node)) {
+        if (key === 'description' && typeof value === 'string') texts.push(value);
+        else collect(value);
+      }
+    };
+    collect(agentsTool.inputSchema);
+    expect(texts.length).toBeGreaterThan(10);
+    for (const text of texts) {
+      // An order opens a sentence ("Never …", "Omit …"); "never grants …" mid-sentence is a fact.
+      expect(text, text).not.toMatch(/(^|[.;:]\s+)(Never|Do not|Don't|Omit|Prefer|Use)\b/);
+      expect(text, text).not.toMatch(/\bprefer this|only after checking|\bconfirm/i);
+      expect(text, text).not.toMatch(/the answer says/i);
+    }
   });
 
   it('rejects action-specific agent fields instead of silently ignoring them', async () => {
@@ -1832,6 +2082,18 @@ describe('bounded output', () => {
     expect(text).not.toContain('app.ts');
   });
 
+  it('lists the shared folders for the virtual root, where a model naturally starts', async () => {
+    // Live on macOS (2026-10-04): "read /" answered only "Path is empty. Use an approved virtual
+    // root such as /<root>/file.txt.", so the model had to guess the folder names.
+    const reply = await core('tools/call', { name: 'read', arguments: { paths: ['/', '/workspace/notes.txt'] } });
+    const text = textOf(reply);
+    expect(failed(reply), text).toBe(false);
+    expect(text).toContain('--- / — 1 entry, one level ---');
+    expect(text).toContain('d workspace');
+    expect(text).not.toContain('ERROR');
+    expect(text).not.toContain(approved);
+  });
+
   it('validates tool arguments instead of trusting them', async () => {
     const reply = await core('tools/call', { name: 'read', arguments: { paths: [12345] } });
     expect(failed(reply)).toBe(true);
@@ -1913,6 +2175,19 @@ describe('bounded output', () => {
     expect(text).toContain('The nearest existing folder is /workspace/src/lib; it contains: f util.ts');
     const top = await core('tools/call', { name: 'read', arguments: { paths: ['/workspace/lib/util.ts'] } });
     expect(textOf(top)).toMatch(/The nearest existing folder is \/workspace; it contains: .*d src, .*f notes\.txt/);
+  });
+
+  it('points a path built under the wrong root at the root it names, and lists nothing else', async () => {
+    // 2026-10-12, live: with roots /downloads and /voxelcraft a model read
+    // /downloads/.Dev-projects/voxelcraft/shared/adventure.ts. The hint listed the user's Downloads
+    // folder, unrelated to the project, instead of naming the file it was after.
+    ctx.roots = [{ name: 'downloads', path: outside }, { name: 'workspace', path: approved }];
+    const reply = await core('tools/call', { name: 'read', arguments: { paths: ['/downloads/projects/workspace/src/app.ts'] } });
+    const text = textOf(reply);
+    expect(failed(reply)).toBe(true);
+    expect(text).toContain('Did you mean /workspace/src/app.ts?');
+    expect(text).not.toContain('passwords.txt');
+    expect(text).not.toContain('nearest existing folder');
   });
 
   it('reads a per-path line range spelled as path:start-end', async () => {
@@ -2074,6 +2349,30 @@ describe('apply_patch', () => {
     ctx.caps = withCaps({ create: true, edit: true, move: true, deleteFile: true });
   });
 
+  it.each([true, false])('returns mismatch guidance with source excerpts only under Read permission (%s)', async read => {
+    ctx.caps = withCaps({ read, edit: true });
+    const original = 'uniqueAnchor();\nactualSourceOnly();\n';
+    await fs.writeFile(path.join(approved, 'diagnostic.txt'), original);
+    await fs.writeFile(path.join(approved, 'unchanged.txt'), 'before\n');
+    const reply = await core('tools/call', {
+      name: 'apply_patch',
+      arguments: { patch: [
+        '*** Begin Patch', '*** Update File: /workspace/unchanged.txt', '@@', '-before', '+after',
+        '*** Update File: /workspace/diagnostic.txt', '@@', ' uniqueAnchor();', '-guessedSource();', '+replacement();',
+        '*** End Patch'
+      ].join('\n') }
+    });
+    expect(reply.body.result?.isError).toBe(true);
+    const text = textOf(reply);
+    expect(text).toContain('Use the current file text as patch context');
+    expect(text).toContain('/workspace/diagnostic.txt');
+    expect(text).not.toContain(approved);
+    expect(text.includes('actualSourceOnly();')).toBe(read);
+    expect(text.includes('Source excerpt from the patch verification snapshot')).toBe(read);
+    expect(await fs.readFile(path.join(approved, 'diagnostic.txt'), 'utf8')).toBe(original);
+    expect(await fs.readFile(path.join(approved, 'unchanged.txt'), 'utf8')).toBe('before\n');
+  });
+
   it('resolves later hunks against files created earlier in the same patch', async () => {
     const reply = await core('tools/call', {
       name: 'apply_patch',
@@ -2092,6 +2391,27 @@ describe('apply_patch', () => {
     });
     expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
     expect(await fs.readFile(path.join(approved, 'fresh-sequential.ts'), 'utf8')).toBe('const fresh = 2;\n');
+  });
+
+  it('keeps a file\'s own line endings when it edits it', async () => {
+    // The upstream default split a CRLF file on LF only: lines outside the hunk kept their CR,
+    // and the hunk's context and new lines lost it, so one edit left a Windows file mixed.
+    await fs.writeFile(path.join(approved, 'run.bat'), '@echo off\r\necho one\r\necho two\r\necho three\r\n');
+    await fs.writeFile(path.join(approved, 'unix.txt'), 'alpha\nbeta\ngamma');
+    const edited = await core('tools/call', {
+      name: 'apply_patch',
+      arguments: {
+        patch: [
+          '*** Begin Patch',
+          '*** Update File: /workspace/run.bat', '@@', ' echo one', '-echo two', '+echo TWO', '+echo extra', ' echo three',
+          '*** Update File: /workspace/unix.txt', '@@', ' alpha', '-beta', '+BETA',
+          '*** End Patch'
+        ].join('\n')
+      }
+    });
+    expect(edited.body.result?.isError).toBeFalsy();
+    expect(await fs.readFile(path.join(approved, 'run.bat'), 'utf8')).toBe('@echo off\r\necho one\r\necho TWO\r\necho extra\r\necho three\r\n');
+    expect(await fs.readFile(path.join(approved, 'unix.txt'), 'utf8')).toBe('alpha\nBETA\ngamma\n');
   });
 
   it('adds, updates, moves and deletes through one tool', async () => {
@@ -2344,7 +2664,7 @@ describe('apply_patch', () => {
     ].join('\n');
     const reply = await core('tools/call', { name: 'apply_patch', arguments: { patch } });
     expect(reply.body.result?.isError).toBe(true);
-    expect(textOf(reply)).toBe('apply_patch environment selection is unavailable for this turn');
+    expect(reply.body.result.content[0]).toEqual({ type: 'text', text: 'apply_patch environment selection is unavailable for this turn' });
     await expect(fs.stat(path.join(approved, 'env-selected.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
@@ -2480,6 +2800,90 @@ describe('exec_command and write_stdin', () => {
   beforeEach(() => {
     ctx.readOnly = false;
     ctx.caps = withCaps({ command: true });
+    getConfig().commandAllowlist = { enabled: false, mode: 'allow', rules: [] };
+  });
+
+  it('enforces the same optional policy at the shared handler before process launch', async () => {
+    const command = IS_WINDOWS ? 'Write-Output allowlist-ok' : "printf '%s\\n' allowlist-ok";
+    getConfig().commandAllowlist = { enabled: true, mode: 'allow', rules: [command] };
+    const allowed = await core('tools/call', {
+      name: 'exec_command', arguments: { cmd: command, workdir: '/workspace', yield_time_ms: 5_000 }
+    });
+    expect(failed(allowed), textOf(allowed)).toBe(false);
+    expect(textOf(allowed)).toContain('allowlist-ok');
+
+    const launch = vi.spyOn(unifiedExecManager, 'execCommand');
+    const denied = await core('tools/call', {
+      name: 'exec_command', arguments: { cmd: IS_WINDOWS ? 'Write-Output denied' : 'printf denied', workdir: '/workspace' }
+    });
+    expect(failed(denied)).toBe(true);
+    expect(textOf(denied)).toContain('COMMAND_NOT_ALLOWED');
+    expect(textOf(denied)).toContain('No command was run');
+    expect(launch).not.toHaveBeenCalled();
+    launch.mockRestore();
+  });
+
+  it('preflights a complete batch before launching its allowed first command', async () => {
+    getConfig().commandAllowlist = { enabled: true, mode: 'allow', rules: ['git status'] };
+    const launch = vi.spyOn(unifiedExecManager, 'execCommand');
+    const denied = await core('tools/call', {
+      name: 'exec_command', arguments: { cmds: ['git status', 'git diff'], workdir: '/workspace' }
+    });
+    expect(failed(denied)).toBe(true);
+    expect(textOf(denied)).toContain('in command 2');
+    expect(launch).not.toHaveBeenCalled();
+    launch.mockRestore();
+  });
+
+  it('preflights a complete denylist batch before launching its allowed first command', async () => {
+    getConfig().commandAllowlist = { enabled: true, mode: 'deny', rules: ['git diff *'] };
+    const launch = vi.spyOn(unifiedExecManager, 'execCommand');
+    const denied = await core('tools/call', {
+      name: 'exec_command', arguments: { cmds: ['git status', 'git diff --stat'], workdir: '/workspace' }
+    });
+    expect(failed(denied)).toBe(true);
+    expect(textOf(denied)).toContain('in command 2');
+    expect(textOf(denied)).toContain('matched a deny rule');
+    expect(launch).not.toHaveBeenCalled();
+    launch.mockRestore();
+  });
+
+  it.runIf(IS_WINDOWS)('rejects normalization argument drift before launch in both policy modes', async () => {
+    const raw = 'Write-Output parity';
+    const normalize = vi.spyOn(execHints, 'normalizeShellCommand').mockReturnValue({
+      cmd: 'Write-Output parity changed',
+      notes: []
+    });
+    const launch = vi.spyOn(unifiedExecManager, 'execCommand');
+    try {
+      for (const commandAllowlist of [
+        { enabled: true, mode: 'allow' as const, rules: [raw] },
+        { enabled: true, mode: 'deny' as const, rules: ['git status'] }
+      ]) {
+        getConfig().commandAllowlist = commandAllowlist;
+        const denied = await core('tools/call', {
+          name: 'exec_command', arguments: { cmd: raw, workdir: '/workspace' }
+        });
+        expect(failed(denied)).toBe(true);
+        expect(textOf(denied)).toContain('command normalization changed the authorized argument list');
+      }
+      expect(launch).not.toHaveBeenCalled();
+    } finally {
+      normalize.mockRestore();
+      launch.mockRestore();
+    }
+  });
+
+  it('checks policy before intercepted apply_patch can mutate a file', async () => {
+    getConfig().commandAllowlist = { enabled: true, mode: 'allow', rules: ['git status'] };
+    const target = path.join(approved, 'allowlist-intercept.txt');
+    const patch = ['*** Begin Patch', '*** Add File: allowlist-intercept.txt', '+must-not-land', '*** End Patch'].join('\n');
+    const denied = await core('tools/call', {
+      name: 'exec_command', arguments: { cmd: `apply_patch <<'PATCH'\n${patch}\nPATCH`, workdir: '/workspace' }
+    });
+    expect(failed(denied)).toBe(true);
+    expect(textOf(denied)).toContain('COMMAND_NOT_ALLOWED');
+    await expect(fs.stat(target)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('refuses an approved virtual path in opaque shell text instead of running against the drive root', async () => {
@@ -2551,9 +2955,9 @@ describe('exec_command and write_stdin', () => {
       arguments: { cmd: patch, workdir: '/workspace' }
     });
     expect(reply.body.result?.isError).toBe(true);
-    expect(textOf(reply)).toBe(
+    expect(reply.body.result.content[0]).toEqual({ type: 'text', text:
       'apply_patch verification failed: patch detected without explicit call to apply_patch. Rerun as ["apply_patch", "<patch>"]'
-    );
+    });
     await expect(fs.stat(path.join(approved, 'implicit.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
@@ -2837,7 +3241,15 @@ describe('exec_command and write_stdin', () => {
     }
   });
 
-  it('reads a batch exit per command, so one search finding nothing is not a failure', async () => {
+  /**
+   * Both of these run a real ripgrep through the batch runner, so they need one to exist —
+   * `resources/rg` from packaging, or a copy on PATH. Without either, `rg` is not a command and
+   * the batch reports 127, which says nothing about per-command exit accounting. Skip rather
+   * than fail: the subject is the accounting, not whether this checkout ships the tool.
+   */
+  const ripgrep = locateRipgrep();
+
+  it.skipIf(!ripgrep)('reads a batch exit per command, so one search finding nothing is not a failure', async () => {
     // The batch that `cmds` exists for is several searches at once, and a search that finds
     // nothing exits 1. Handing the wrapper script to the single-command classifier would ask
     // whether a `for` loop is a search, so the batch used to report a plain failure and invite
@@ -2875,7 +3287,7 @@ describe('exec_command and write_stdin', () => {
     expect(brokenText).toContain('Batch: command 2 exited 3; the other command exited 0.');
   }, 60_000);
 
-  it('returns partial search results without exonerating an unreadable batch path', async () => {
+  it.skipIf(!ripgrep)('returns partial search results without exonerating an unreadable batch path', async () => {
     const result = await core('tools/call', { name: 'exec_command', arguments: {
       cmds: ['rg -n "export const name" src/app.ts missing-search-file.ts', 'rg -n "export const name" src/app.ts'],
       workdir: '/workspace', yield_time_ms: 8_000
@@ -2883,6 +3295,9 @@ describe('exec_command and write_stdin', () => {
     expect(result.body.result?.structuredContent).toMatchObject({ exit_code: 2 });
     expect(textOf(result)).toContain('export const name');
     expect(textOf(result)).toContain('Batch: command 1 exited 2; the other command exited 0.');
+    // ChatGPT shows the model the structured result, so the notes have to be there too.
+    expect(result.body.result?.structuredContent?.supplemental_context).toContain('Note: Batch: command 1 exited 2; the other command exited 0.');
+    expect(result.body.result?.structuredContent?.output).not.toContain('Batch: command 1 exited');
     expect(textOf(result)).toContain('incomplete');
     expect(textOf(result)).not.toContain('not a failed search');
   });
@@ -2971,6 +3386,17 @@ describe('exec_command and write_stdin', () => {
     expect(textOf(first)).toContain('first=raw-no-newline');
     expect(textOf(first)).toContain(`Process running with session ID ${sessionId}`);
 
+    // Check the unread cursor while the child is still idle. ConPTY may emit a *new* screen
+    // repaint containing the first line when the console exits; those bytes are not a replay
+    // by CoS and must stay in the raw terminal stream.
+    const idle = await core('tools/call', {
+      name: 'write_stdin',
+      arguments: { session_id: sessionId, chars: '', yield_time_ms: 1_000 }
+    });
+    expect(idle.body.result?.isError).not.toBe(true);
+    expect(idle.body.result?.structuredContent?.output).toBe('');
+    expect(textOf(idle)).toContain(`Process running with session ID ${sessionId}`);
+
     const second = await core('tools/call', {
       name: 'write_stdin',
       arguments: { session_id: sessionId, chars: 'done\r', yield_time_ms: 5_000 }
@@ -2978,8 +3404,7 @@ describe('exec_command and write_stdin', () => {
     expect(second.body.result?.isError).not.toBe(true);
     expect(textOf(second)).toContain('second=done');
     expect(textOf(second)).toContain('Process exited with code 0');
-    // The process buffer is drained per call; previously delivered output is not replayed.
-    expect(textOf(second)).not.toContain('first=raw-no-newline');
+    expect(second.body.result?.structuredContent?.output_replayed).not.toBe(true);
   });
 
   it('runs in workdir and omits the old connector-specific cwd header', async () => {
@@ -3064,6 +3489,9 @@ describe('agent-maintained plans over MCP', () => {
   });
 });
 
+/** Attempts of the recycled-process-id test, so a retry runs on fresh ids. */
+let execOwnRuns = 0;
+
 describe('exec sessions belong to the chat that opened them', () => {
   beforeEach(() => {
     ctx.readOnly = false;
@@ -3099,6 +3527,14 @@ describe('exec sessions belong to the chat that opened them', () => {
       requestId ? { 'x-request-id': `${requestId}/att1` } : {}
     );
 
+  it('notes the served request id for its surface', async () => {
+    const spy = vi.spyOn(identity, 'noteServedRequest');
+    expect(prove('wfr_identity_served', 'conv-identity')).toBe('stored');
+    await asChat('wfr_identity_served', 'read', { paths: ['/workspace/src/app.ts'] });
+    expect(spy).toHaveBeenCalledWith('wfr_identity_served', 'core');
+    spy.mockRestore();
+  });
+
   it('refuses write_stdin from a chat that does not own the session, and keeps serving the one that does', async () => {
     expect(prove('wfr_execown_opener', 'conv-execown-opener')).toBe('stored');
     expect(prove('wfr_execown_stranger', 'conv-execown-stranger')).toBe('stored');
@@ -3133,19 +3569,39 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(stranger)).toContain('EXEC_SESSION_OWNER_MISMATCH');
     expect(textOf(stranger)).not.toContain('may already have delivered');
 
-    // Caller identity is the authorization boundary. An unattributed call must not inherit
-    // the owner's authority merely because it can guess the small numeric session id.
-    const unproven = await asChat(null, 'write_stdin', {
+    // An unresolved request from another turn has no authority from the numeric id alone.
+    // If exact proof never arrives, the bounded wait must still fail closed without sending
+    // input or reading process output.
+    const unproven = await asChat('wfr_execown_unattributed', 'write_stdin', {
+      session_id: sessionId,
+      chars: 'unproven\r',
+      yield_time_ms: 1_000
+    });
+    expect(unproven.body.result?.isError).toBe(true);
+    expect(textOf(unproven)).not.toContain('echo=unproven');
+    expect(textOf(unproven)).toContain('EXEC_CALLER_UNIDENTIFIED');
+    expect(textOf(unproven)).toContain('not Read-only mode');
+
+    // A later request from the same durable session can race the page proof for its exact
+    // request id. The one call should recover when that proof arrives instead of making the
+    // model retry a session it already owns.
+    const lateRequestId = 'wfr_execown_late_same_owner';
+    let lateProofResult: string | undefined;
+    const lateProof = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        lateProofResult = prove(lateRequestId, 'conv-execown-opener');
+        resolve();
+      }, 250);
+    });
+    const recovered = await asChat(lateRequestId, 'write_stdin', {
       session_id: sessionId,
       chars: 'anon\r',
       yield_time_ms: 1_000
     });
-    expect(unproven.body.result?.isError).toBe(true);
-    expect(textOf(unproven)).toContain('current call has no proven chat identity');
-    expect(textOf(unproven)).not.toContain('echo=anon');
-    expect(textOf(unproven)).toContain('This refusal concerns this process id, not Read-only mode');
-    expect(textOf(unproven)).toContain('EXEC_CALLER_UNIDENTIFIED');
-    expect(textOf(unproven)).toContain('retry this same session_id once');
+    await lateProof;
+    expect(lateProofResult).toBe('stored');
+    expect(recovered.body.result?.isError).not.toBe(true);
+    expect(textOf(recovered)).toContain('echo=anon');
 
 
     const owner = await asChat('wfr_execown_opener', 'write_stdin', {
@@ -3158,13 +3614,14 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(owner)).toContain('Process exited with code 0');
   });
 
-  it('distinguishes anonymous launch custody from an unavailable terminal and reports identity recovery', async () => {
+  it('distinguishes unresolved, anonymous and unavailable process custody and reports identity recovery', async () => {
     const source = await createSession({ conversationId: 'exec-return-owner' });
     expect(prove('wfr_exec_return_owner', 'exec-return-owner', source.id)).toBe('stored');
     noteExecOwner(987001, source.id);
     noteExecOwner(987002, null);
     try {
       const unknown = await asChat('wfr_exec_return_late', 'write_stdin', { session_id: 987001, chars: '' });
+      expect(unknown.body.result?.isError).toBe(true);
       expect(textOf(unknown)).toContain('EXEC_CALLER_UNIDENTIFIED');
       expect(prove('wfr_exec_return_late', 'exec-return-owner', source.id)).toBe('stored');
       const recovered = await asChat('wfr_exec_return_owner', 'read', { paths: ['/workspace/src/app.ts'] });
@@ -3224,6 +3681,38 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(stale)).toContain('no local tool was run');
   });
 
+  it('tells a replaced chat where its work continues, also after a second Compact & Resume', async () => {
+    const chatA = 'f0f00011-1111-4111-8111-111111111111';
+    const chatB = 'f0f00012-1111-4111-8111-111111111111';
+    const chatC = 'f0f00013-1111-4111-8111-111111111111';
+    const summary = await createSession({ title: 'Portfolio site', conversationId: chatA });
+    expect(prove('wfr_where_a', chatA, summary.id)).toBe('stored');
+    expect(await rebindSession(summary.id, chatA, chatB)).toBe(true);
+
+    const once = await asChat('wfr_where_a', 'read', { paths: ['/workspace/src/app.ts'] });
+    expect(failed(once)).toBe(true);
+    expect(textOf(once)).toContain('CONVERSATION_SUPERSEDED');
+    expect(textOf(once)).toContain(`https://chatgpt.com/c/${chatB}`);
+    expect(textOf(once)).toContain('"Portfolio site"');
+    expect(textOf(once)).toContain('no local tool was run');
+
+    // A second move sends the oldest chat straight to the newest one, never to the middle one.
+    expect(await rebindSession(summary.id, chatB, chatC)).toBe(true);
+    const twice = await asChat('wfr_where_a', 'read', { paths: ['/workspace/src/app.ts'] });
+    expect(textOf(twice)).toContain(`https://chatgpt.com/c/${chatC}`);
+    expect(textOf(twice)).not.toContain(chatB);
+
+    // A chat not yet named (the store's placeholder title) is named by its link alone.
+    const chatD = 'f0f00014-1111-4111-8111-111111111111';
+    const chatE = 'f0f00015-1111-4111-8111-111111111111';
+    const untitled = await createSession({ title: '  ', conversationId: chatD });
+    expect(prove('wfr_where_d', chatD, untitled.id)).toBe('stored');
+    expect(await rebindSession(untitled.id, chatD, chatE)).toBe(true);
+    const bare = await asChat('wfr_where_d', 'read', { paths: ['/workspace/src/app.ts'] });
+    expect(textOf(bare)).toContain(`https://chatgpt.com/c/${chatE}. Tell the user to continue there`);
+    expect(textOf(bare)).not.toContain('shown in Chat On Steroids as');
+  });
+
   it('refuses every tool from a chat whose handoff brief has been asked for, until the move is over', async () => {
     resetContinuationsForTests();
     const chatA = 'f0f00007-1111-4111-8111-111111111111';
@@ -3263,18 +3752,40 @@ describe('exec sessions belong to the chat that opened them', () => {
   });
 
   it('does not let a stale owner inherit a recycled process id during the new exec yield', async () => {
+    // Fresh ids per attempt: a CI retry must not meet the first attempt's stored proofs ('same').
+    const run = ++execOwnRuns;
     // Model the real lifetime split directly: the manager has released an exited process id,
     // but the separate ownership registry still carries the chat that used to own it. Force
     // the next allocator pick to reuse that number so the race is deterministic instead of a
     // 1-in-99k lottery.
     await unifiedExecManager.terminateAllProcesses();
     const recycledId = 1_000;
-    noteExecOwner(recycledId, 'session-conv-execown-old');
-    expect(execOwner(recycledId)).toBe('session-conv-execown-old');
-    expect(prove('wfr_execown_old_recycled', 'conv-execown-old')).toBe('stored');
-    expect(prove('wfr_execown_new_recycled', 'conv-execown-new')).toBe('stored');
+    noteExecOwner(recycledId, `session-conv-execown-old-${run}`);
+    expect(execOwner(recycledId)).toBe(`session-conv-execown-old-${run}`);
+    expect(prove(`wfr_execown_old_recycled_${run}`, `conv-execown-old-${run}`)).toBe('stored');
+    expect(prove(`wfr_execown_new_recycled_${run}`, `conv-execown-new-${run}`)).toBe('stored');
 
-    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    // The allocator draws from a CSPRNG, so the pick is forced here: reserved the way it reserves.
+    const allocation = vi.spyOn(unifiedExecManager, 'allocateProcessId').mockImplementation(() => {
+      (unifiedExecManager as unknown as { reservedProcessIds: Set<number> }).reservedProcessIds.add(recycledId);
+      return recycledId;
+    });
+    // Hold only publication of the real process result, not process creation or ownership.
+    // The process is alive and writable, but the MCP handler has not yet installed its new
+    // owner. This is the same custody gap without racing a five-second shell-startup budget
+    // against the one-second exec yield on a loaded Windows runner.
+    const execute = unifiedExecManager.execCommand.bind(unifiedExecManager);
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let reached!: (output: Awaited<ReturnType<typeof execute>>) => void;
+    const atPublication = new Promise<Awaited<ReturnType<typeof execute>>>(resolve => { reached = resolve; });
+    const execution = vi.spyOn(unifiedExecManager, 'execCommand').mockImplementation(async request => {
+      const output = await execute(request);
+      reached(output);
+      await held;
+      return output;
+    });
+    let starting: ReturnType<typeof asChat> | undefined;
     try {
       // Block in the shell process itself. Spawning a second cold `node` here made this
       // ownership regression depend on hosted-runner process startup rather than on the
@@ -3286,24 +3797,26 @@ describe('exec sessions belong to the chat that opened them', () => {
 
       // Do not await. The process is registered while exec_command spends its initial yield
       // collecting output, which is the exact old authority window.
-      const starting = asChat('wfr_execown_new_recycled', 'exec_command', {
+      starting = asChat(`wfr_execown_new_recycled_${run}`, 'exec_command', {
         cmd: holdOpen,
         workdir: '/workspace',
         tty: true,
         yield_time_ms: 1_000
       });
-      await vi.waitFor(
-        () => {
-          expect(unifiedExecManager.listProcesses().some((entry) => entry.processId === recycledId)).toBe(true);
-        },
-        { timeout: 5_000, interval: 10 }
-      );
+      // Surface a pre-launch refusal instead of hanging on a signal that can never arrive.
+      const boundary = await Promise.race([
+        atPublication.then(output => ({ output })),
+        starting.then(reply => ({ reply }))
+      ]);
+      if ('reply' in boundary) throw new Error(`Exec did not reach publication: ${textOf(boundary.reply)}`);
+      expect(boundary.output.processId).toBe(recycledId);
+      expect(unifiedExecManager.listProcesses().some(entry => entry.processId === recycledId)).toBe(true);
 
       // Allocation must have removed the stale principal before the new process became
       // writable. The old chat knows this integer from its own previous session, but it no
       // longer has authority over what now happens to occupy that slot.
       expect(execOwner(recycledId)).toBeNull();
-      const stolen = await asChat('wfr_execown_old_recycled', 'write_stdin', {
+      const stolen = await asChat(`wfr_execown_old_recycled_${run}`, 'write_stdin', {
         session_id: recycledId,
         chars: 'stolen\r',
         yield_time_ms: 50
@@ -3311,16 +3824,17 @@ describe('exec sessions belong to the chat that opened them', () => {
       expect(stolen.body.result?.isError).toBe(true);
       expect(textOf(stolen)).toContain('EXEC_SESSION_UNAVAILABLE');
 
+      release();
       const started = await starting;
       expect(started.body.result?.isError, textOf(started)).not.toBe(true);
       expect(Number(textOf(started).match(/Process running with session ID (\d+)/)?.[1])).toBe(recycledId);
-      expect(execOwner(recycledId)).toBe('session-conv-execown-new');
+      expect(execOwner(recycledId)).toBe(`session-conv-execown-new-${run}`);
       expect(textOf(started)).not.toContain('got=');
 
       // Let the real owner release the shell normally. Besides proving the new principal did
       // receive authority, this keeps cleanup deterministic instead of spending the process
       // manager's kill grace period on an intentionally blocked test process.
-      const owner = await asChat('wfr_execown_new_recycled', 'write_stdin', {
+      const owner = await asChat(`wfr_execown_new_recycled_${run}`, 'write_stdin', {
         session_id: recycledId,
         chars: 'owner\r',
         yield_time_ms: 5_000
@@ -3329,7 +3843,10 @@ describe('exec sessions belong to the chat that opened them', () => {
       expect(textOf(owner)).toContain('got=owner');
       expect(textOf(owner)).toContain('Process exited with code 0');
     } finally {
-      random.mockRestore();
+      release();
+      await starting?.catch(() => undefined);
+      execution.mockRestore();
+      allocation.mockRestore();
       await unifiedExecManager.terminateAllProcesses();
       resetExecOwnershipForTests();
     }
@@ -3366,6 +3883,9 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(later)).toContain(`Exit code: ${exitCode}`);
     expect(textOf(later)).toContain('background-e2e-once');
     expect(textOf(later)).not.toContain(`write_stdin(session_id=${sessionId}`);
+    // ChatGPT's safety check read "Delivered automatically" as the tool steering how its output
+    // is treated, and stopped a long run on an approval card (VM, 2026-10-15).
+    expect(textOf(later)).not.toMatch(/delivered automatically/i);
 
     // Publication receipts require a strictly later timestamp; loopback calls can
     // otherwise share one millisecond even though this response was already read.
@@ -3374,6 +3894,24 @@ describe('exec sessions belong to the chat that opened them', () => {
     const after = await asChat('wfr_background_owner', 'read', { paths: ['/workspace/src/app.ts'] });
     expect(textOf(after)).not.toContain(`Background session ${sessionId}`);
     expect(unifiedExecManager.exitedUnread(owned)).toEqual([]);
+    const reread = await asChat('wfr_background_owner', 'write_stdin', { session_id: sessionId, chars: '' });
+    expect(failed(reread), textOf(reread)).toBe(false);
+    expect(textOf(reread)).toContain('Retained output');
+    expect(textOf(reread)).toContain('background-e2e-once');
+    expect(textOf(reread)).toContain('Process exited with code 7');
+    const forbidden = await asChat('wfr_background_other', 'write_stdin', { session_id: sessionId, chars: '' });
+    expect(failed(forbidden)).toBe(true);
+    expect(textOf(forbidden)).not.toContain('background-e2e-once');
+    const direct = await asChat('wfr_background_owner', 'exec_command', {
+      cmd: IS_WINDOWS ? "Write-Output 'direct-result'; exit 0" : "printf '%s\\n' direct-result",
+      workdir: '/workspace', yield_time_ms: 10000
+    });
+    expect(failed(direct), textOf(direct)).toBe(false);
+    const completedId = Number(textOf(direct).match(/Completed session ID: (\d+)/)?.[1]);
+    expect(Number.isInteger(completedId)).toBe(true);
+    const directRead = await asChat('wfr_background_owner', 'write_stdin', { session_id: completedId, chars: '' });
+    expect(failed(directRead), textOf(directRead)).toBe(false);
+    expect(textOf(directRead)).toContain('direct-result');
   });
 
   it('reoffers completed output after the real HTTP connection closes before publication', async () => {
@@ -3416,6 +3954,10 @@ describe('exec sessions belong to the chat that opened them', () => {
     const replay = await asChat(requestId, 'read', { paths: ['/workspace/src/app.ts'] });
     expect(textOf(replay)).toContain('transport-replay');
     expect(unifiedExecManager.exitedUnread(new Set([id]))).toHaveLength(1);
+    // Receipts require a strictly later invocation timestamp. Fast CI can receive both
+    // HTTP responses in one millisecond, which is intentionally not a receipt boundary.
+    const replayReceivedAt = Date.now();
+    await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(replayReceivedAt));
     const receipt = await asChat(requestId, 'read', { paths: ['/workspace/src/app.ts'] });
     expect(textOf(receipt)).not.toContain('transport-replay');
     expect(unifiedExecManager.exitedUnread(new Set([id]))).toEqual([]);
@@ -3450,10 +3992,28 @@ describe('exec sessions belong to the chat that opened them', () => {
 
     const blockedRequest = 'wfr_background_admission_blocked';
     expect(prove(blockedRequest, conversationId)).toBe('stored');
-    const blocked = await asChat(blockedRequest, 'exec_command', {
-      cmd: IS_WINDOWS ? "Write-Output 'must-not-run'" : "printf '%s\\n' must-not-run",
-      workdir: '/workspace'
+    const offer = unifiedExecManager.offerCompletedOutput.bind(unifiedExecManager);
+    let publication: Parameters<typeof offer>[1] | undefined;
+    const published = vi.spyOn(unifiedExecManager, 'offerCompletedOutput').mockImplementation(async (...args) => {
+      publication = args[1];
+      return offer(...args);
     });
+    let blocked: Awaited<ReturnType<typeof asChat>>;
+    try {
+      blocked = await asChat(blockedRequest, 'exec_command', {
+        cmd: IS_WINDOWS ? "Write-Output 'must-not-run'" : "printf '%s\\n' must-not-run",
+        workdir: '/workspace'
+      });
+      // A later invocation acknowledges only a successfully published page whose completion
+      // timestamp is strictly earlier. Observe that boundary instead of retrying commands.
+      await vi.waitFor(() => {
+        expect(publication?.failed).toBe(false);
+        expect(publication?.completedAt).toBeTypeOf('number');
+        expect(Date.now()).toBeGreaterThan(publication!.completedAt!);
+      });
+    } finally {
+      published.mockRestore();
+    }
     expect(failed(blocked)).toBe(true);
     expect(textOf(blocked)).toContain('EXEC_RESULTS_UNREAD');
     for (const sessionId of sessionIds) expect(textOf(blocked)).toContain(String(sessionId));
@@ -3546,6 +4106,59 @@ describe('exec sessions belong to the chat that opened them', () => {
       expect(textOf(after)).not.toContain(`Background session ${sessionId}`);
     } finally {
       await unifiedExecManager.terminateProcess(sessionId);
+    }
+  });
+
+  it('names a still-running identical command from the same chat, and still starts the new one', async () => {
+    expect(prove('wfr_duplicate_first', 'conv-duplicate')).toBe('stored');
+    expect(prove('wfr_duplicate_retry', 'conv-duplicate')).toBe('stored');
+    expect(prove('wfr_duplicate_stranger', 'conv-duplicate-stranger')).toBe('stored');
+    const cmd = IS_WINDOWS ? 'Start-Sleep -Seconds 30' : 'sleep 30';
+    const sessionOf = (result: Awaited<ReturnType<typeof asChat>>) =>
+      Number(textOf(result).match(/Process running with session ID (\d+)/)?.[1]);
+    const started: number[] = [];
+    try {
+      const first = await asChat('wfr_duplicate_first', 'exec_command', { cmd, workdir: '/workspace', yield_time_ms: 250 });
+      started.push(sessionOf(first));
+      expect(Number.isInteger(started[0]), textOf(first)).toBe(true);
+      expect(textOf(first)).not.toContain('still running from earlier');
+
+      // Another chat running the same command is its own business.
+      const stranger = await asChat('wfr_duplicate_stranger', 'exec_command', { cmd, workdir: '/workspace', yield_time_ms: 250 });
+      started.push(sessionOf(stranger));
+      expect(textOf(stranger)).not.toContain('still running from earlier');
+
+      // A different folder is a different command.
+      await fs.mkdir(path.join(approved, 'elsewhere'), { recursive: true });
+      const elsewhere = await asChat('wfr_duplicate_retry', 'exec_command', { cmd, workdir: '/workspace/elsewhere', yield_time_ms: 250 });
+      started.push(sessionOf(elsewhere));
+      expect(textOf(elsewhere)).not.toContain('still running from earlier');
+
+      // The retry in the same chat and folder is not refused: running twice can be deliberate.
+      const retry = await asChat('wfr_duplicate_retry', 'exec_command', { cmd, workdir: '/workspace', yield_time_ms: 250 });
+      started.push(sessionOf(retry));
+      expect(failed(retry), textOf(retry)).toBe(false);
+      expect(Number.isInteger(started[3]), textOf(retry)).toBe(true);
+      expect(started[3]).not.toBe(started[0]);
+      expect(textOf(retry)).toContain(`still running from earlier in this chat as session ${started[0]} `);
+      expect(textOf(retry)).toContain(`write_stdin(session_id=${started[0]}, chars="")`);
+      // The structured result is what ChatGPT gives the model; the note must be in it.
+      expect(retry.body.result?.structuredContent?.supplemental_context)
+        .toContain(`still running from earlier in this chat as session ${started[0]} `);
+      expect(first.body.result?.structuredContent).not.toHaveProperty('supplemental_context');
+
+      // Delivery's own appendix (here the reminder about an unpolled session) joins the handler's
+      // note in that field instead of replacing it.
+      backdateExecAttendanceForTests(started[0]!, UNATTENDED_EXEC_NOTICE_MS + 60_000);
+      expect(prove('wfr_duplicate_again', 'conv-duplicate')).toBe('stored');
+      const again = await asChat('wfr_duplicate_again', 'exec_command', { cmd, workdir: '/workspace', yield_time_ms: 250 });
+      started.push(sessionOf(again));
+      const context = String(again.body.result?.structuredContent?.supplemental_context ?? '');
+      expect(context).toContain('still running from earlier in this chat');
+      expect(context).toContain(`Background session ${started[0]} has been running unpolled`);
+      expect(context.indexOf('still running from earlier')).toBeLessThan(context.indexOf(`Background session ${started[0]}`));
+    } finally {
+      for (const id of started) if (Number.isInteger(id)) await unifiedExecManager.terminateProcess(id);
     }
   });
 });
@@ -3641,6 +4254,22 @@ describe('blocked chats', () => {
     return requestId;
   };
 
+  /** Same proof, but tied to a real durable session so app notices can be asserted. */
+  const ownedSession = (conversationId: string, sessionId: string): string => {
+    const requestId = `wfr_block_session_${++proofSeq}`;
+    expect(
+      observeRequestCorrelation({
+        requestId,
+        conversationId,
+        sessionId,
+        messageId: `message-block-session-${proofSeq}`,
+        tool: 'read',
+        observedAt: Date.now()
+      })
+    ).toBe('stored');
+    return requestId;
+  };
+
   /**
    * The same proof, deliberately late: the page reporting *after* the call has already landed.
    *
@@ -3672,8 +4301,36 @@ describe('blocked chats', () => {
       requestId ? { 'x-request-id': `${requestId}/att1` } : {}
     );
 
-  beforeEach(() => resetBlockedChatsForTests());
-  afterAll(() => resetBlockedChatsForTests());
+  beforeEach(() => {
+    resetBlockedChatsForTests();
+    resetTrustedChatsForTests();
+    resetAgentsForTests();
+    onSwarmPersistNow(async () => undefined);
+    onSpawnRequest(() => undefined);
+    getConfig().multiAgent.strictChatAllowlist = false;
+  });
+  afterAll(() => {
+    resetBlockedChatsForTests();
+    resetTrustedChatsForTests();
+    resetAgentsForTests();
+    getConfig().multiAgent.strictChatAllowlist = false;
+  });
+
+  // `ui.rotateStopFallback`: while the app stops a turn to continue it in a fresh one, a call of that
+  // chat is refused, not run, so a Stop landing mid-call cannot make the model run it twice.
+  it('refuses, without running it, a call of a chat whose turn is being continued in a fresh one', async () => {
+    const { armRotationFence, clearRotationFence } = await import('../src/main/rotation-fence.js');
+    armRotationFence(ROGUE, 'turn-being-stopped');
+    try {
+      const reply = await readAs(owned(ROGUE));
+      expect(failed(reply)).toBe(true);
+      expect(textOf(reply)).toContain('TURN_CONTINUING');
+      expect(textOf(reply)).toMatch(/was not run/i);
+      expect(textOf(reply)).not.toContain('/workspace/notes.txt');
+    } finally { clearRotationFence(ROGUE); }
+    // Lifted: the same call runs again.
+    expect(failed(await readAs(owned(ROGUE)))).toBe(false);
+  });
 
   it('refuses a blocked chat’s call and tells the model to stop instead of retrying', async () => {
     setChatBlocked(ROGUE, true);
@@ -3754,5 +4411,188 @@ describe('blocked chats', () => {
     const after = await readAs(requestId);
     expect(failed(after)).toBe(false);
     expect(textOf(after)).toContain('/workspace/notes.txt');
+  });
+
+  it('strict mode refuses untrusted and unattributed calls, then admits only the exact trusted chat', async () => {
+    getConfig().multiAgent.strictChatAllowlist = true;
+
+    const untrusted = await readAs(owned(BYSTANDER));
+    expect(failed(untrusted)).toBe(true);
+    expect(textOf(untrusted)).toContain('CHAT_NOT_TRUSTED');
+    expect(textOf(untrusted)).toMatch(/⋯ menu in the app's sidebar/);
+    expect(textOf(untrusted)).toContain('Trust chat');
+    // VM, 2026-10-20: refused here, the model ran the same command through the other computer's app.
+    expect(textOf(untrusted)).toContain('Do not send it to another app or connector instead');
+    expect(textOf(untrusted)).not.toContain('Sessions');
+    expect(textOf(untrusted)).not.toContain('/workspace/notes.txt');
+
+    const unattributed = await readAs(null);
+    expect(failed(unattributed)).toBe(true);
+    expect(textOf(unattributed)).toContain('CHAT_NOT_TRUSTED');
+
+    await setChatTrusted(BYSTANDER, true);
+    const trusted = await readAs(owned(BYSTANDER));
+    expect(failed(trusted)).toBe(false);
+    expect(textOf(trusted)).toContain('/workspace/notes.txt');
+  });
+
+  it('strict mode waits for late exact proof and block still wins over trust', async () => {
+    getConfig().multiAgent.strictChatAllowlist = true;
+    await setChatTrusted(ROGUE, true);
+
+    const trustedLate = await readAs(provenLate(ROGUE, 40));
+    expect(failed(trustedLate)).toBe(false);
+    expect(textOf(trustedLate)).toContain('/workspace/notes.txt');
+
+    setChatBlocked(ROGUE, true);
+    const blocked = await readAs(owned(ROGUE));
+    expect(failed(blocked)).toBe(true);
+    expect(textOf(blocked)).toContain('CHAT_BLOCKED');
+    expect(textOf(blocked)).not.toContain('CHAT_NOT_TRUSTED');
+  });
+
+  it('lets a trusted prime worker use tools and revokes it with the prime', async () => {
+    const prime = 'strict-prime-owner';
+    const worker = 'strict-worker-owned';
+    getConfig().multiAgent.strictChatAllowlist = true;
+    const run = spawn({ caller: { conversationId: prime }, workers: [{ task: 'read the project' }] });
+    expect(bindConversation('worker-1', worker, run.runId)).toBe(true);
+
+    await setChatTrusted(prime, true);
+    const allowed = await readAs(owned(worker));
+    expect(failed(allowed), textOf(allowed)).toBe(false);
+    expect(textOf(allowed)).toContain('/workspace/notes.txt');
+
+    await setChatTrusted(prime, false);
+    const untrusted = await readAs(owned(worker));
+    expect(failed(untrusted)).toBe(true);
+    expect(textOf(untrusted)).toContain('CHAT_NOT_TRUSTED');
+
+    await setChatTrusted(prime, true);
+    setChatBlocked(prime, true);
+    const parentBlocked = await readAs(owned(worker));
+    expect(failed(parentBlocked)).toBe(true);
+    expect(textOf(parentBlocked)).toContain('CHAT_NOT_TRUSTED');
+  });
+
+  it('tells a refused worker to use its main chat\'s menu in the sidebar', async () => {
+    const prime = 'strict-worker-notice-prime';
+    const worker = 'strict-worker-notice-child';
+    const primeSession = await createSession({ title: 'strict worker notice prime', conversationId: prime });
+    const workerSession = await createSession({
+      title: 'strict worker notice child', conversationId: worker,
+      origin: { kind: 'worker', fromSessionId: primeSession.id, agentId: 'worker-1', task: 'read the project' }
+    });
+    getConfig().multiAgent.strictChatAllowlist = true;
+    const run = spawn({ caller: { conversationId: prime }, workers: [{ task: 'read the project' }] });
+    expect(bindConversation('worker-1', worker, run.runId)).toBe(true);
+
+    const refused = await readAs(ownedSession(worker, workerSession.id));
+    expect(failed(refused)).toBe(true);
+    const notices = (await readRecentEvents(workerSession.id, 20))
+      .filter(event => event.kind === 'progress' && /worker whose main chat/i.test(event.message.text));
+    expect(notices).toHaveLength(1);
+    const copy = notices[0]?.kind === 'progress' ? notices[0].message.text : '';
+    expect(copy).toMatch(/main chat's ⋯ menu in the sidebar/);
+    expect(copy).toContain('Trust chat');
+    expect(copy).toContain('Release chat');
+    expect(copy).not.toContain('Sessions');
+  });
+
+  it('keeps durable worker identity fail-closed after broker provenance expires', async () => {
+    const worker = 'strict-worker-durable-origin';
+    const session = await createSession({
+      title: 'strict durable worker origin',
+      conversationId: worker,
+      origin: { kind: 'worker', fromSessionId: null, agentId: 'worker-9', task: 'old worker task' }
+    });
+    getConfig().multiAgent.strictChatAllowlist = true;
+    // Simulate a pre-fix direct worker Trust entry that outlived the broker family's bounded
+    // active/dormant/retired retention. Durable session origin must still keep it fail-closed.
+    await setChatTrusted(worker, true);
+
+    const refused = await readAs(ownedSession(worker, session.id));
+    expect(failed(refused)).toBe(true);
+    expect(textOf(refused)).toContain('CHAT_NOT_TRUSTED');
+    const notices = (await readRecentEvents(session.id, 20))
+      .filter(event => event.kind === 'progress' && /app-created worker/.test(event.message.text));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.kind === 'progress' && notices[0].message.text).toContain('the main chat that started it is not proven yet');
+  });
+
+  it('keeps a trusted chat authorized only after its Compact & Resume successor commits', async () => {
+    const chatA = 'f0f00009-1111-4111-8111-111111111111';
+    const chatB = 'f0f00010-1111-4111-8111-111111111111';
+    const chatC = 'f0f00012-1111-4111-8111-111111111111';
+    const summary = await createSession({ title: 'strict resume owner', conversationId: chatA });
+    getConfig().multiAgent.strictChatAllowlist = true;
+    await setChatTrusted(chatA, true);
+
+    const opened = await openContinuationNow(summary.id, chatA, false);
+    expect((await beginContinuationSourceSendNow(opened.token))?.allowed).toBe(true);
+    expect(await dispatchContinuationSourceSendNow(opened.token)).toBe(true);
+    await attachSummary(opened.token, 'STRICT_RESUME_SUMMARY\n'.repeat(40));
+    expect(await claimContinuationNow(opened.token, 'strict-resume-document')).not.toBeNull();
+
+    const beforeCommit = await readAs(ownedSession(chatB, summary.id));
+    expect(failed(beforeCommit)).toBe(true);
+    expect(textOf(beforeCommit)).toContain('CHAT_NOT_TRUSTED');
+
+    expect(await commitContinuation(opened.token, chatB)).toBe(true);
+    const afterCommit = await readAs(ownedSession(chatB, summary.id));
+    expect(failed(afterCommit), textOf(afterCommit)).toBe(false);
+    expect(textOf(afterCommit)).toContain('/workspace/notes.txt');
+
+    // The durable lineage remains transitive across later committed resumes; B has no copied
+    // Trust bit of its own, so C still derives from the original explicit source A.
+    expect(await rebindSession(summary.id, chatB, chatC, 'handoff-resume-chain-0001')).toBe(true);
+    const afterSecondCommit = await readAs(ownedSession(chatC, summary.id));
+    expect(failed(afterSecondCommit), textOf(afterSecondCommit)).toBe(false);
+    expect(textOf(afterSecondCommit)).toContain('/workspace/notes.txt');
+
+    await setChatTrusted(chatA, false);
+    const revoked = await readAs(ownedSession(chatC, summary.id));
+    expect(failed(revoked)).toBe(true);
+    expect(textOf(revoked)).toContain('CHAT_NOT_TRUSTED');
+
+    await setChatTrusted(chatA, true);
+    setChatBlocked(chatB, true);
+    const intermediateBlocked = await readAs(ownedSession(chatC, summary.id));
+    expect(failed(intermediateBlocked)).toBe(true);
+    expect(textOf(intermediateBlocked)).toContain('CHAT_NOT_TRUSTED');
+    setChatBlocked(chatB, false);
+    setChatBlocked(chatA, true);
+    const sourceBlocked = await readAs(ownedSession(chatC, summary.id));
+    expect(failed(sourceBlocked)).toBe(true);
+    expect(textOf(sourceBlocked)).toContain('CHAT_NOT_TRUSTED');
+  });
+
+  it('records one visible notice when strict mode refuses an attributed untrusted chat', async () => {
+    const conversationId = 'f0f00011-1111-4111-8111-111111111111';
+    const session = await createSession({ title: 'strict refusal notice', conversationId });
+    getConfig().multiAgent.strictChatAllowlist = true;
+
+    const parallel = await Promise.all([
+      readAs(ownedSession(conversationId, session.id)),
+      readAs(ownedSession(conversationId, session.id))
+    ]);
+    expect(parallel.every(reply => textOf(reply).includes('CHAT_NOT_TRUSTED'))).toBe(true);
+    const notes = (await readRecentEvents(session.id, 20))
+      .filter(event => event.kind === 'progress' && /untrusted chat was refused/.test(event.message.text));
+    expect(notes).toHaveLength(1);
+    const copy = notes[0]?.kind === 'progress' ? notes[0].message.text : '';
+    // The sidebar has one ⋯ menu per row since 7a023be7; there is no ✓ to hover for.
+    expect(copy).toMatch(/⋯ menu in the sidebar/);
+    expect(copy).toContain('Trust chat');
+    expect(copy).not.toContain('Trust (✓)');
+    expect(copy).not.toContain('Sessions');
+
+    await setChatTrusted(conversationId, true);
+    expect(failed(await readAs(ownedSession(conversationId, session.id)))).toBe(false);
+    await setChatTrusted(conversationId, false);
+    expect(textOf(await readAs(ownedSession(conversationId, session.id)))).toContain('CHAT_NOT_TRUSTED');
+    const nextEpisode = foldProgress(await readRecentEvents(session.id, 20))
+      .filter(event => event.kind === 'progress' && /untrusted chat was refused/.test(event.message.text));
+    expect(nextEpisode).toHaveLength(2);
   });
 });

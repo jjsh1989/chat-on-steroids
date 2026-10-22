@@ -147,6 +147,21 @@ const UNDONE: Record<string, string> = {
   Requested: 'request'
 };
 
+/**
+ * Past tense → progressive, for the caption of a call still running. The title is built from the
+ * call's arguments alone, before any evidence exists, so it names the subject and not the result.
+ */
+const ONGOING: Record<string, string> = {
+  Edited: 'Editing', Applied: 'Applying', Rewrote: 'Rewriting', Appended: 'Appending', Created: 'Creating',
+  Saved: 'Saving', Interrupted: 'Interrupting', Filled: 'Filling', Wrote: 'Writing', Moved: 'Moving',
+  Deleted: 'Deleting', Read: 'Reading', Viewed: 'Viewing', Inspected: 'Inspecting', Listed: 'Listing',
+  Searched: 'Searching', Checked: 'Checking', Ran: 'Running', Launched: 'Launching', Started: 'Starting',
+  Stopped: 'Stopping', Opened: 'Opening', Looked: 'Looking', Waited: 'Waiting', Clicked: 'Clicking',
+  'Double-clicked': 'Double-clicking', Dragged: 'Dragging', Scrolled: 'Scrolling', Typed: 'Typing',
+  Pressed: 'Pressing', Focused: 'Focusing', Acted: 'Acting', Replaced: 'Replacing', Loaded: 'Loading',
+  Messaged: 'Messaging', Reported: 'Reporting', Requested: 'Requesting', Updated: 'Updating', Cleared: 'Clearing'
+};
+
 /** Whole titles that do not begin with a verb. */
 const UNDONE_WHOLE: Record<string, string> = {};
 
@@ -175,6 +190,19 @@ export interface SummaryInput {
   resultHead?: string;
 }
 
+/** What a call is doing while it runs: "Reading src/x.ts", "Running npm test", and its kind. */
+export function summarizeRunningCall(tool: string, args: unknown, evidence: CallEvidence): { title: string; kind: ActivitySummary['kind'] } {
+  let summary: ActivitySummary;
+  try {
+    summary = build(tool, record(args), evidence, [], { tool, args, evidence, outcome: 'ok', durationMs: 0 });
+  } catch {
+    return { title: `Running ${tool}`, kind: 'other' };
+  }
+  const space = summary.title.indexOf(' ');
+  const verb = ONGOING[space === -1 ? summary.title : summary.title.slice(0, space)];
+  return { title: verb ? `${verb}${space === -1 ? '' : summary.title.slice(space)}` : `Running ${tool}`, kind: summary.kind };
+}
+
 /**
  * Builds the compact entry.
  *
@@ -191,15 +219,22 @@ export function summarizeToolCall(input: SummaryInput): ActivitySummary {
   // A child process reporting failure is still a successfully executed tool call.
   if (input.outcome === 'ok' || input.outcome === 'process_exit_nonzero') return summary;
   const refused = input.outcome === 'tool_rejected';
+  const head = (input.resultHead ?? '').trim();
+  // Only content-match verification failures get this wording. Permission, identity,
+  // syntax and execution failures keep their own meaning (and any partial-change evidence).
+  const patchMismatch = refused && input.tool === 'apply_patch' && changes.length === 0 &&
+    /^apply_patch verification failed: Failed to find (?:expected lines in |context(?: in | '))/.test(head);
   const failed: ActivitySummary = {
     ...summary,
     tone: input.outcome === 'tool_internal_error' ? 'bad' : 'warn',
     // The verb carries the outcome, not just the colour. Tone and metric are easy to
     // miss and are gone entirely once a line is quoted or read back as text.
-    title: input.outcome === 'tool_execution_error' ? `Tool ${input.tool} failed` : undoTitle(summary.title, refused)
+    title: patchMismatch ? 'Patch didn’t match' :
+      input.outcome === 'tool_execution_error' ? `Tool ${input.tool} failed` : undoTitle(summary.title, refused)
   };
-  const head = (input.resultHead ?? '').trim();
-  if (refused) {
+  if (patchMismatch) {
+    failed.metric = 'not applied';
+  } else if (refused) {
     failed.metric = 'refused';
   } else if (!failed.metric || !failed.metric.startsWith('✕')) {
     failed.metric = '✕ failed';
@@ -294,8 +329,9 @@ function build(
 
     // ---------------------------------------------------------- commands
     case 'exec_command': {
-      const command = scriptLabel(str(args['cmd']));
-      const failed = evidence.timedOut || (evidence.exitCode !== null && evidence.exitCode !== 0);
+      const commands = Array.isArray(args['cmds']) ? args['cmds'].filter((item): item is string => typeof item === 'string') : [];
+      const command = commands.length ? `${commands.length} commands: ${scriptLabel(commands.join('; '))}` : scriptLabel(str(args['cmd']));
+      const failed = evidence.timedOut || (!evidence.benignExit && evidence.exitCode !== null && evidence.exitCode !== 0);
       // `exec_command` deliberately returns after its yield window when the child is still
       // alive. New callers record that state explicitly. The second branch keeps older
       // in-memory/test evidence readable, but no new summary needs to infer process state
@@ -318,7 +354,7 @@ function build(
       };
     }
     case 'write_stdin': {
-      const id = str(args['session_id']) ?? '';
+      const id = typeof args['session_id'] === 'number' ? String(args['session_id']) : str(args['session_id']) ?? '';
       const signal = str(args['signal']);
       const title =
         signal === 'kill'
@@ -328,7 +364,9 @@ function build(
             : str(args['chars'])
               ? `Wrote to session ${id}`.trim()
               : `Waited on session ${id}`.trim();
-      return { kind: 'process', tone: signal === 'kill' ? 'warn' : 'neutral', title };
+      const failed = !evidence.benignExit && evidence.exitCode !== null && evidence.exitCode !== 0;
+      return { kind: 'process', tone: signal === 'kill' ? 'warn' : failed ? 'bad' : 'neutral', title,
+        ...(evidence.exitCode === null ? {} : { metric: failed ? `✕ exit ${evidence.exitCode}` : '✓ finished' }) };
     }
 
     // ------------------------------------------------------------ screen

@@ -1,0 +1,109 @@
+import { beforeEach, expect, it, vi } from 'vitest';
+const mocks = vi.hoisted(() => ({
+  spawn: vi.fn(), workspace: vi.fn(), project: vi.fn(), command: true,
+  pty: { onData: vi.fn(), onExit: vi.fn(), pause: vi.fn(), resume: vi.fn(), write: vi.fn(), resize: vi.fn(), kill: vi.fn() }
+}));
+vi.mock('node-pty', () => ({ spawn: mocks.spawn }));
+vi.mock('../src/main/projects.js', () => ({ projectWorkspace: mocks.workspace, getProject: mocks.project }));
+vi.mock('../src/main/config.js', () => ({ getConfig: () => ({}), effectiveCapabilities: () => ({ command: mocks.command }) }));
+vi.mock('../src/main/codex/shell.js', () => ({ defaultUserShell: () => ({ shellPath: 'shell', shellType: 'bash' }) }));
+import { resetWorkspaceTerminalExitsForTests, WorkspaceTerminals, workspaceTerminalsExited } from '../src/main/workspace-terminal.js';
+import { sshArgs, sshProgram, remoteLoginShell } from '../src/main/remote/ssh.js';
+beforeEach(() => { vi.clearAllMocks(); mocks.command = true; mocks.spawn.mockReturnValue(mocks.pty); mocks.workspace.mockResolvedValue({ real: '/project' }); mocks.project.mockResolvedValue({ id: 'project-a' }); });
+
+it('captures project cwd and cancels a pending spawn when its tab closes', async () => {
+  let resolve!: (value: { real: string }) => void;
+  mocks.workspace.mockReturnValueOnce(new Promise(done => { resolve = done; }));
+  const service = new WorkspaceTerminals(vi.fn(), '/home');
+  const opening = service.create('one', 'project-a', 80, 24); service.close('one');
+  resolve({ real: '/project' }); await expect(opening).rejects.toThrow('cancelled'); expect(mocks.spawn).not.toHaveBeenCalled();
+  await expect(service.create('two', 'project-a', 80, 24)).resolves.toMatchObject({ cwd: '/project' });
+  expect(mocks.spawn).toHaveBeenCalledWith('shell', [], expect.objectContaining({ cwd: '/project', cols: 80, rows: 24 }));
+  service.dispose(); expect(mocks.pty.kill).toHaveBeenCalledOnce();
+});
+it('rechecks command permission and original project identity before interactive input', async () => {
+  const service = new WorkspaceTerminals(vi.fn(), '/home'); await service.create('one', 'project-a', 80, 24);
+  mocks.command = false; await expect(service.write('one', 'rm file\r')).rejects.toThrow('disabled');
+  mocks.command = true; mocks.workspace.mockResolvedValue({ real: '/other' });
+  await expect(service.write('one', 'pwd\r')).rejects.toThrow('changed'); expect(mocks.pty.write).not.toHaveBeenCalled();
+  service.dispose();
+});
+it('pauses output until xterm has parsed it and releases exited or disposed terminals', async () => {
+  const emit = vi.fn(), service = new WorkspaceTerminals(emit, '/home'); await service.create('one', 'project-a', 80, 24);
+  const data = mocks.pty.onData.mock.calls[0]![0]; data('a'.repeat(262_144));
+  expect(emit).toHaveBeenCalledTimes(16); expect(mocks.pty.pause).toHaveBeenCalledOnce();
+  service.acknowledge('one', 262_144); expect(mocks.pty.resume).toHaveBeenCalledOnce();
+  mocks.pty.onExit.mock.calls[0]![0]({ exitCode: 7 }); expect(emit).toHaveBeenLastCalledWith({ id: 'one', exitCode: 7 });
+  await expect(service.write('one', 'echo x')).rejects.toThrow('closed');
+  service.dispose(); expect(mocks.pty.kill).not.toHaveBeenCalled();
+});
+it('bounds active plus pending tabs and prevents spawn after renderer retirement', async () => {
+  const service = new WorkspaceTerminals(vi.fn(), '/home');
+  for (let index = 0; index < 8; index++) await service.create(String(index), 'project-a', 80, 24);
+  await expect(service.create('ninth', 'project-a', 80, 24)).rejects.toThrow('maximum 8');
+  service.dispose(); expect(mocks.pty.kill).toHaveBeenCalledTimes(8);
+});
+it('starts projectless shells in the main-owned home cwd without resolving a project', async () => {
+  const service = new WorkspaceTerminals(vi.fn(), '/home');
+  await expect(service.create('one', null, 80, 24)).resolves.toMatchObject({ projectId: null, cwd: '/home' });
+  expect(mocks.workspace).not.toHaveBeenCalled();
+  expect(mocks.spawn).toHaveBeenCalledWith('shell', [], expect.objectContaining({ cwd: '/home' }));
+  await service.write('one', 'pwd\r');
+  expect(mocks.workspace).not.toHaveBeenCalled();
+  expect(mocks.pty.write).toHaveBeenCalledWith('pwd\r');
+  mocks.command = false;
+  await expect(service.write('one', 'echo denied\r')).rejects.toThrow('disabled');
+  service.dispose();
+});
+it('never falls back to home when a selected project cannot be resolved', async () => {
+  mocks.workspace.mockRejectedValueOnce(new Error('Project is unavailable'));
+  const service = new WorkspaceTerminals(vi.fn(), '/home');
+  await expect(service.create('one', 'missing-project', 80, 24)).rejects.toThrow('Project is unavailable');
+  expect(mocks.spawn).not.toHaveBeenCalled();
+});
+it('lets shutdown wait for a closed shell\'s exit, bounded, so ConPTY is not torn down mid-exit', async () => {
+  // Earlier tests close shells whose mocked exits never fire.
+  resetWorkspaceTerminalExitsForTests();
+  await expect(workspaceTerminalsExited(10)).resolves.toBeUndefined();
+  const service = new WorkspaceTerminals(vi.fn(), '/home'); await service.create('one', null, 80, 24);
+  const exit = mocks.pty.onExit.mock.calls[0]![0] as (event: { exitCode: number }) => void;
+  service.close('one');
+  let done = false;
+  const waiting = workspaceTerminalsExited(5_000).then(() => { done = true; });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(done).toBe(false);
+  const exitedAt = Date.now();
+  exit({ exitCode: 0 });
+  await waiting;
+  expect(done).toBe(true);
+  expect(Date.now() - exitedAt).toBeLessThan(1_000);
+  // An exit that never arrives does not hold shutdown past its budget.
+  await service.create('two', null, 80, 24); service.close('two');
+  const started = Date.now();
+  await workspaceTerminalsExited(30);
+  expect(Date.now() - started).toBeLessThan(1_000);
+  (mocks.pty.onExit.mock.calls[1]![0] as (event: { exitCode: number }) => void)({ exitCode: 0 });
+  await expect(workspaceTerminalsExited(10)).resolves.toBeUndefined();
+});
+
+// #1469: a project on a server opens its terminal there, through the person's own ssh, in the
+// project folder and the server account's login shell.
+it('opens a server project\'s terminal over ssh in its folder', async () => {
+  mocks.project.mockResolvedValue({ id: 'remote', remote: { host: 'me@devbox', port: 2222, path: '/srv/my app' } });
+  mocks.workspace.mockResolvedValue({ real: '/srv/my app' });
+  const service = new WorkspaceTerminals(vi.fn(), '/home');
+  await expect(service.create('one', 'remote', 80, 24)).resolves.toMatchObject({ cwd: '/srv/my app', shell: 'sh' });
+  const [program, args, options] = mocks.spawn.mock.calls[0]!;
+  expect(program).toBe(sshProgram());
+  expect(args).toEqual(sshArgs({ host: 'me@devbox', port: 2222, path: '/srv/my app' }, ['-tt'], [remoteLoginShell('/srv/my app')]));
+  // ssh itself runs from the app's own folder: the project folder exists only on the server.
+  expect(options).toMatchObject({ cwd: '/home', cols: 80, rows: 24 });
+  // Typing does not ask the server about the folder for every key; the project's address does.
+  mocks.workspace.mockClear();
+  await service.write('one', 'ls\r');
+  expect(mocks.workspace).not.toHaveBeenCalled();
+  expect(mocks.pty.write).toHaveBeenCalledWith('ls\r');
+  mocks.project.mockResolvedValue({ id: 'remote', remote: { host: 'me@other', path: '/srv/my app' } });
+  await expect(service.write('one', 'rm x\r')).rejects.toThrow('changed');
+  service.dispose();
+});

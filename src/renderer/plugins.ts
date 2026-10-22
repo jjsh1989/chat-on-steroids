@@ -1,8 +1,9 @@
-import { ui, t } from './i18n.js';
+import { ui, t, tn } from './i18n.js';
 import type { AppState } from '../shared/types.js';
 import type { SettingsPatch } from '../preload/index.js';
 import type { PluginSnapshot, PluginView, PluginCatalogEntry, PluginSource } from '../shared/plugins.js';
-import { $, el, run, toast } from './dom.js';
+import { $, disclosureChevron, el, run, toast } from './dom.js';
+import { paintSharedTunnel } from './tunnel-warning.js';
 
 let snapshot: PluginSnapshot = { plugins: [], catalog: [], schemaRevision: 0 };
 let epoch = 0;
@@ -14,10 +15,19 @@ function button(label: string | (() => string), action: () => void | Promise<voi
   node.type = 'button';
   node.addEventListener('click', async () => {
     node.disabled = true;
-    try { await action(); } catch (error) { toast(error instanceof Error ? error.message : 'Plugin operation failed'); }
+    try { await action(); } catch (error) { toast(error instanceof Error ? error.message : t('Plugin operation failed')); }
     finally { node.disabled = false; }
   });
   return node;
+}
+/**
+ * A disclosure headline with the app's chevron, the only sign it opens once the native marker is
+ * hidden. The words sit in their own span, so a language change rewrites them without the chevron.
+ */
+function disclosureSummary(label: () => string): HTMLElement {
+  const summary = el('summary');
+  summary.append(disclosureChevron('details-chevron'), el('span', '', label));
+  return summary;
 }
 function art(id: string): HTMLElement {
   const img = document.createElement('img'); img.className = 'plugin-icon'; img.alt = '';
@@ -41,8 +51,12 @@ async function mutate(work: ReturnType<typeof window.api.pluginsSnapshot>, notif
   const own = ++epoch; const result = await run(work);
   if (!result) return false;
   if (own === epoch) { snapshot = result; renderInstalled(); }
-  if (notify) toast(t("Plugin settings saved. Refresh the Chat On Steroids Plugins connector in ChatGPT to update its tools."));
+  if (notify) toast(t("Plugin settings saved. Refresh {0} in ChatGPT to update its tools.", [pluginsConnectorName()]));
   return true;
+}
+/** This computer's Plugins connector name, which carries its suffix when one is set. */
+function pluginsConnectorName(): string {
+  return appState?.status.surfaces.find(item => item.id === 'plugins')?.connectorName ?? 'Chat On Steroids Plugins';
 }
 export async function refreshPlugins(): Promise<void> { await mutate(window.api.pluginsSnapshot(), false); }
 export function applyPluginsState(next: AppState): void {
@@ -52,28 +66,29 @@ export function applyPluginsState(next: AppState): void {
   const contacted = surface?.state === 'live' && !!surface.lastRequestAt;
   const configured = !!next.config.tunnel.pluginsTunnelId?.trim() || surface?.state === 'live';
   $('pluginsSetupTitle').closest('.plugin-connection')!.classList.toggle('is-configured', configured);
-  ui($('pluginsSetupTitle'), 'textContent', () => configured ? t("Your Plugins connector") : t("Set up plugins before your first use"));
+  ui($('pluginsSetupTitle'), 'textContent', () => configured ? t("Chat On Steroids Plugins in ChatGPT") : t("Set up plugins before your first use"));
   ui($('pluginsSetupHint'), 'textContent', () => configured
-    ? t("Your enabled plugins share one connector in ChatGPT. Manage its connection here.")
-    : t("Add the Chat On Steroids Plugins connector in ChatGPT once so it can use your installed plugins."));
+    ? t("Your enabled plugins reach ChatGPT through one plugin there: Chat On Steroids Plugins. Manage its connection here.")
+    : t("Add {0} to ChatGPT once, so ChatGPT can use your installed plugins.", [pluginsConnectorName()]));
   ui($('pluginsSetupLink'), 'textContent', () => configured ? t("Plugin setup") : t("Set up plugins"));
+  ui($('pluginsRefreshName'), 'textContent', pluginsConnectorName);
   $('pluginsSetupLink').classList.toggle('btn-solid', !configured);
   ui(status, 'textContent', () => surface?.state === 'live'
-    ? contacted ? t("Connected to ChatGPT") : t("Connector online · waiting for ChatGPT")
-    : configured ? t("Plugins connector offline") : t("Setup required · connect your plugins"));
+    ? contacted ? t("Connected to ChatGPT") : t("Plugin online · waiting for ChatGPT")
+    : configured ? t("Chat On Steroids Plugins offline") : t("Setup required · connect your plugins"));
   status.dataset.live = String(surface?.state === 'live');
-  status.title = surface?.detail ?? '';
+  ui(status, 'title', () => t(surface?.detail ?? ''));
   const setupStatus = document.getElementById('pluginSetupStatus');
   if (setupStatus) ui(setupStatus, 'textContent', () => surface?.state === 'live'
-    ? t("{0} tools available · {1}", [surface.tools.length, surface.lastRequestAt ? t("Connected to ChatGPT") : t("Ready to add in ChatGPT")])
-    : surface?.state === 'error' ? surface.detail : t("Save your connection below to make enabled plugins available in ChatGPT."));
+    ? tn("{0} tool available · {1}", "{0} tools available · {1}", surface.tools.length, [surface.tools.length, surface.lastRequestAt ? t("Connected to ChatGPT") : t("Ready to add in ChatGPT")])
+    : surface?.state === 'error' ? t(surface.detail) : t("Save your connection below to make enabled plugins available in ChatGPT."));
 }
 function showConnection(): void {
   if (!appState) { toast(t("Connection settings are still loading.")); return; }
   const { config, hasApiKey, status } = appState;
   const surface = status.surfaces.find(item => item.id === 'plugins');
   const { body } = dialog(() => t("Plugin setup"));
-  body.append(el('p', '', () => t("Connect once. Your enabled plugins share this connector in ChatGPT.")));
+  body.append(el('p', '', () => t("Connect once. Your enabled plugins share this one plugin in ChatGPT.")));
   const connectionStatus = el('p', 'plugin-setup-status'); connectionStatus.id = 'pluginSetupStatus'; body.append(connectionStatus);
   const copy = (label: string, value: string) => {
     const input = field(body, label, value); input.readOnly = true;
@@ -85,25 +100,29 @@ function showConnection(): void {
     body.append(button(() => t("Open Tunnels"), async () => { await run(window.api.openLink('https://platform.openai.com/settings/organization/tunnels')); }));
     tunnel = field(body, () => t("Plugins tunnel ID"), config.tunnel.pluginsTunnelId ?? '', false, () => t("Create a dedicated tunnel in the same workspace you use in ChatGPT."));
     tunnel.id = 'pluginsTunnelId'; tunnel.spellcheck = false; tunnel.autocomplete = 'off';
+    const shared = el('p', 'hint is-required'); shared.id = 'pluginsTunnelIdShared'; shared.setAttribute('role', 'status');
+    tunnel.closest('label')!.after(shared);
+    const paintShared = () => paintSharedTunnel(shared, { ...config.tunnel, pluginsTunnelId: tunnel!.value }, 'plugins');
+    tunnel.addEventListener('input', paintShared); paintShared();
     if (hasApiKey) body.append(el('p', 'hint', () => t("Your stored tunnel API key is already available.")));
-    else key = field(body, () => t("Tunnel API key"), '', true, () => t("Use a restricted key with Tunnels: Read and Tunnels: Use. It is stored securely and shared with your other connectors."));
+    else key = field(body, () => t("Tunnel API key"), '', true, () => t("Use a restricted key with Tunnels: Read and Tunnels: Use. It is stored securely and shared with Core and Desktop."));
   }
   // Values needed for ChatGPT setup stay copyable; tool lists belong to each plugin.
-  copy(t("Connector name"), surface?.connectorName ?? 'Chat On Steroids Plugins');
+  copy(t("Name in ChatGPT"), surface?.connectorName ?? 'Chat On Steroids Plugins');
   copy(t("Description"), surface?.description ?? 'Tools from your enabled Chat On Steroids plugins.');
   const url = surface?.publicUrl ?? (config.tunnel.kind === 'manual' ? surface?.localUrl : null);
   if (url) copy(t("MCP server URL"), url);
   body.append(el('p', 'hint', () => config.tunnel.kind === 'openai'
-    ? t("In ChatGPT, add this connector with Tunnel and select your Plugins tunnel. Refresh its tools after adding or changing plugins.")
-    : t("In ChatGPT, add this connector using its MCP server URL. Refresh its tools after adding or changing plugins.")));
+    ? t("In ChatGPT, add this as a plugin with Tunnel and select your Plugins tunnel. Refresh it after adding or changing plugins.")
+    : t("In ChatGPT, add this as a plugin using its MCP server URL. Refresh it after adding or changing plugins.")));
   const actions = el('div', 'plugin-setup-actions');
-  actions.append(button(() => t("Open ChatGPT plugins"), async () => { await run(window.api.openLink('https://chatgpt.com/#settings/Plugins')); }), button(() => t("Save & connect"), async () => {
+  actions.append(button(() => t("Open ChatGPT plugins"), async () => { await run(window.api.openLink('https://chatgpt.com/plugins')); }), button(() => t("Save & connect"), async () => {
     if (!appState) return;
     if (tunnel && !tunnel.value.trim()) { tunnel.focus(); throw new Error(t("Enter your Plugins tunnel ID.")); }
     if (key?.value) { const next = await run(window.api.setApiKey(key.value)); if (!next) return; key.value = ''; applyAppState(next); applyPluginsState(next); }
     if (tunnel) {
-      const { capabilities, readOnly, tunnel: previousTunnel, ui, sessions, compaction, multiAgent, goal, mcp } = appState.config;
-      const base: SettingsPatch = { capabilities, readOnly, tunnel: previousTunnel, ui, sessions, compaction, multiAgent, goal, mcp };
+      const { capabilities, readOnly, commandAllowlist, tunnel: previousTunnel, ui, sessions, compaction, multiAgent, goal, mcp } = appState.config;
+      const base: SettingsPatch = { capabilities, readOnly, commandAllowlist, tunnel: previousTunnel, ui, sessions, compaction, multiAgent, goal, mcp };
       const next = await run(window.api.saveSettings({ ...base, tunnel: { ...previousTunnel, pluginsTunnelId: tunnel.value.trim() } }, base));
       if (!next) return; applyAppState(next); applyPluginsState(next);
     }
@@ -114,7 +133,7 @@ function showConnection(): void {
 }
 function renderInstalled(): void {
   const list = $('pluginsInstalled');
-  list.replaceChildren(); ui($('pluginsCount'), 'textContent', () => t("{0} installed", [snapshot.plugins.length]));
+  list.replaceChildren(); ui($('pluginsCount'), 'textContent', () => tn("{0} installed", "{0} installed", snapshot.plugins.length));
   const query = $<HTMLInputElement>('pluginsSearch').value.trim().toLowerCase();
   const matches = (name: string, description = '') => `${name} ${description}`.toLowerCase().includes(query);
   if (!snapshot.plugins.length) {
@@ -133,7 +152,7 @@ function renderInstalled(): void {
     const count = plugin.tools.filter(tool => tool.enabled).length;
     const foot = el('div', 'plugin-card-foot');
     foot.append(el('span', `pill${plugin.status === 'ready' && plugin.tools.length ? ' is-live' : plugin.status === 'error' ? ' is-error' : ''}`, status));
-    if (plugin.error) foot.append(el('span', 'plugin-card-error', plugin.error));
+    if (plugin.error) foot.append(el('span', 'plugin-card-error', () => t(plugin.error!)));
     foot.append(el('span', 'plugin-tool-count', () => t(count === 1 ? '{0} tool enabled' : '{0} tools enabled', [count])));
     title.append(foot); open.append(art(recipe?.icon ?? plugin.catalogId ?? 'custom'), title);
     const menu = document.createElement('details'); menu.className = 'plugin-menu';
@@ -173,7 +192,7 @@ function renderCatalog(parent: HTMLElement, query = ''): void {
 }
 function renderPluginTools(parent: HTMLElement, plugin: PluginView): void {
     const published = plugin.tools.filter(tool => tool.published).length;
-    const publication = plugin.tools.some(tool => tool.published !== undefined) ? t(" · {0} available in ChatGPT", [published]) : '';
+    const publication = plugin.tools.some(tool => tool.published !== undefined) ? tn(" · {0} available in ChatGPT", " · {0} available in ChatGPT", published) : '';
     parent.replaceChildren();
     if (plugin.status === 'needs-auth' || plugin.status === 'authenticating') {
       const auth = el('div', 'plugin-auth');
@@ -184,7 +203,7 @@ function renderPluginTools(parent: HTMLElement, plugin: PluginView): void {
       parent.append(auth);
     }
     parent.append(el('h3', '', () => t("Tools")), el('p', 'plugin-tools-summary', () => t("{0}/{1} enabled{2} · This plugin only · Refresh ChatGPT after changes", [plugin.tools.filter(tool => tool.enabled).length, plugin.tools.length, publication])));
-    if (plugin.error) parent.append(el('p', 'plugin-error', plugin.error));
+    if (plugin.error) parent.append(el('p', 'plugin-error', () => t(plugin.error!)));
     const tools = el('div', 'plugin-tools');
     for (const tool of plugin.tools) {
       const row = el('label', 'plugin-tool'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = tool.enabled; checkbox.disabled = !plugin.enabled;
@@ -204,14 +223,23 @@ function showPlugin(plugin: PluginView): void {
   intro.append(el('p', '', () => recipe ? t(recipe.description) : t("Your own MCP server, available in your conversations.")), configure);
   hero.append(art(recipe?.icon ?? plugin.catalogId ?? 'custom'), intro); body.append(hero);
   const tools = el('section', 'plugin-detail-tools'); tools.dataset.pluginDetail = plugin.id; renderPluginTools(tools, plugin); body.append(tools);
-  const about = document.createElement('details'); about.className = 'plugin-about'; about.append(el('summary', '', () => t("About this plugin")));
+  const about = document.createElement('details'); about.className = 'plugin-about'; about.append(disclosureSummary(() => t("About this plugin")));
   about.append(el('p', 'plugin-source', plugin.source.url ?? plugin.source.package ?? plugin.source.command ?? plugin.source.kind), el('p', 'muted', () => `${plugin.version || t("Custom version")} · ${plugin.license || t("License not supplied")}`), el('p', '', () => t("Runs while installed and enabled, including after reopening the app. Disable or uninstall it to stop its connection. Restart reconnects and refreshes its tools.")));
   if (plugin.homepage ?? recipe?.homepage) about.append(button(() => t("Open upstream project"), async () => { await run(window.api.openLink((plugin.homepage ?? recipe!.homepage)!)); }));
   body.append(about);
 }
 function showUninstall(plugin: PluginView): void {
   const { box, body } = dialog(() => t("Uninstall {0}?", [plugin.name]));
-  body.append(el('p', '', () => t("This stops its connection and deletes the installation, its CoS-managed local data and stored credentials. Back up any plugin data you need first. External application data is not removed.")), button(() => t("Uninstall plugin"), async () => { if (await mutate(window.api.pluginsUninstall(plugin.id))) box.close(); }, true));
+  // The same shape as removing a skill or a pet: Cancel first and focused, the destructive step last.
+  box.classList.add('pet-delete-dialog');
+  const actions = el('div', 'pet-delete-actions');
+  const cancel = el('button', 'btn btn-solid pet-delete-cancel', () => t('Cancel')) as HTMLButtonElement;
+  cancel.type = 'button'; cancel.addEventListener('click', () => box.close());
+  const uninstall = button(() => t("Uninstall plugin"), async () => { if (await mutate(window.api.pluginsUninstall(plugin.id))) box.close(); });
+  uninstall.classList.add('plugin-destructive', 'pet-delete-confirm');
+  actions.append(cancel, uninstall);
+  body.append(el('p', '', () => t("This stops its connection and deletes the installation, its CoS-managed local data and stored credentials. Back up any plugin data you need first. External application data is not removed.")), actions);
+  cancel.focus();
 }
 function showConfigure(plugin: PluginView): void {
   const { box, body } = dialog(() => t("Configure {0}", [plugin.name])); const config = new Map<string, HTMLInputElement>(); const secrets = new Map<string, HTMLInputElement>();
@@ -223,19 +251,31 @@ function showConfigure(plugin: PluginView): void {
   const source = field(body, () => t("Server configuration (JSON)"), JSON.stringify(plugin.source), false, () => t("Keep credentials in the secure fields, not in command arguments or URLs."));
   const extraConfig = field(body, () => t("Additional configuration (JSON object)"), '{}', false, () => t("Non-secret settings and environment variables only."));
   const extraKey = field(body, () => t("Additional credential name (optional)"), '', false, () => t("Environment variable for local servers; header name for remote servers.")); const extraValue = field(body, () => t("Additional credential value"), '', true);
-  body.append(button(() => t("Save and reconnect"), async () => {
+  const longestCall = field(body, () => t("Longest call (seconds)"), String(plugin.longestCallSeconds ?? 120), false, () => t("1–1800 seconds per call; default 120. Changing only this limit does not restart the plugin."));
+  longestCall.type = 'number'; longestCall.min = '1'; longestCall.max = '1800'; longestCall.step = '1';
+  body.append(button(() => t("Save"), async () => {
+    const longestCallSeconds = Number(longestCall.value);
+    if (!longestCall.value.trim() || !Number.isInteger(longestCallSeconds) || longestCallSeconds < 1 || longestCallSeconds > 1800) {
+      longestCall.focus(); throw new Error(t("Enter a whole number from 1 to 1800 seconds."));
+    }
     const credentials = Object.fromEntries([...secrets].filter(([, input]) => input.value).map(([key, input]) => [key, input.value]));
     if (extraKey.value.trim() && extraValue.value) credentials[extraKey.value.trim()] = extraValue.value;
     const additions: unknown = JSON.parse(extraConfig.value);
     if (!additions || typeof additions !== 'object' || Array.isArray(additions) || !Object.values(additions).every((value) => typeof value === 'string')) throw new Error(t("Additional configuration must be an object of string values."));
     const configuredSource = JSON.parse(source.value) as PluginSource;
-    if (await mutate(window.api.pluginsConfigure(plugin.id, { name: name.value,
-      ...(JSON.stringify(configuredSource) !== JSON.stringify(plugin.source) ? { source: configuredSource } : {}),
-      config: { ...Object.fromEntries([...config].map(([key, input]) => [key, input.value])), ...additions as Record<string,string> }, credentials }))) box.close();
+    const configuredValues = { ...Object.fromEntries([...config].map(([key, input]) => [key, input.value])), ...additions as Record<string,string> };
+    const sourceChanged = JSON.stringify(configuredSource) !== JSON.stringify(plugin.source);
+    const otherChanges = name.value !== plugin.name || sourceChanged || Object.keys(credentials).length > 0 ||
+      Object.entries(configuredValues).some(([key, value]) => value !== (plugin.config[key] ?? '') ||
+        (Object.hasOwn(additions, key) && !Object.hasOwn(plugin.config, key)));
+    const limitOnly = longestCallSeconds !== (plugin.longestCallSeconds ?? 120) && !otherChanges;
+    if (await mutate(window.api.pluginsConfigure(plugin.id, limitOnly ? { longestCallSeconds } : { name: name.value,
+      ...(sourceChanged ? { source: configuredSource } : {}),
+      config: configuredValues, credentials, longestCallSeconds }), !limitOnly)) box.close();
   }, true));
 }
 function showCatalog(): void {
-  const { body } = dialog(() => t("Add a plugin")); body.append(el('p', 'muted', () => t("Independent integrations, one shared connector. Review each plugin’s access and setup before installing.")));
+  const { body } = dialog(() => t("Add a plugin")); body.append(el('p', 'muted', () => t("Independent integrations, one shared plugin in ChatGPT. Review each plugin’s access and setup before installing.")));
   const grid = el('div', 'plugin-catalog'); grid.dataset.pluginCatalog = ''; renderCatalog(grid);
   body.append(grid, el('h3', '', () => t("Bring your own server"))); const custom = el('div', 'plugin-actions');
   custom.append(button(() => t("Import MCPB bundle"), async () => { const path = await run(window.api.pluginsImportBundle()); if (path) showCustom('mcpb', path); }), button(() => t("npm / Python / executable"), () => showCustom('npm')), button(() => t("Remote MCP URL"), () => showCustom('remote')), button(() => t("GitHub repository"), () => showCustom('github')));
@@ -248,7 +288,7 @@ function showRecipe(recipe: PluginCatalogEntry): void {
     const tools = el('ul', 'plugin-tool-preview'); for (const name of recipe.tools) tools.append(el('li', '', () => t(name)));
     body.append(el('h3', 'plugin-preview-title', () => t("Tool preview")), tools);
   }
-  const setup = document.createElement('details'); setup.className = 'plugin-about'; setup.append(el('summary', '', () => t("Setup requirements")));
+  const setup = document.createElement('details'); setup.className = 'plugin-about'; setup.append(disclosureSummary(() => t("Setup requirements")));
   const steps = el('ol', 'plugin-steps'); for (const step of recipe.instructions) steps.append(el('li', '', () => t(step))); setup.append(steps, button(() => t("Open project & setup guide"), async () => { await run(window.api.openLink(recipe.homepage)); })); body.append(setup);
   const values = new Map<string, HTMLInputElement>();
   for (const item of recipe.fields) { const input = field(body, item.label, '', item.secret, item.placeholder); input.required = !!item.required; values.set(item.key, input); }
@@ -273,13 +313,27 @@ function showCustom(kind: PluginSource['kind'], path = ''): void {
   select.value = kind; label.append(select); body.append(label);
   const location = field(body, () => t("Package, executable, URL or bundle path"), path); const version = field(body, () => t("Version (npm / Python)"), '', false, () => t("Pin a published version for reproducible installation."));
   const args = field(body, () => t("Arguments (JSON array)"), '[]', false, () => t("Example: [\"--port\", \"9876\"]. Passed directly, without a shell."));
+  // Remote servers can sign in through the provider instead of a static header; the backend
+  // already supports `auth: "oauth"`, so only the choice was missing here.
+  const authLabel = el('label', 'plugin-field'); authLabel.append(el('span', '', () => t("Authentication"))); const auth = document.createElement('select');
+  for (const [value, text] of [['', t("None or a static credential")], ['oauth', t("OAuth (sign in through the provider)")]]) { const option = document.createElement('option'); option.value = value!; option.textContent = text!; auth.append(option); }
+  authLabel.append(auth); body.append(authLabel);
   const key = field(body, () => t("Credential name (optional)"), '', false, () => t("An environment variable for local servers, or an HTTP header such as Authorization.")); const credential = field(body, () => t("Credential value"), '', true);
+  const oauth = () => select.value === 'remote' && auth.value === 'oauth';
+  const sync = () => { authLabel.hidden = select.value !== 'remote'; key.parentElement!.hidden = credential.parentElement!.hidden = oauth(); };
+  select.addEventListener('change', sync); auth.addEventListener('change', sync); sync();
   body.append(el('p', 'hint', () => t("Remote servers must support MCP Streamable HTTP. GitHub links require a known recipe or supported manifest. Local servers run outside the CoS folder sandbox.")), button(() => t("Install and connect"), async () => {
     const selected = select.value as PluginSource['kind']; const value = location.value.trim(); if (!value) throw new Error(t("Enter the server location first."));
     const parsed: unknown = JSON.parse(args.value); if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === 'string')) throw new Error(t("Arguments must be a JSON array of strings."));
     const source: PluginSource = { kind: selected, args: parsed };
     if (selected === 'remote' || selected === 'github') source.url = value; else if (selected === 'mcpb') source.path = value; else if (selected === 'command') source.command = value; else { source.package = value; if (version.value.trim()) source.version = version.value.trim(); }
-    if (await mutate(window.api.pluginsInstall({ name: name.value, source, credentials: key.value.trim() && credential.value ? { [key.value.trim()]: credential.value } : {} }))) box.close();
+    const signIn = oauth(); if (signIn) source.auth = 'oauth';
+    const before = new Set(snapshot.plugins.map(plugin => plugin.id));
+    if (await mutate(window.api.pluginsInstall({ name: name.value, source, credentials: !signIn && key.value.trim() && credential.value ? { [key.value.trim()]: credential.value } : {} }))) {
+      box.close();
+      // Like a catalog OAuth recipe: land on the new plugin, where its Sign in button is.
+      const installed = signIn ? snapshot.plugins.find(plugin => !before.has(plugin.id)) : undefined; if (installed) showPlugin(installed);
+    }
   }, true));
 }
 export function initPlugins(onState: (next: AppState) => void = () => {}): void {
@@ -287,7 +341,7 @@ export function initPlugins(onState: (next: AppState) => void = () => {}): void 
   $('pluginsAdd').addEventListener('click', showCatalog); $('pluginsRefresh').addEventListener('click', () => void refreshPlugins());
   $('pluginsSearch').addEventListener('input', renderInstalled);
   $('pluginsSetupLink').addEventListener('click', showConnection);
-  $('pluginsOpenChatGPT').addEventListener('click', async () => { await run(window.api.openLink('https://chatgpt.com/#settings/Plugins')); });
+  $('pluginsOpenChatGPT').addEventListener('click', async () => { await run(window.api.openLink('https://chatgpt.com/plugins')); });
   $('pluginsLegalOpen').addEventListener('click', async () => { await run(window.api.openLegalNotices()); });
   window.api.onPluginsChanged(() => { void refreshPlugins(); }); void refreshPlugins();
 }

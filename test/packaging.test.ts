@@ -1,3 +1,5 @@
+// @ts-expect-error The target planner is a plain Node script without type declarations.
+import { releaseTargets } from '../scripts/release-targets.mjs';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,6 +41,17 @@ function yamlFile(relative: string): any {
 }
 
 describe('cross-platform packaging targets', () => {
+  it('stages only the target Windows Pets FFI and probes the packaged binding', () => {
+    const config = yamlFile('electron-builder.yml');
+    expect(config.files).toContain('!node_modules/@koromix/koffi-*/**/*');
+    expect(config.files).toContain('!node_modules/koffi/build/**/*');
+    expect(config.asarUnpack).toContain('**/node_modules/@koromix/koffi-*/**');
+    const staging = readFileSync(path.join(root, 'scripts/prepare-packaging-native.mjs'), 'utf8');
+    expect(staging).toContain("if (platform === 'win32') packages.push(`@koromix/koffi-win32-${arch}`)");
+    const smoke = readFileSync(path.join(root, 'scripts/smoke-packaged-runtime.mjs'), 'utf8');
+    expect(smoke).toContain("appRequire('koffi')");
+    expect(smoke).toContain('runtime.petFocus !== true');
+  });
   it('normalizes supported OS spellings and rejects unsupported targets', () => {
     expect(normalizePlatform('windows')).toBe('win32');
     expect(normalizePlatform('macos')).toBe('darwin');
@@ -124,6 +137,11 @@ describe('cross-platform packaging targets', () => {
     expect(smoke).toContain('const expectedElectronVersion = sourcePackage.devDependencies?.electron;');
     expect(smoke).toContain('electron: process.versions.electron');
     expect(smoke).toContain('runtime.electron !== expectedElectronVersion');
+    expect(smoke).toContain("'@modelcontextprotocol/core/internal'");
+    expect(smoke).toContain("'@modelcontextprotocol/server'");
+    expect(smoke).toContain("'@modelcontextprotocol/client'");
+    expect(smoke).toContain("'@modelcontextprotocol/node'");
+    expect(smoke).toContain('runtime.mcp !== true');
   });
 
   it('grants sandbox read access only to the Windows install tree and fails on ACL errors', () => {
@@ -139,14 +157,182 @@ describe('cross-platform packaging targets', () => {
     expect(installer).toContain('${If} $0 != 0');
     expect(installer).toContain('SetErrorLevel 2');
     expect(installer).toContain('Abort "Windows could not set the folder access needed');
+    // An update aborts before any page exists, which NSIS does silently: the reason must be shown (#1258).
+    expect(installer).toContain('${IfNot} ${Silent}');
+    expect(installer).toMatch(/MessageBox MB_ICONSTOP\|MB_OK "Windows could not set the folder access[^"]*icacls exit code \$0[^"]*run this installer as administrator\."/);
     expect(installer).not.toMatch(/\/(?:reset|remove|T)\b/i);
     expect(installer).not.toMatch(/(?:no-sandbox|disable-gpu-sandbox)/i);
+  });
+
+  it('shows an update the person asked for as a branded progress window that restarts the app by itself', () => {
+    // 2026-10-15: after Restart and install the app vanished for about 100 s with nothing on
+    // screen. The installer now runs visibly for that case; it skips every question an update
+    // already answered and closes itself at the end instead of waiting for Finish.
+    const config = yamlFile('electron-builder.yml');
+    const installer = readFileSync(path.join(root, 'scripts/windows-installer-acl.nsh'), 'utf8');
+    // An update keeps the installation's own mode; the "install for whom" page never shows.
+    expect(installer).toMatch(/!macro customInstallMode[\s\S]*\$\{if\} \$\{isUpdated\}[\s\S]*\$isForceMachineInstall "1"[\s\S]*\$isForceCurrentInstall "1"[\s\S]*!macroend/);
+    // The finish page of an update starts the app when asked to and ends the installer.
+    expect(installer).toMatch(/!macro customFinishPage[\s\S]*MUI_PAGE_CUSTOMFUNCTION_PRE[\s\S]*!insertmacro MUI_PAGE_FINISH[\s\S]*!macroend/);
+    expect(installer).toMatch(/\$\{if\} \$\{isUpdated\}\s+\$\{if\} \$\{isForceRun\}[\s\S]*ExecShellAsUser[\s\S]*\$\{endif\}\s+Abort/);
+    // A fresh install keeps its Run checkbox.
+    expect(installer).toContain('!define MUI_FINISHPAGE_RUN_FUNCTION');
+    expect(config.nsis.installerHeader).toBe('build/installerHeader.bmp');
+    expect(config.nsis.installerSidebar).toBe('build/installerSidebar.bmp');
+    const icons = readFileSync(path.join(root, 'scripts/make-icon.mjs'), 'utf8');
+    expect(icons).toContain("'installerHeader.bmp'");
+    expect(icons).toContain("'installerSidebar.bmp'");
+  });
+
+  it('builds canaries only for the targets most installs use, and releases for all of them', () => {
+    expect(releaseTargets('common').include.map((target: { name: string }) => target.name)).toEqual(['Windows x64', 'macOS arm64', 'Linux x64']);
+    expect(releaseTargets('common').files).toEqual(['Chat-On-Steroids-Setup-x64.exe', 'Chat-On-Steroids-macOS-arm64.dmg',
+      'Chat-On-Steroids-macOS-arm64.zip', 'Chat-On-Steroids-Linux-x64.AppImage', 'Chat-On-Steroids-Linux-x64.deb',
+      'Chat-On-Steroids-Extension.zip', 'Chat-On-Steroids-Native-Sources.tar.gz']);
+    expect(() => releaseTargets('some')).toThrow();
+    const canary = yamlFile('.github/workflows/canary.yml');
+    expect(canary.jobs.candidate.with).toEqual({ platforms: 'common' });
+    // Built after every app-relevant push to main, and a running canary is never cancelled
+    // halfway through replacing the previous one.
+    expect(canary.on.push).toMatchObject({ branches: ['main'] });
+    expect(canary.on.push['paths-ignore']).toEqual(expect.arrayContaining(['docs/**', 'test/**']));
+    expect(canary.on).toHaveProperty('workflow_dispatch');
+    expect(canary.concurrency).toEqual({ group: 'canary', 'cancel-in-progress': false });
+    // A stable release passes nothing, which is `all`.
+    expect(yamlFile('.github/workflows/publish.yml').jobs.candidate?.with?.platforms).toBeUndefined();
+  });
+
+  it('publishes a canary checksum manifest that names only attached canary assets', () => {
+    const canary = yamlFile('.github/workflows/canary.yml');
+    const steps = canary.jobs.publish.steps as Array<Record<string, any>>;
+    const reverify = steps.find((step) => step.name === 'Re-verify the checksums');
+    const narrow = steps.find((step) => step.name === 'Limit checksums to published canary assets');
+    const publish = steps.find((step) => step.name === 'Replace the canary prerelease');
+
+    expect(reverify?.run).toContain('sha256sum -c SHA256SUMS.txt');
+    expect(narrow?.['working-directory']).toBe('publish');
+    expect(narrow?.run).toContain('Chat-On-Steroids-Native-Sources.tar.gz');
+    expect(narrow?.run).toContain('SHA256SUMS.txt');
+    expect(narrow?.run).toContain('SHA256SUMS.canary.txt');
+    expect(publish?.run).toContain("! -name '*Native-Sources*'");
+    expect(steps.indexOf(narrow!)).toBeGreaterThan(steps.indexOf(reverify!));
+    expect(steps.indexOf(narrow!)).toBeLessThan(steps.indexOf(publish!));
+  });
+
+  it('skips a stale canary run before staging a replacement', () => {
+    const canary = yamlFile('.github/workflows/canary.yml');
+    const steps = canary.jobs.publish.steps as Array<Record<string, any>>;
+    const publish = steps.find((step) => step.name === 'Replace the canary prerelease');
+    const script = String(publish?.run ?? '');
+
+    const headCheck = script.indexOf('gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha');
+    const stagingTag = script.indexOf('staging_tag="canary-staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"');
+    const draftCreate = script.indexOf('gh api --method POST "repos/${GITHUB_REPOSITORY}/releases"');
+    expect(headCheck).toBeGreaterThanOrEqual(0);
+    expect(stagingTag).toBeGreaterThan(headCheck);
+    expect(draftCreate).toBeGreaterThan(stagingTag);
+    expect(script).toContain('if [ "$GITHUB_SHA" != "$main_sha" ]; then');
+    expect(script).toContain('Skipping stale canary run');
+    expect(script).toContain('exit 0');
+    expect(script).toContain('-f tag_name="$staging_tag"');
+    expect(script).toContain('-F draft=true');
+    expect(script).not.toContain('git ls-remote --exit-code origin refs/heads/main');
+  });
+
+  it('verifies a temporary draft before swapping the fixed canary tag', () => {
+    const canary = yamlFile('.github/workflows/canary.yml');
+    const steps = canary.jobs.publish.steps as Array<Record<string, any>>;
+    const publish = steps.find((step) => step.name === 'Replace the canary prerelease');
+    const script = String(publish?.run ?? '');
+
+    const headChecks = [...script.matchAll(/gh api "repos\/\$\{GITHUB_REPOSITORY\}\/commits\/main" --jq \.sha/g)]
+      .map((match) => match.index ?? -1);
+    const createDraft = script.indexOf('gh api --method POST "repos/${GITHUB_REPOSITORY}/releases"');
+    const verifyAssets = script.indexOf('diff -u expected-canary-assets.txt actual-canary-assets.txt');
+    const verifyDigests = script.indexOf('diff -u expected-canary-digests.txt actual-canary-digests.txt');
+    const swapStarted = script.indexOf('swap_started=true');
+    const deleteOld = script.indexOf('gh release delete canary --yes');
+    const repointTag = script.indexOf('git/refs/tags/canary');
+    const publishDraft = script.lastIndexOf('gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${draft_id}"');
+    const markPromoted = script.indexOf('staging_promoted=true');
+    const verifyFixed = script.indexOf('gh release view canary --json');
+
+    expect(headChecks).toHaveLength(2);
+    const firstHeadCheck = headChecks[0]!;
+    const secondHeadCheck = headChecks[1]!;
+    expect(createDraft).toBeGreaterThan(firstHeadCheck);
+    expect(verifyAssets).toBeGreaterThan(createDraft);
+    expect(verifyDigests).toBeGreaterThan(verifyAssets);
+    expect(secondHeadCheck).toBeGreaterThan(verifyDigests);
+    expect(swapStarted).toBeGreaterThan(secondHeadCheck);
+    expect(deleteOld).toBeGreaterThan(secondHeadCheck);
+    expect(deleteOld).toBeGreaterThan(swapStarted);
+    expect(repointTag).toBeGreaterThan(deleteOld);
+    expect(publishDraft).toBeGreaterThan(repointTag);
+    expect(markPromoted).toBeGreaterThan(publishDraft);
+    expect(verifyFixed).toBeGreaterThan(markPromoted);
+    expect(script).toContain('-F draft=true');
+    expect(script).toContain('-f target_commitish="$GITHUB_SHA"');
+    expect(script).toContain('-f tag_name=canary');
+    expect(script).toContain('-F draft=false');
+    expect(script).toContain('-F prerelease=true');
+    expect(script).toContain('releases/${draft_id}/assets?name=${name}');
+    expect(script).toContain('/releases/download/canary/');
+    expect(script).not.toContain('candidate_tag="canary-${GITHUB_SHA}"');
+    expect(script).not.toContain('--clobber');
+  });
+
+  it('fails closed on canary existence-probe errors and cleans temporary state', () => {
+    const canary = yamlFile('.github/workflows/canary.yml');
+    const steps = canary.jobs.publish.steps as Array<Record<string, any>>;
+    const publish = steps.find((step) => step.name === 'Replace the canary prerelease');
+    const script = String(publish?.run ?? '');
+
+    const secondHeadCheck = script.lastIndexOf('gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha');
+    const releaseProbe = script.indexOf('canary_release_status="$(github_get_status', secondHeadCheck);
+    const refProbe = script.indexOf('canary_ref_status="$(github_get_status', secondHeadCheck);
+    const deleteOld = script.indexOf('gh release delete canary --yes');
+    expect(releaseProbe).toBeGreaterThan(secondHeadCheck);
+    expect(refProbe).toBeGreaterThan(releaseProbe);
+    expect(deleteOld).toBeGreaterThan(refProbe);
+    expect(script).toContain("case \"$status\" in");
+    expect(script).toContain('200|404) printf');
+    expect(script).toContain('Unexpected GitHub API status');
+    expect(script).toContain('curl transport failed');
+    expect(script).toContain('if [ "$canary_release_status" = "200" ]; then');
+    expect(script).toContain('if [ "$canary_ref_status" = "200" ]; then');
+    expect(script).toContain('trap cleanup_staging EXIT');
+    expect(script).toContain('cleanup_staging_ref');
+    expect(script).toContain('gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${draft_id}"');
+    expect(script).toContain('[ "$swap_started" != "true" ]');
+    expect(script).toContain('gh release delete canary --yes');
+    expect(script).not.toContain('gh release delete canary --cleanup-tag');
+    expect(script).not.toContain('if gh release view canary');
+    expect(script).not.toContain('if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/canary"');
+  });
+
+  it('keeps every input required by the pinned first-interaction action without restoring PR events', () => {
+    const welcome = yamlFile('.github/workflows/welcome.yml');
+    const steps = welcome.jobs.welcome.steps as Array<Record<string, any>>;
+    const firstInteraction = steps.find((step) => step.uses === 'actions/first-interaction@1c4688942c71f71d4f5502a26ea67c331730fa4d');
+
+    expect(firstInteraction).toBeTruthy();
+    expect(String(firstInteraction?.with?.issue_message ?? '').trim()).not.toBe('');
+    expect(String(firstInteraction?.with?.pr_message ?? '').trim()).not.toBe('');
+    expect(welcome.on).toHaveProperty('issues');
+    expect(welcome.on).not.toHaveProperty('pull_request_target');
+    // The bug form requires versions, OS and the diagnostics report, and the intake check names
+    // anything missing (#1527); the welcome asking again read as a second, different list (#1534, #1540).
+    expect(String(firstInteraction?.with?.issue_message)).not.toMatch(/versions|steps that lead/i);
   });
 
   it('assembles every platform artifact in the reusable release workflow', () => {
     const workflow = readFileSync(path.join(root, '.github', 'workflows', 'release.yml'), 'utf8');
     const parsed = yamlFile('.github/workflows/release.yml');
-    const matrix = parsed.jobs.package.strategy.matrix.include;
+    // The matrix comes from the plan job, which reads .github/release-targets.json.
+    expect(parsed.jobs.package.strategy.matrix.include).toBe('${{ fromJSON(needs.plan.outputs.include) }}');
+    expect(parsed.jobs.plan.steps.at(-1).run).toBe('node scripts/release-targets.mjs "$PLATFORMS"');
+    const matrix = releaseTargets('all').include;
     expect(matrix).toHaveLength(6);
     expect(matrix).toEqual([
       {
@@ -160,26 +346,29 @@ describe('cross-platform packaging targets', () => {
       {
         name: 'macOS x64', platform: 'darwin', arch: 'x64', runner: 'macos-15-intel',
         script: 'dist:mac:x64', artifact: 'package-macos-x64',
-        files: 'release/Chat-On-Steroids-macOS-x64.dmg\nrelease/Chat-On-Steroids-macOS-x64.zip\n'
+        files: 'release/Chat-On-Steroids-macOS-x64.dmg\nrelease/Chat-On-Steroids-macOS-x64.zip'
       },
       {
         name: 'macOS arm64', platform: 'darwin', arch: 'arm64', runner: 'macos-15',
         script: 'dist:mac:arm64', artifact: 'package-macos-arm64',
-        files: 'release/Chat-On-Steroids-macOS-arm64.dmg\nrelease/Chat-On-Steroids-macOS-arm64.zip\n'
+        files: 'release/Chat-On-Steroids-macOS-arm64.dmg\nrelease/Chat-On-Steroids-macOS-arm64.zip'
       },
       {
         name: 'Linux x64', platform: 'linux', arch: 'x64', runner: 'ubuntu-24.04',
         script: 'dist:linux:x64', artifact: 'package-linux-x64',
-        files: 'release/Chat-On-Steroids-Linux-x64.AppImage\nrelease/Chat-On-Steroids-Linux-x64.deb\n'
+        files: 'release/Chat-On-Steroids-Linux-x64.AppImage\nrelease/Chat-On-Steroids-Linux-x64.deb'
       },
       {
         name: 'Linux arm64', platform: 'linux', arch: 'arm64', runner: 'ubuntu-24.04-arm',
         script: 'dist:linux:arm64', artifact: 'package-linux-arm64',
-        files: 'release/Chat-On-Steroids-Linux-arm64.AppImage\nrelease/Chat-On-Steroids-Linux-arm64.deb\n'
+        files: 'release/Chat-On-Steroids-Linux-arm64.AppImage\nrelease/Chat-On-Steroids-Linux-arm64.deb'
       }
     ]);
     expect(parsed.jobs.package['runs-on']).toBe('${{ matrix.runner }}');
     expect(workflow).toContain('name: chat-on-steroids-candidate-${{ github.run_id }}');
+    expect(workflow).not.toContain('Package Firefox extension groundwork');
+    expect(workflow).not.toContain('npm run extension:firefox:stage');
+    expect(workflow).not.toContain('Chat-On-Steroids-Firefox.zip');
     expect(workflow).toContain('Install generated DEB on target distro');
     expect(workflow).toContain('Launch installed DEB normally under Xvfb');
     expect(workflow).toContain('CLF_DEBUG=1 timeout --signal=TERM --kill-after=5s 12s xvfb-run -a /usr/bin/chat-on-steroids');
@@ -337,7 +526,7 @@ describe('cross-platform packaging targets', () => {
     const ipc = readFileSync(path.join(root, 'src', 'main', 'ipc.ts'), 'utf8');
     const save = ipc.indexOf("handle('settings:save', async (payload) => {");
     const liveTheme = ipc.indexOf('nativeTheme.themeSource = next.ui.theme;', save);
-    const background = ipc.indexOf("getWindow()?.setBackgroundColor(next.ui.theme === 'dark' ? '#0e0e11' : '#ffffff');", liveTheme);
+    const background = ipc.indexOf('getWindow()?.setBackgroundColor(windowBackgroundForTheme(next.ui.theme, next.ui.appearance));', liveTheme);
     expect(save).toBeGreaterThan(-1);
     expect(liveTheme).toBeGreaterThan(save);
     expect(background).toBeGreaterThan(liveTheme);
@@ -358,7 +547,9 @@ describe('cross-platform packaging targets', () => {
     expect(iconScript).toContain("build', 'icon.png'), pngFor(1024)");
 
     const packageScript = readFileSync(path.join(root, 'scripts', 'package.mjs'), 'utf8');
+    expect(packageScript).toContain("run(node, ['-e', \"require('electron')\"]);");
     expect(packageScript).toContain('COS_PACKAGE_ARCH: arch');
+    expect(packageScript).toContain("run(node, ['scripts/smoke-packaged-runtime.mjs', ...targetArgs]);");
     const releaseWorkflow = readFileSync(path.join(root, '.github', 'workflows', 'release.yml'), 'utf8');
     expect(releaseWorkflow).toContain('HOME="$deb_smoke_root/home"');
     expect(releaseWorkflow).toContain('HOME="$smoke_root/home"');
@@ -626,6 +817,51 @@ Load command 11
     expect(workflow).toContain('name: chat-on-steroids-candidate-${{ github.run_id }}');
   });
 
+  // The Firefox add-on is signed by Mozilla only when a tag is published: AMO signs each version
+  // once, so canary builds cannot. Signing needs the AMO_JWT_* repository secrets.
+  it('signs the Firefox add-on once per published tag and attaches it with its update manifest', () => {
+    const publish = yamlFile('.github/workflows/publish.yml');
+    const sign = publish.jobs['firefox-addon'];
+    expect(sign?.needs).toBe('preflight');
+    const steps = sign.steps as Array<Record<string, any>>;
+    const script = steps.map(step => String(step.run ?? '')).join('\n');
+    const env = JSON.stringify(steps.map(step => step.env ?? {}));
+    expect(script).toContain('node scripts/write-extension-stamp.mjs');
+    expect(script).toContain('node scripts/stage-firefox-extension.mjs');
+    // Self-hosted: the add-on names its own update_url, which the default (AMO-listed) lint refuses.
+    expect(script).toMatch(/npx --yes web-ext@\d+\.\d+\.\d+ lint --source-dir \S+ --self-hosted/);
+    expect(script).toMatch(/npx --yes web-ext@\d+\.\d+\.\d+ sign --channel=unlisted/);
+    expect(script).toContain('node scripts/firefox-update-manifest.mjs');
+    expect(env).toContain('${{ secrets.AMO_JWT_ISSUER }}');
+    expect(env).toContain('${{ secrets.AMO_JWT_SECRET }}');
+    // Secrets reach web-ext through the environment, never the command line.
+    expect(script).not.toMatch(/--api-(key|secret)/);
+    expect(publish.jobs.publish.needs).toEqual(['candidate', 'firefox-addon']);
+    const publishSteps = publish.jobs.publish.steps as Array<Record<string, any>>;
+    const names = publishSteps.map(step => step.name);
+    expect(names.indexOf('Add the signed Firefox add-on')).toBeGreaterThan(names.indexOf('Re-verify the checksums'));
+    expect(names.indexOf('Add the signed Firefox add-on')).toBeLessThan(names.indexOf('Publish the release'));
+    const release = String(publishSteps.find(step => step.name === 'Publish the release')?.run);
+    expect(release).toContain('publish/Chat-On-Steroids-Firefox.xpi');
+    expect(release).toContain('publish/firefox-updates.json');
+  });
+
+  // Proves the AMO credentials and Mozilla's validation before a release depends on them, without
+  // spending a release version: it signs <app version>.<run number + 1000>, never the release number.
+  it('can check Firefox signing on demand without using up a release version', () => {
+    const check = yamlFile('.github/workflows/firefox-sign-check.yml');
+    expect(Object.keys(check.on)).toEqual(['workflow_dispatch']);
+    const steps = check.jobs.sign.steps as Array<Record<string, any>>;
+    const script = steps.map(step => String(step.run ?? '')).join('\n');
+    expect(script).toContain('node scripts/stage-firefox-extension.mjs');
+    expect(script).toMatch(/npx --yes web-ext@\d+\.\d+\.\d+ lint --source-dir \S+ --self-hosted/);
+    expect(script).toMatch(/\$\{pkg\}\.\$\(\(\s*GITHUB_RUN_NUMBER \+ 1000\s*\)\)/);
+    expect(script).toMatch(/npx --yes web-ext@\d+\.\d+\.\d+ sign --channel=unlisted/);
+    expect(script).not.toMatch(/--api-(key|secret)/);
+    expect(JSON.stringify(steps.map(step => step.env ?? {}))).toContain('${{ secrets.AMO_JWT_SECRET }}');
+    expect(check.permissions).toEqual({ contents: 'read' });
+  });
+
   it('keeps version metadata aligned and validates artifacts independently of editorial release notes', () => {
     const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')) as { version: string };
     const lock = JSON.parse(readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
@@ -664,12 +900,19 @@ Load command 11
     );
     const candidateUpload = release.slice(release.indexOf('      - name: Upload release candidate'));
     const publishStep = publish.slice(publish.indexOf('      - name: Publish the release'));
+    // A release packages every target: the plan for `all` names each artifact, and the checksum step
+    // and the candidate upload take exactly that plan.
+    expect(checksumStep).toContain('FILES: ${{ needs.plan.outputs.files }}');
+    expect(candidateUpload).toContain('release/Chat-On-Steroids-*');
+    expect(candidateUpload).toContain('release/SHA256SUMS.txt');
+    const planned = releaseTargets('all').files;
+    expect(planned).not.toContain('Chat-On-Steroids-Firefox.zip');
+    expect(checksumStep).not.toContain('Chat-On-Steroids-Firefox.zip');
+    expect(candidateUpload).not.toContain('Chat-On-Steroids-Firefox.zip');
+    expect(publishStep).not.toContain('Chat-On-Steroids-Firefox.zip');
     for (const artifact of artifacts) {
-      expect(candidateUpload).toContain(artifact);
       expect(publishStep).toContain(artifact);
-    }
-    for (const artifact of artifacts.filter((artifact) => artifact !== 'SHA256SUMS.txt')) {
-      expect(checksumStep).toContain(artifact);
+      if (artifact !== 'SHA256SUMS.txt') expect(planned).toContain(artifact);
     }
   });
 });

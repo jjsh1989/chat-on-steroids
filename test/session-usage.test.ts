@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { usageMessageTotals } from '../src/shared/usage.js';
 const store = vi.hoisted(() => ({ listUsageSessions: vi.fn(), readEvents: vi.fn() }));
 vi.mock('../src/main/session/store.js', () => store);
 const catalog = vi.hoisted(() => ({ getChatModels: vi.fn() }));
 vi.mock('../src/main/chat-models.js', () => catalog);
 const durable = vi.hoisted(() => ({ readDurable: vi.fn(), writeDurableSoon: vi.fn() }));
 vi.mock('../src/main/durable.js', () => durable);
+const logger = vi.hoisted(() => ({ logInfo: vi.fn() }));
+vi.mock('../src/main/logger.js', async (importOriginal) => ({ ...(await importOriginal<object>()), logInfo: logger.logInfo }));
 let usage: typeof import('../src/main/session/usage.js');
 let now: number;
 const limit = (overrides: Record<string, unknown> = {}) => ({ model: 'Shared ChatGPT usage', scope: 'shared', remaining: null, remainingPercent: 40, resetAt: null, windowSeconds: 18000, ...overrides });
@@ -19,15 +22,134 @@ beforeEach(async () => {
   usage = await import('../src/main/session/usage.js');
 });
 afterEach(() => vi.restoreAllMocks());
+it('logs an overview pass only when it rebuilt something, not each refresh of the open page', async () => {
+  store.listUsageSessions.mockResolvedValue([{ id: 'one', updatedAt: 1, events: 1, estimatedTokens: 0 }]);
+  logger.logInfo.mockReset();
+  await usage.usageOverview();
+  expect(logger.logInfo).toHaveBeenCalledTimes(1);
+  expect(logger.logInfo.mock.calls[0]![0]).toContain('rebuilt=1');
+  await usage.usageOverview();
+  await usage.usageOverview();
+  expect(logger.logInfo).toHaveBeenCalledTimes(1);
+});
+describe('verified native message counts', () => {
+  const message = (messageId: string | undefined, model: string | undefined, time: number, extra = {}) =>
+    ({ kind: 'user_message', messageId, model, time, message: { text: '' }, ...extra });
+  beforeEach(() => {
+    now = new Date(2026, 8, 21, 12).getTime(); // Monday, in the machine's local timezone.
+    store.listUsageSessions.mockResolvedValue([{ id: 'one', updatedAt: 1, events: 20, estimatedTokens: 0,
+      selectedModel: { model: 'gpt-6-pro', observedAt: now } }]);
+  });
+
+  it('counts proven native sends including image-only messages, without borrowing model or tool evidence', async () => {
+    store.readEvents.mockResolvedValue([
+      message('sol', 'gpt-5-6-thinking', now), message('old-pro', 'gpt-5-6-pro', now),
+      message('astra', 'gpt-6-astra', now), message('image-only', 'gpt-6-pro', now),
+      message('input:injected', 'gpt-6-pro', now, { inputDelivery: 'confirmed' }),
+      message('unconfirmed', 'gpt-6-pro', now, { inputDelivery: 'offered' }),
+      message('no-model', undefined, now), message(undefined, 'gpt-6-pro', now),
+      message('unrecognized', 'gpt-6-pro-future', now),
+      { kind: 'tool_call', time: now, call: { callId: 'tool', conversationId: 'chat', model: 'gpt-6-pro', args: { text: '' }, result: { text: '' }, summary: { title: '' } } }
+    ]);
+    const result = await usage.usageOverview();
+    expect(usageMessageTotals(result.messages, 1)).toMatchObject({ gpt56: 2, gpt6: 2 });
+    expect(result.tokens).toBe(0);
+  });
+
+  it('proves a page-typed send by the model ChatGPT resolved for its own reply, and only that reply', async () => {
+    const reply = (resolvedModel: string | undefined, extra = {}) =>
+      ({ kind: 'assistant_message', time: now, final: true, message: { text: '' }, ...(resolvedModel ? { resolvedModel } : {}), ...extra });
+    store.readEvents.mockResolvedValue([
+      // Counted: the first reply after the send names a known model.
+      message('typed-56', undefined, now), reply('gpt-5-6-thinking'), reply('gpt-6-pro'),
+      message('typed-6', undefined, now), reply(undefined), reply('gpt-6-astra'),
+      // Not counted: an unknown slug, a reply after the next send, and an injected app message.
+      message('typed-other', undefined, now), reply('gpt-5-4-auto-thinking'),
+      message('no-reply', undefined, now), message('input:injected', undefined, now, { inputDelivery: 'confirmed' }), reply('gpt-6-pro'),
+      // An explicit but unrecognised own model abstains instead of borrowing the reply's.
+      message('own-unknown', 'gpt-6-pro-future', now), reply('gpt-6-pro')
+    ]);
+    const result = await usage.usageOverview();
+    expect(usageMessageTotals(result.messages, 1)).toMatchObject({ gpt56: 1, gpt6: 1 });
+  });
+
+  it('uses the original timestamp and an inclusive midnight boundary, excluding older and future sends', async () => {
+    const saturday = new Date(2026, 8, 19).getTime();
+    store.readEvents.mockResolvedValue([
+      message('before', 'gpt-6-pro', saturday - 1), message('at-start', 'gpt-6-pro', saturday),
+      message('now', 'gpt-6-pro', now), message('future', 'gpt-6-pro', now + 1),
+      message('old-replayed', 'gpt-6-pro', now, { authoredAt: new Date(2026, 8, 12).getTime() }),
+      message('bad-time', 'gpt-6-pro', now, { authoredAt: NaN }),
+      message('zero-time', 'gpt-6-pro', now, { authoredAt: 0 })
+    ]);
+    const result = await usage.usageOverview();
+    expect(result.messages.through).toBe(now);
+    expect(usageMessageTotals(result.messages, 6)).toEqual({ date: '2026-09-19', gpt56: 0, gpt6: 2 });
+    expect(usageMessageTotals(result.messages, 1)).toMatchObject({ gpt6: 1 });
+    now++;
+    expect(usageMessageTotals((await usage.usageOverview()).messages, 1)).toMatchObject({ gpt6: 2 });
+    expect(store.readEvents).toHaveBeenCalledTimes(1);
+  });
+
+  it('deduplicates native identities across replays and copied history, abstaining on conflicting evidence', async () => {
+    store.listUsageSessions.mockResolvedValue(['one', 'two'].map(id => ({ id, updatedAt: 1, events: 4, estimatedTokens: 0 })));
+    const native = message('native-id', 'gpt-6-pro', now);
+    store.readEvents.mockResolvedValueOnce([native, native, message('conflicting', 'gpt-6-pro', now)])
+      .mockResolvedValueOnce([native, message('conflicting', 'gpt-5.6', now)]);
+    const first = await usage.usageOverview();
+    expect(usageMessageTotals(first.messages, 1)).toMatchObject({ gpt56: 0, gpt6: 1 });
+    first.messages.days[0]!.gpt6 = 999;
+    expect(usageMessageTotals((await usage.usageOverview()).messages, 1)).toMatchObject({ gpt6: 1 });
+    expect(store.readEvents).toHaveBeenCalledTimes(2);
+  });
+
+  it('reuses verified timestamps after restart and advances the week without rereading unchanged recordings', async () => {
+    store.readEvents.mockResolvedValue([message('native', 'gpt-6-pro', now)]);
+    await usage.usageOverview();
+    const saved = structuredClone(durable.writeDurableSoon.mock.calls.at(-1)![1]);
+    vi.resetModules(); durable.readDurable.mockResolvedValue(saved); store.readEvents.mockClear();
+    usage = await import('../src/main/session/usage.js');
+    expect(usageMessageTotals((await usage.usageOverview()).messages, 1)).toMatchObject({ gpt6: 1 });
+    now = new Date(2026, 8, 28).getTime();
+    expect(usageMessageTotals((await usage.usageOverview()).messages, 1)).toEqual({ date: '2026-09-28', gpt56: 0, gpt6: 0 });
+    expect(store.readEvents).not.toHaveBeenCalled();
+  });
+
+  it('incorporates late verified model evidence and removes deleted recordings from counts', async () => {
+    store.readEvents.mockResolvedValue([message('native', undefined, now)]);
+    expect(usageMessageTotals((await usage.usageOverview()).messages, 1)).toMatchObject({ gpt6: 0 });
+    store.listUsageSessions.mockResolvedValue([{ id: 'one', updatedAt: 2, events: 20, estimatedTokens: 0 }]);
+    store.readEvents.mockResolvedValue([message('native', 'gpt-6-pro', now)]);
+    expect(usageMessageTotals((await usage.usageOverview()).messages, 1)).toMatchObject({ gpt6: 1 });
+    store.listUsageSessions.mockResolvedValue([]);
+    expect((await usage.usageOverview()).messages.days).toEqual([]);
+  });
+});
 describe('passive usage limits and canonical token totals', () => {
-  it('keeps shared windows distinct and does not manufacture model-specific counts', async () => {
-    usage.observeUsage([limit(), limit({ windowSeconds: 604800, remainingPercent: 70 }), limit({ model: 'gpt-example', scope: 'model', remaining: 3, remainingPercent: null })]);
+  it('counts only the outer code-mode exchange while retaining ordinary calls sharing its request', async () => {
+    const time = new Date(2026, 8, 5, 12).getTime();
+    const call = (callId: string, nested = false) => ({ kind: 'tool_call', time, call: {
+      callId, nested, requestId: 'same-generation', conversationId: 'chat',
+      args: { text: 'aaaa' }, result: nested ? { text: 'preview', truncated: true, chars: 80_000 } : { text: 'bbbb' }, summary: { title: '' }
+    } });
+    store.listUsageSessions.mockResolvedValue([{ id: 'one', updatedAt: 1, events: 4, estimatedTokens: 999 }]);
+    store.readEvents.mockResolvedValue([call('child-a', true), call('child-b', true), call('outer'), call('direct')]);
+    // Four context tokens, two real exchanges. Children add neither text nor billing calls.
+    expect((await usage.usageOverview()).tokens).toBe(4);
+  });
+  it('keeps Codex windows distinct and does not manufacture model-specific counts', async () => {
+    usage.observeUsage([limit({ scope: 'codex' }), limit({ windowSeconds: 604800, remainingPercent: 70, scope: 'codex' }), limit({ model: 'gpt-example', scope: 'model', remaining: 3, remainingPercent: null })]);
     const result = await usage.usageOverview();
     expect(result.limits).toHaveLength(3);
-    expect(result.limits.filter(row => row.scope === 'shared').map(row => row.remaining)).toEqual([null, null]);
+    expect(result.limits.filter(row => row.scope === 'codex').map(row => row.remaining)).toEqual([null, null]);
     expect(result.limits.filter(row => row.scope === 'model')).toEqual([expect.objectContaining({ model: 'gpt-example', remaining: 3, remainingPercent: null })]);
     result.limits[0]!.remainingPercent = 99;
     expect((await usage.usageOverview()).limits[0]?.remainingPercent).toBe(40);
+  });
+  // An extension from before 2.1.40 still sends wham/usage windows as "shared"; they were Codex's.
+  it('reads the old "shared" rows as Codex', () => {
+    usage.observeUsage([limit({ model: 'Shared usage', scope: 'shared' })]);
+    expect(usage.reportedUsageLimits()).toEqual([expect.objectContaining({ model: 'Codex', scope: 'codex', remainingPercent: 40 })]);
   });
   it.each([{ remaining: -1 }, { remaining: Infinity }, { remainingPercent: 101 }, { remainingPercent: NaN }, { resetAt: -1 }, { windowSeconds: 0 }, { scope: 'guessed' }])('rejects malformed batch atomically (%j)', async (bad) => {
     usage.observeUsage([limit()]);
@@ -201,7 +323,7 @@ describe('passive usage limits and canonical token totals', () => {
     expect(await usage.usageOverview()).toMatchObject({ contextTokenCap: 256_000, tokens: 128_000 });
     expect(store.readEvents).toHaveBeenCalledTimes(1);
   });
-  it.each([4, 5, 6])('rebuilds old cache version %i and reuses the corrected cache after restart', async (version) => {
+  it.each([4, 5, 6, 7, 8])('rebuilds old cache version %i and reuses the corrected cache after restart', async (version) => {
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     durable.readDurable.mockResolvedValue({ version, rows: [{ id: 'one', revision: `${timezone}:1:1:2000000`, days: [['2026-09-05', [{ model: 'gpt-6-pro', reasoningEffort: null, assumed: false, tokens: 1_000_000 }]]] }] });
     store.listUsageSessions.mockResolvedValue([{ id: 'one', updatedAt: 1, events: 1, estimatedTokens: 2_000_000 }]);
@@ -209,7 +331,7 @@ describe('passive usage limits and canonical token totals', () => {
     expect((await usage.usageOverview()).tokens).toBe(128_000);
     expect(store.readEvents).toHaveBeenCalledTimes(1);
     const persisted = durable.writeDurableSoon.mock.calls.at(-1)![1];
-    expect(persisted.version).toBe(7);
+    expect(persisted.version).toBe(9);
     vi.resetModules(); durable.readDurable.mockResolvedValue(persisted); store.readEvents.mockClear();
     usage = await import('../src/main/session/usage.js');
     expect((await usage.usageOverview()).tokens).toBe(128_000);
@@ -364,5 +486,47 @@ describe('model attribution and equivalent cost', () => {
     expect(usageEstimate(groups[0]!.sources, formula)).toEqual({ tokens: 4e6, cost: 1.44, unpricedTokens: 1e6 });
     expect(usageEstimate(rows.slice(-1), DEFAULT_USAGE_FORMULA).unpricedTokens).toBe(1e6);
     expect(rows[0]!.model).toBe('5.6');
+  });
+});
+
+it('prices ChatGPT 5.5 IDs as GPT-5.5 and knows the GPT-6 Sol and Luna rates, without guessing plain gpt-6', async () => {
+  const { DEFAULT_USAGE_FORMULA: formula, usageRate } = await import('../src/shared/usage.js');
+  for (const id of ['5.5', 'gpt-5-5', 'gpt-5-5-instant', 'gpt-5-5-thinking']) expect(usageRate(id, formula)).toBe(0.5);
+  expect(usageRate('gpt-6-sol', formula)).toBe(0.2);
+  expect(usageRate('gpt-6-luna', formula)).toBe(0.01);
+  // Which API model ChatGPT's plain GPT-6 corresponds to is not established; it stays user-priced.
+  expect(usageRate('gpt-6', formula)).toBeUndefined();
+});
+describe('usage by project', () => {
+  const time = new Date(2026, 8, 5, 12).getTime();
+  const call = (id: string, model?: string) => ({ kind: 'tool_call', time, call: { callId: id, conversationId: 'chat', args: { text: 'aaaa' }, result: { text: '' }, summary: { title: '' }, ...(model ? { model } : {}) } });
+  const session = (id: string, projectId?: string) => ({ id, updatedAt: 1, events: 2, estimatedTokens: 2, ...(projectId ? { projectId } : {}) });
+  const recordings: Record<string, unknown[]> = {
+    one: [call('a', 'gpt-6-pro')],
+    two: [call('a', 'model-b'), call('b', 'model-b')],
+    three: [call('a')],
+    loose: [call('a'), call('b')],
+    quiet: [{ kind: 'user_message', time, messageId: 'native', message: { text: 'aaaa' } }]
+  };
+  it('groups the cached per-chat totals by each chat\'s current project and regroups a moved chat without rereading it', async () => {
+    store.readEvents.mockImplementation(async (id: string) => recordings[id] ?? []);
+    store.listUsageSessions.mockResolvedValue([session('one', 'alpha'), session('two', 'alpha'), session('three', 'beta'), session('loose'), session('quiet', 'gamma')]);
+    const first = await usage.usageOverview();
+    // A chat outside every project is its own row; a project without tool calls has none.
+    expect(first.projects).toEqual([
+      { projectId: 'alpha', tokens: 2.5, models: [
+        { model: 'gpt-6-pro', reasoningEffort: null, assumed: false, tokens: 0.5 },
+        { model: 'model-b', reasoningEffort: null, assumed: false, tokens: 2 }
+      ] },
+      { projectId: null, tokens: 2, models: [{ model: 'gpt-5.6', reasoningEffort: 'high', assumed: true, tokens: 2 }] },
+      { projectId: 'beta', tokens: 0.5, models: [{ model: 'gpt-5.6', reasoningEffort: 'high', assumed: true, tokens: 0.5 }] }
+    ]);
+    expect(first.projects.reduce((sum, project) => sum + project.tokens, 0)).toBe(first.tokens);
+    expect(store.readEvents).toHaveBeenCalledTimes(5);
+    // Moving a chat keeps its recording revision: its whole history moves with it, from the cache.
+    store.listUsageSessions.mockResolvedValue([session('one', 'alpha'), session('two', 'beta'), session('three', 'beta'), session('loose'), session('quiet', 'gamma')]);
+    const moved = await usage.usageOverview();
+    expect(moved.projects.map(project => [project.projectId, project.tokens])).toEqual([['beta', 2.5], [null, 2], ['alpha', 0.5]]);
+    expect(store.readEvents).toHaveBeenCalledTimes(5);
   });
 });

@@ -1,12 +1,38 @@
 import { REASONING_EFFORTS } from '../src/shared/session.js';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { getChatModels, requestChatModels, pendingChatModelRequest, observeChatModels, resetChatModelsForTests, configureChatModelDiscovery, startChatModelDiscovery, restoreChatModels } from '../src/main/chat-models.js';
+import { getChatModels, requestChatModels, pendingChatModelRequest, observeChatModels, resetChatModelsForTests, configureChatModelDiscovery, startChatModelDiscovery, restoreChatModels, refreshForUnoffered } from '../src/main/chat-models.js';
 const saved = vi.hoisted(() => ({ value: null as unknown }));
 vi.mock('../src/main/durable.js', () => ({ readDurable: async () => saved.value, writeDurableSoon: (_name: string, value: unknown) => { saved.value = structuredClone(value); } }));
 const models = [{ id: 'gpt-example', label: 'GPT Example', efforts: ['none', 'medium', 'high', 'xhigh'] }];
 beforeEach(() => { resetChatModelsForTests(); saved.value = null; vi.useFakeTimers(); });
 afterEach(() => vi.useRealTimers());
 describe('durable observed ChatGPT model catalog', () => {
+  it('gives the first explicit promotion a fresh budget without extending repeated Refresh clicks', () => {
+    requestChatModels(false); const passive = pendingChatModelRequest()!;
+    vi.advanceTimersByTime(80000);
+    requestChatModels(true); const promoted = pendingChatModelRequest()!;
+    expect(promoted).toEqual({ ...passive, allowOpen: true, expiresAt: passive.expiresAt + 80000 });
+    vi.advanceTimersByTime(80000); requestChatModels(true);
+    expect(pendingChatModelRequest()).toEqual(promoted);
+    vi.advanceTimersByTime(40000);
+    expect(pendingChatModelRequest()).toBeNull(); expect(getChatModels().state).toBe('unavailable');
+  });
+  it('keeps nonce-bound waiting separate from model evidence and retains the last problem at expiry', () => {
+    requestChatModels(); observeChatModels({ nonce: pendingChatModelRequest()!.nonce, models });
+    requestChatModels(); const request = pendingChatModelRequest()!;
+    expect(observeChatModels({ nonce: request.nonce, waiting: 'generating' })).toBe(true);
+    expect(getChatModels()).toMatchObject({ state: 'pending', models, waiting: expect.stringContaining('generating') });
+    expect(pendingChatModelRequest()).toEqual(request);
+    expect(observeChatModels({ nonce: request.nonce, waiting: 'inspecting' })).toBe(true);
+    vi.advanceTimersByTime(120000);
+    expect(getChatModels()).toMatchObject({ state: 'ready', models, error: expect.stringMatching(/timed out.*generating/) });
+    expect(getChatModels().waiting).toBeUndefined();
+    requestChatModels();
+    expect(observeChatModels({ nonce: request.nonce, waiting: 'draft' })).toBe(false);
+    expect(observeChatModels({ nonce: pendingChatModelRequest()!.nonce, waiting: 'arbitrary-page-text' })).toBe(false);
+    observeChatModels({ nonce: pendingChatModelRequest()!.nonce, models });
+    expect(getChatModels().error).toBeUndefined(); expect(getChatModels().waiting).toBeUndefined();
+  });
   it('settles native picker close failure immediately while retaining observed choices', () => {
     requestChatModels(); observeChatModels({ nonce: pendingChatModelRequest()!.nonce, models });
     requestChatModels();
@@ -148,4 +174,26 @@ it('publishes exactly all canonical observed efforts without dropping Low or imp
   const observed = [{ id: 'actual-sol', label: 'GPT-5.6 Sol', efforts: [...REASONING_EFFORTS] }];
   expect(observeChatModels({ nonce: pendingChatModelRequest()!.nonce, models: observed })).toBe(true);
   expect(getChatModels()).toMatchObject({ state: 'ready', models: observed });
+});
+
+describe('a saved choice the stored catalog does not offer', () => {
+  it('asks the open ChatGPT page once, and not again after a fresh catalog still lacks it', () => {
+    requestChatModels(); observeChatModels({ nonce: pendingChatModelRequest()!.nonce, models });
+    expect(pendingChatModelRequest()).toBeNull();
+    refreshForUnoffered('goal helper 6');
+    const request = pendingChatModelRequest()!;
+    expect(request).toMatchObject({ allowOpen: false });
+    refreshForUnoffered('goal helper 6');
+    expect(pendingChatModelRequest()).toEqual(request);
+    vi.advanceTimersByTime(1);
+    observeChatModels({ nonce: request.nonce, models });
+    refreshForUnoffered('goal helper 6');
+    expect(pendingChatModelRequest()).toBeNull();
+    refreshForUnoffered('default worker 6');
+    expect(pendingChatModelRequest()).toMatchObject({ allowOpen: false });
+  });
+  it('does nothing before any catalog was observed', () => {
+    refreshForUnoffered('goal helper 6');
+    expect(pendingChatModelRequest()).toBeNull();
+  });
 });

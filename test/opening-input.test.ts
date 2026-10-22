@@ -4,12 +4,14 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { initConfigPath, defaultConfig, saveConfig } from '../src/main/config.js';
 import { initDurableStore, readDurable, writeDurableNow, flushDurable, resetDurableForTests } from '../src/main/durable.js';
-import { initSessionStore, getSession, createSession, findSessionByConversation, listSessions, resetSessionStoreForTests } from '../src/main/session/store.js';
+import { initSessionStore, getSession, createSession, findSessionByConversation, listSessions, rebindSession, resetSessionStoreForTests } from '../src/main/session/store.js';
 import { enqueueInput, listInputs, pendingBrowserInputs, claimBrowserInput, authorizeBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject,
   cancelInput, failBrowserInput, resetInputForTests, configureInputDelivery, setInputAutomation, type InputArgs, type InputEntry } from '../src/main/session/input.js';
 import { addProject } from '../src/main/projects.js';
 import { validateNewRoot } from '../src/main/sandbox.js';
+import { isChatTrusted, resetTrustedChatsForTests, setChatTrusted } from '../src/main/session/trusted-chats.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
+import { getLog } from '../src/main/logger.js';
 
 let directory: string;
 const args = (over: Partial<InputArgs> = {}): InputArgs => ({ id: randomUUID(), sessionId: null, text: 'Independent task', mode: 'auto',
@@ -19,11 +21,15 @@ const legacy = (over: Partial<InputEntry> = {}): InputEntry => ({ ...args(), sta
 beforeEach(async () => {
   directory = await makeTempDir('clf-openings-');
   initConfigPath(directory); initDurableStore(directory); initSessionStore(directory); resetInputForTests();
+  resetTrustedChatsForTests();
   await saveConfig(defaultConfig());
-  configureInputDelivery({ applyAutomation: async () => {}, changed: () => {} });
+  configureInputDelivery({
+    applyAutomation: async () => {}, changed: () => {},
+    trustOpening: async (_sessionId, conversationId) => { await setChatTrusted(conversationId, true); return true; }
+  });
 });
 afterEach(async () => {
-  vi.restoreAllMocks(); await flushDurable(); resetInputForTests(); resetSessionStoreForTests(); resetDurableForTests(); await removeTempDir(directory);
+  vi.restoreAllMocks(); await flushDurable(); resetTrustedChatsForTests(); resetInputForTests(); resetSessionStoreForTests(); resetDurableForTests(); await removeTempDir(directory);
 });
 
 it('admits twenty independent durable sessions before any native ACK and preserves exact retry identity', async () => {
@@ -61,6 +67,9 @@ it('migrates real legacy ordinary openings to durable owners without changing cu
   const approved = await validateNewRoot(requestedRoot, []);
   await saveConfig({ ...defaultConfig(), roots: [{ name: 'approved', path: approved }] });
   const project = await addProject(approved);
+  // A project of that era had no native ChatGPT Project; a new one now waits for its own (#1176).
+  const { chatgpt: _, ...legacyProject } = project;
+  await writeDurableNow('projects', [legacyProject]);
   const stamp = Date.now();
   const queued = legacy({ projectId: project.id, text: 'Queued legacy opening' });
   const browser = legacy({ text: 'Claimed legacy opening', state: 'browser', owner: 'legacy-page', offeredAt: stamp,
@@ -164,6 +173,97 @@ it('binds an exact authorized opening before recording and acknowledges only its
   expect((await listInputs())[0]).toMatchObject({ sessionId: row.sessionId, deliveredSessionId: row.sessionId, state: 'sent', opening: true });
 });
 
+it('trusts a strict-mode CoS composer opening only after its exact authoritative bind', async () => {
+  const config = defaultConfig();
+  await saveConfig({ ...config, multiAgent: { ...config.multiAgent, strictChatAllowlist: true } });
+  const row = await enqueueInput(args());
+  const conversation = randomUUID();
+  expect(await claimBrowserInput(row.id, 'strict-opening-owner', null, true)).toMatchObject({ opening: true, sessionId: row.sessionId });
+  expect(await authorizeBrowserInput(row.id, 'strict-opening-owner', null)).toBe(true);
+  expect(isChatTrusted(conversation)).toBe(false);
+
+  expect(await bindBrowserInputProject(row.id, 'strict-opening-owner', conversation)).toBe(true);
+  expect((await getSession(row.sessionId!))?.conversationId).toBe(conversation);
+  expect(isChatTrusted(conversation)).toBe(true);
+});
+
+it('keeps browser-created direct chats untrusted while strict mode is enabled', async () => {
+  const config = defaultConfig();
+  await saveConfig({ ...config, multiAgent: { ...config.multiAgent, strictChatAllowlist: true } });
+  const conversation = randomUUID();
+  await createSession({ title: 'Direct browser chat', conversationId: conversation });
+  expect(isChatTrusted(conversation)).toBe(false);
+});
+
+it('does not create an unnecessary Trust bit for a CoS opening while strict mode is off', async () => {
+  const row = await enqueueInput(args());
+  const conversation = randomUUID();
+  await claimBrowserInput(row.id, 'ordinary-opening-owner', null, true);
+  await authorizeBrowserInput(row.id, 'ordinary-opening-owner', null);
+  expect(await bindBrowserInputProject(row.id, 'ordinary-opening-owner', conversation)).toBe(true);
+  expect((await getSession(row.sessionId!))?.conversationId).toBe(conversation);
+  expect(isChatTrusted(conversation)).toBe(false);
+  const config = defaultConfig();
+  await saveConfig({ ...config, multiAgent: { ...config.multiAgent, strictChatAllowlist: true } });
+  expect(await bindBrowserInputProject(row.id, 'ordinary-opening-owner', conversation)).toBe(true);
+  expect(isChatTrusted(conversation)).toBe(false);
+});
+
+it('logs a new chat getting its conversation id without calling the old one null', async () => {
+  // Activity shows this line; "moved from ChatGPT conversation null" read like a fault.
+  const row = await enqueueInput(args());
+  const conversation = randomUUID();
+  expect(await rebindSession(row.sessionId!, null, conversation)).toBe(true);
+  const line = getLog().map(entry => entry.message).filter(message => message.includes(conversation)).at(-1);
+  expect(line).toBe(`session ${row.sessionId} is now ChatGPT conversation ${conversation}`);
+  const next = randomUUID();
+  expect(await rebindSession(row.sessionId!, conversation, next)).toBe(true);
+  expect(getLog().map(entry => entry.message).filter(message => message.includes(next)).at(-1))
+    .toBe(`session ${row.sessionId} moved from ChatGPT conversation ${conversation} to ${next}`);
+});
+
+it('fails closed instead of trusting a recovered opening whose durable attach outran its outbox ACK', async () => {
+  const row = await enqueueInput(args());
+  const conversation = randomUUID();
+  await claimBrowserInput(row.id, 'recovered-opening-owner', null, true);
+  await authorizeBrowserInput(row.id, 'recovered-opening-owner', null);
+
+  // Model a crash boundary after the authoritative reserved-session bind but before the outbox
+  // ACK transition records that same conversation id.
+  expect(await rebindSession(row.sessionId!, null, conversation)).toBe(true);
+  expect((await listInputs()).find(entry => entry.id === row.id)?.conversationId).toBeNull();
+  expect(isChatTrusted(conversation)).toBe(false);
+  resetInputForTests(); resetSessionStoreForTests(); initSessionStore(directory);
+
+  const config = defaultConfig();
+  await saveConfig({ ...config, multiAgent: { ...config.multiAgent, strictChatAllowlist: true } });
+  await expect(acknowledgeBrowserInput(row.id, 'recovered-opening-owner', conversation, 'recovered-message'))
+    .rejects.toThrow('Reserved opening session belongs to another ChatGPT conversation');
+  expect((await getSession(row.sessionId!))?.conversationId).toBe(conversation);
+  expect(isChatTrusted(conversation)).toBe(false);
+});
+
+it('does not trust a recovered /input/bind when the reserved session already attached while strict mode was off', async () => {
+  const row = await enqueueInput(args());
+  const conversation = randomUUID();
+  await claimBrowserInput(row.id, 'recovered-bind-owner', null, true);
+  await authorizeBrowserInput(row.id, 'recovered-bind-owner', null);
+
+  // Crash boundary: session metadata reached A under strict-Off, but the opening outbox row did
+  // not publish its conversationId. A later /input/bind may reconcile that row, but it did not
+  // perform the authoritative null -> A session bind and therefore must not create Trust.
+  expect(await rebindSession(row.sessionId!, null, conversation)).toBe(true);
+  expect((await listInputs()).find(entry => entry.id === row.id)?.conversationId).toBeNull();
+  expect(isChatTrusted(conversation)).toBe(false);
+  resetInputForTests(); resetSessionStoreForTests(); initSessionStore(directory);
+
+  const config = defaultConfig();
+  await saveConfig({ ...config, multiAgent: { ...config.multiAgent, strictChatAllowlist: true } });
+  expect(await bindBrowserInputProject(row.id, 'recovered-bind-owner', conversation)).toBe(true);
+  expect((await getSession(row.sessionId!))?.conversationId).toBe(conversation);
+  expect(isChatTrusted(conversation)).toBe(false);
+});
+
 it('rejects another recording collision and never binds a cancelled unauthorized opening', async () => {
   const row = await enqueueInput(args());
   await claimBrowserInput(row.id, 'owner', null, true);
@@ -232,6 +332,34 @@ it('keeps a reviewed pre-send retry in its session but refuses ambiguous Send re
   await expect(enqueueInput(args({ sessionId: row.sessionId }))).rejects.toThrow('no ChatGPT conversation');
   expect(await acknowledgeBrowserInput(retry.id, 'retry-owner', randomUUID(), 'late-real-receipt')).toBe(true);
   expect((await listInputs()).find(entry => entry.id === retry.id)).toMatchObject({ state: 'cancelled', deliveredSessionId: row.sessionId });
+});
+
+/**
+ * #821: the page clicked Send for an opening, but the row it read back never matched its text.
+ * The claim stayed `browser`, and an opening is left out of the 15-minute release, so for six
+ * hours every later message in that chat waited behind it.
+ */
+it('retires an opening whose receipt the page could not confirm, and claims the next message', async () => {
+  const row = await enqueueInput(args());
+  expect(await claimBrowserInput(row.id, 'opening-page', null, true)).not.toBeNull();
+  expect(await authorizeBrowserInput(row.id, 'opening-page', null)).toBe(true);
+  // The recorder binds the new chat from the page's own activity, as it did in the incident.
+  const conversationId = randomUUID();
+  expect(await rebindSession(row.sessionId!, null, conversationId)).toBe(true);
+  // Admitted while the opening's turn could still take it, as the incident's next message was.
+  const next = legacy({ sessionId: row.sessionId, conversationId, text: 'Next message' });
+  const bound = (await listInputs()).map(entry => entry.id === row.id ? { ...entry, conversationId } : entry);
+  await writeDurableNow('session-input', [...bound, next]); resetInputForTests();
+  expect(await claimBrowserInput(next.id, 'opening-page', conversationId, true)).toBeNull();
+
+  expect(await failBrowserInput(row.id, 'opening-page', 'Native Send receipt was not confirmed.')).toBe(true);
+  expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'cancelled',
+    sendAuthorizedAt: expect.any(Number), error: expect.stringContaining('it will not be resent') });
+  expect(await claimBrowserInput(next.id, 'opening-page', conversationId, true)).toMatchObject({ id: next.id });
+  // Never a replay, and a late exact receipt still confirms the retired opening.
+  expect((await pendingBrowserInputs()).some(entry => entry.id === row.id)).toBe(false);
+  expect(await acknowledgeBrowserInput(row.id, 'opening-page', conversationId, 'late-receipt')).toBe(true);
+  expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'cancelled', messageId: 'late-receipt' });
 });
 
 it('does not let a generic failed label erase native Send authorization', async () => {

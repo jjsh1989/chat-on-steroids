@@ -255,6 +255,14 @@ export function defaultUserShell(): DetectedShell {
   return shell;
 }
 
+/** Restore an app-owned POSIX search directory after login-profile evaluation. */
+export function withPosixPathPrefix(command: string, shellType: ShellType, directory: string | null): string {
+  if (!directory || !['zsh', 'bash', 'sh'].includes(shellType)) return command;
+  // Login profiles run after the inherited environment has been prepared. Reapply
+  // the app-owned search directory afterwards while retaining the profile's PATH.
+  return `export PATH=${shlexJoin([directory])}:"\${PATH:-}"\n${command}`;
+}
+
 /** `Shell::derive_exec_args`: the argv Codex hands the operating system. */
 export function deriveExecArgs(shell: DetectedShell, command: string, useLoginShell: boolean): string[] {
   switch (shell.shellType) {
@@ -317,6 +325,33 @@ export function prefixPowershellScriptWithUtf8(command: readonly string[]): stri
     ? extracted.script
     : `${UTF8_OUTPUT_PREFIX}${extracted.script}`;
   return [...command.slice(0, command.length - 1), script];
+}
+
+/**
+ * Ends a PowerShell script with the exit status of its last statement.
+ *
+ * Windows PowerShell 5.1 ends `-Command` with exit 1 whenever the last statement failed, so a
+ * native program's own code was lost: `cmd /c exit 5` and git's 128 both came back as 1, and
+ * ripgrep's error 2 read as its benign "no matches" (measured on Windows, 2026-10-16). `$?` is
+ * recorded right after the script's own last statement; `exit` inside the script and a
+ * terminating error still end it first, as before. PowerShell 7 reports the same codes either way.
+ *
+ * The script runs dot-sourced (its variables and functions stay in script scope) and piped to
+ * `Out-Default`, so its output is written out before the `exit`: Windows PowerShell 5.1 holds
+ * table output back and an `exit` dropped it, so `Get-Location` or `Select-Object` printed
+ * nothing (2026-10-21). `return` at the top level counts as success, as without the wrapper.
+ */
+export const POWERSHELL_EXIT_STATUS_SUFFIX =
+  '\n$global:__cos_ok = $?\n} | Out-Default\nif ($global:__cos_ok) { exit 0 }; if ($LASTEXITCODE -is [int] -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; exit 1';
+const POWERSHELL_EXIT_STATUS_PREFIX = '$global:__cos_ok = $true\n. {\n';
+
+export function withPowershellExitStatus(command: readonly string[]): string[] {
+  const extracted = extractPowershellCommand(command);
+  if (!extracted || extracted.script.endsWith(POWERSHELL_EXIT_STATUS_SUFFIX)) return [...command];
+  // The UTF-8 output line stays first, outside the block, exactly as prefixPowershellScriptWithUtf8 put it.
+  const lead = extracted.script.startsWith(UTF8_OUTPUT_PREFIX) ? UTF8_OUTPUT_PREFIX : '';
+  const body = extracted.script.slice(lead.length);
+  return [...command.slice(0, command.length - 1), `${lead}${POWERSHELL_EXIT_STATUS_PREFIX}${body}${POWERSHELL_EXIT_STATUS_SUFFIX}`];
 }
 
 // --------------------------------------------------------------------------- shlex

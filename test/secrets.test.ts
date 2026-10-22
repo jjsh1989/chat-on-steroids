@@ -19,10 +19,13 @@ const {
   deleteAllSecrets,
   getSecret,
   initSecretsPath,
+  keychainReadPending,
   resetSecretsCacheForTests,
   secureStorageCiphertextIsProtected,
   secureStorageStatus,
-  setSecret
+  setAsideUnreadableSecrets,
+  setSecret,
+  storedSecretsUnreadable
 } = await import('../src/main/secrets.js');
 const { safeStorage } = await import('electron');
 const { formatLogAsJson, getLog, logInfo } = await import('../src/main/logger.js');
@@ -49,6 +52,22 @@ afterEach(async () => {
 });
 
 describe('secret store', () => {
+  it('reports a Keychain read as pending while it waits, so quitting does not wait on the prompt', async () => {
+    // On macOS the first read of a new build waits on the password prompt; quitting then reads
+    // this to end the process instead of waiting on Chromium's teardown (2026-10-10).
+    let answer!: (available: boolean) => void;
+    vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockImplementationOnce(() => new Promise<boolean>(resolve => { answer = resolve; }));
+    expect(keychainReadPending()).toBe(false);
+    const status = secureStorageStatus('darwin');
+    await vi.waitFor(() => expect(keychainReadPending()).toBe(true));
+    answer(true);
+    await status;
+    expect(keychainReadPending()).toBe(false);
+    // A failed read is no longer pending either.
+    vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockRejectedValueOnce(new Error('denied'));
+    await secureStorageStatus('darwin');
+    expect(keychainReadPending()).toBe(false);
+  });
   it('refuses Linux v10 hard-coded-key ciphertext instead of trusting the legacy backend label', async () => {
     vi.mocked(safeStorage.getSelectedStorageBackend).mockReturnValue('basic_text');
     vi.mocked(safeStorage.encryptStringAsync).mockResolvedValueOnce(Buffer.from('v10fallback-ciphertext', 'ascii'));
@@ -87,6 +106,20 @@ describe('secret store', () => {
     // DPAPI/Keychain hosts as Linux basic_text merely because their prefix happens to match.
     expect(secureStorageCiphertextIsProtected(v10, 'win32')).toBe(true);
     expect(secureStorageCiphertextIsProtected(v10, 'darwin')).toBe(true);
+  });
+
+  it('stores and returns API keys without invisible characters a paste can carry (#577)', async () => {
+    // A soft hyphen or NEL survives trim(); OpenRouter reads "Bearer \u00ADsk-…" as a missing header.
+    await setSecret('openRouterApiKey', '\u00ADsk-or-test\u0085 ');
+    expect(await getSecret('openRouterApiKey')).toBe('sk-or-test');
+    await setSecret('customProviderApiKey', '\u200Bsk-custom\uFEFF');
+    expect(await getSecret('customProviderApiKey')).toBe('sk-custom');
+    // A key stored before this check is healed when read.
+    await fs.writeFile(path.join(dir, 'secrets.bin'), Buffer.from(JSON.stringify({ openRouterApiKey: '\u00ADsk-or-legacy', bridgeToken: 'bridge-token' }), 'utf8'));
+    resetSecretsCacheForTests();
+    expect(await getSecret('openRouterApiKey')).toBe('sk-or-legacy');
+    // Only API keys are cleaned; other secrets keep their exact bytes.
+    expect(await getSecret('bridgeToken')).toBe('bridge-token');
   });
 
   it('serializes concurrent writes so one credential cannot erase another', async () => {
@@ -243,7 +276,7 @@ describe('secret store', () => {
     // isAsyncEncryptionAvailable() still says that the provider exists.
     expect(await getSecret('bridgeToken')).toBeNull();
     await expect(setSecret('openRouterApiKey', 'must-not-replace-ambiguous-blob')).rejects.toThrow(
-      /credential storage is unavailable/i
+      /saved keys could not be read/i
     );
     expect(await fs.readFile(file)).toEqual(before);
 
@@ -269,9 +302,71 @@ describe('secret store', () => {
 
     expect(await getSecret('bridgeToken')).toBeNull();
     await expect(setSecret('openRouterApiKey', 'must-not-replace-malformed-blob')).rejects.toThrow(
-      /credential storage is unavailable/i
+      /saved keys could not be read/i
     );
     expect(await fs.readFile(file)).toEqual(before);
+    expect(storedSecretsUnreadable()).toBe(true);
+  });
+
+  // After a keychain reset, or a profile copied to another computer, the file can never be
+  // decrypted again. The store then refused every new key, with nothing the person could do
+  // short of deleting a file by hand.
+  describe('a saved file that can no longer be read', () => {
+    const seed = async (): Promise<{ file: string; before: Buffer }> => {
+      await Promise.all([setSecret('bridgeToken', 'old-bridge-token'), setSecret('openaiApiKey', 'sk-old')]);
+      const file = path.join(dir, 'secrets.bin');
+      const before = await fs.readFile(file);
+      resetSecretsCacheForTests();
+      return { file, before };
+    };
+
+    it('is set aside as a backup when asked, and the store then takes new keys', async () => {
+      const { file, before } = await seed();
+      expect(storedSecretsUnreadable()).toBe(false);
+      vi.mocked(safeStorage.decryptStringAsync).mockRejectedValue(new Error('key not found'));
+      expect(await getSecret('openaiApiKey')).toBeNull();
+      expect(storedSecretsUnreadable()).toBe(true);
+      await expect(setSecret('openaiApiKey', 'sk-new')).rejects.toThrow(/saved keys could not be read/i);
+      expect(await fs.readFile(file)).toEqual(before);
+
+      const backup = await setAsideUnreadableSecrets();
+      expect(backup).toMatch(/^secrets\.unreadable-[0-9-]+\.bin$/);
+      expect(await fs.readFile(path.join(dir, backup!))).toEqual(before);
+      await expect(fs.stat(file)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(storedSecretsUnreadable()).toBe(false);
+
+      await setSecret('openaiApiKey', 'sk-new');
+      vi.mocked(safeStorage.decryptStringAsync).mockImplementation(async (buffer) => ({ result: buffer.toString('utf8'), shouldReEncrypt: false }));
+      resetSecretsCacheForTests();
+      expect(await getSecret('openaiApiKey')).toBe('sk-new');
+      expect(await getSecret('bridgeToken')).toBeNull();
+      // The backup is never touched again.
+      expect(await fs.readFile(path.join(dir, backup!))).toEqual(before);
+    });
+
+    it('stays where it is when it can be read again after all', async () => {
+      // A locked keychain looks the same as a lost key. Asking again is the only way to tell.
+      const { file, before } = await seed();
+      vi.mocked(safeStorage.decryptStringAsync).mockRejectedValueOnce(new Error('provider temporarily unavailable'));
+      expect(await getSecret('openaiApiKey')).toBeNull();
+      expect(storedSecretsUnreadable()).toBe(true);
+
+      expect(await setAsideUnreadableSecrets()).toBeNull();
+      expect(await fs.readFile(file)).toEqual(before);
+      expect((await fs.readdir(dir)).filter(name => name.includes('unreadable'))).toEqual([]);
+      expect(storedSecretsUnreadable()).toBe(false);
+      expect(await getSecret('openaiApiKey')).toBe('sk-old');
+    });
+
+    it('is not touched while secure storage itself is unavailable', async () => {
+      const { file, before } = await seed();
+      vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockResolvedValue(false);
+      expect(await getSecret('openaiApiKey')).toBeNull();
+      // That is the other state, with its own message: nothing says the file is unreadable.
+      expect(storedSecretsUnreadable()).toBe(false);
+      await expect(setAsideUnreadableSecrets()).rejects.toThrow(/credential storage is unavailable/i);
+      expect(await fs.readFile(file)).toEqual(before);
+    });
   });
 
   it('re-encrypts a successfully decrypted blob when Electron reports key rotation', async () => {

@@ -19,20 +19,24 @@
  * that evidence is already available. That conversation is stronger than the old
  * sole-generating fallback and must win whenever present.
  *
- * Identity comes only from the request-correlated conversation. Friendly agent names are
- * local to a run and cannot own cwd. When exact identity is absent — Chrome off, late/missing Fiber evidence,
- * or a conflicting observation — there
- * is **no workspace**, and a relative path is refused with the absolute form to use instead.
- * That is the whole safety argument: ambiguity costs a retry, never a wrong file. Nothing
- * here ever widens what may be reached; every path still goes through `resolvePath` and
- * every root, containment and symlink check it performs.
+ * Identity normally comes from the request-correlated conversation. Friendly agent names are
+ * local to a run and cannot own cwd. When the user explicitly permits unattributed calls, the
+ * turn-level request id is a temporary workspace owner until its exact conversation arrives.
+ * That keeps one unresolved workflow coherent without borrowing another chat's folder. Nothing
+ * here widens what may be reached; every path still goes through `resolvePath` and every root,
+ * containment and symlink check it performs.
  */
 
 import path from 'node:path';
 import { rawPromises as fs } from './rawfs.js';
 import type { Root } from '../shared/types.js';
 import { currentCall } from './mcp/call-context.js';
-import { isSkillPath } from './skill-access.js';
+import { requestCorrelation } from './session/correlation.js';
+import { isSkillPath, isSkillVirtualPath } from './skill-access.js';
+import { isContained } from './sandbox.js';
+import { fsForRoot, type ProjectFs } from './remote/project-fs.js';
+import { lookupWorkerWorkspace } from './worktrees/index.js';
+import { managedWorkerAllocationIdentity, managedWorkerWorktreeRequired } from './agents.js';
 
 /** How long a learned workspace survives without being used or renewed. */
 const WORKSPACE_TTL_MS = 12 * 60 * 60 * 1000;
@@ -65,9 +69,20 @@ const workspaces = new Map<string, Workspace>();
  * Returns null rather than a guess. Callers treat null as "this chat has no workspace",
  * which refuses relative paths; they never fall back to another chat's.
  */
+function workspaceKeys(): string[] {
+  const call = currentCall();
+  if (!call) return [];
+  const keys: string[] = [];
+  if (call.caller.conversationId) keys.push(`chat:${call.caller.conversationId}`);
+  if (call.allowUnattributed && call.caller.requestId) keys.push(`request:${call.caller.requestId}`);
+  // Transport-only callers are rare, but the explicit opt-in still grants them ordinary
+  // operations. Keep them apart from identified chats while preserving the legacy behavior.
+  if (call.allowUnattributed && keys.length === 0) keys.push('unattributed');
+  return keys;
+}
+
 export function workspaceKey(): string | null {
-  const conversationId = currentCall()?.caller.conversationId;
-  return conversationId ? `chat:${conversationId}` : null;
+  return workspaceKeys()[0] ?? null;
 }
 
 function prune(): void {
@@ -89,26 +104,63 @@ function prune(): void {
 
 /** The workspace for the call currently running, or null if it has none. */
 export function currentWorkspace(): Workspace | null {
-  const key = workspaceKey();
-  if (!key) return null;
+  const call = currentCall();
+  const keys = workspaceKeys();
+  if (!keys.length) return null;
   prune();
-  const held = workspaces.get(key) ?? null;
-  if (held) held.at = Date.now();
+  // Worker allocation is the broker's immutable identity, independent of its active run id.
+  // On restart the marker can be rebuilt while this ephemeral cwd cache is empty.
+  const required = call ? managedWorkerWorktreeRequired(call.caller) : false;
+  if (required) {
+    const allocation = managedWorkerAllocationIdentity(call!.caller);
+    const lease = allocation && call!.agent === allocation.agentId ? lookupWorkerWorkspace(allocation) : null;
+    if (!lease) {
+      throw new Error('WORKTREE_OWNER_UNAVAILABLE: the required isolated worker checkout has no verified owner. Restore the marker and approved root before using local files or commands.');
+    }
+    const workspace: Workspace = { ...lease.workspace, at: Date.now() };
+    for (const key of keys) workspaces.set(key, { ...workspace });
+    return workspace;
+  }
+  let held: Workspace | null = null;
+  for (const key of keys) {
+    held = workspaces.get(key) ?? null;
+    if (held) break;
+  }
+  // Correlation may arrive after the request-scoped call already returned. On the next exact
+  // call, recover the newest request workspace proven to belong to this same session instead
+  // of requiring another absolute path merely to perform the delayed alias.
+  if (!held && call?.caller.conversationId) {
+    for (const [key, candidate] of workspaces) {
+      if (!key.startsWith('request:')) continue;
+      const owner = requestCorrelation(key.slice('request:'.length));
+      if (!owner) continue;
+      const sameConversation = owner.conversationId === call.caller.conversationId;
+      const sameSession = Boolean(call.caller.sessionId && owner.sessionId === call.caller.sessionId);
+      if (!sameConversation && !sameSession) continue;
+      if (!held || candidate.at > held.at) held = candidate;
+    }
+  }
+  if (held) {
+    held.at = Date.now();
+    // Exact browser proof can arrive between two calls in one turn. Mirror the same cwd to
+    // both keys so already-running request-scoped children and later chat-scoped calls agree.
+    for (const key of keys) if (!workspaces.has(key)) workspaces.set(key, { ...held, at: Date.now() });
+  }
   return held;
 }
 
 /** Sets the workspace for an explicit key. Used by resume and by worker inheritance. */
 export function setWorkspaceFor(key: string, workspace: Omit<Workspace, 'at'>): void {
-  if (isSkillPath(workspace.real)) return;
+  if (isSkillPath(workspace.real) || isSkillVirtualPath(workspace.virtual)) return;
   workspaces.set(key, { ...workspace, at: Date.now() });
   prune();
 }
 
 /** Sets the workspace for the call currently running, if it has an identity. */
 export function setCurrentWorkspace(workspace: Omit<Workspace, 'at'>): boolean {
-  const key = workspaceKey();
-  if (!key) return false;
-  setWorkspaceFor(key, workspace);
+  const keys = workspaceKeys();
+  if (!keys.length) return false;
+  for (const key of keys) setWorkspaceFor(key, workspace);
   return true;
 }
 
@@ -117,10 +169,10 @@ function stagedAgentKey(agentId: string, runId?: string | null): string | null {
   return agentId && runId ? `agent:${runId}:${agentId}` : null;
 }
 
-export function inheritWorkspace(toAgent: string, primeConversationId: string | null, runId?: string): boolean {
+export function inheritWorkspace(toAgent: string, primeConversationId: string | null, runId?: string, requestId?: string): boolean {
   const key = stagedAgentKey(toAgent, runId);
   if (!key) return false;
-  const held = primeWorkspace(primeConversationId);
+  const held = primeWorkspace(primeConversationId) ?? (requestId ? workspaces.get(`request:${requestId}`) : undefined);
   if (!held) { workspaces.delete(key); return false; }
   setWorkspaceFor(key, { virtual: held.virtual, real: held.real });
   return true;
@@ -192,6 +244,18 @@ export function moveChatWorkspace(fromConversationId: string, toConversationId: 
   workspaces.set(`chat:${toConversationId}`, { virtual: held.virtual, real: held.real, at: Date.now() });
   workspaces.delete(`chat:${fromConversationId}`);
   return true;
+}
+
+/**
+ * Forgets a learned workspace whose folder no longer exists.
+ *
+ * A worker that slept while its temporary folder was deleted would otherwise run its first
+ * command after revival in that deleted folder and fail with "Not found". Request-scoped copies
+ * of the same folder go too, or the next exact call would recover it from them again.
+ */
+export function forgetMissingWorkspace(real: string): void {
+  for (const key of workspaceKeys()) if (workspaces.get(key)?.real === real) workspaces.delete(key);
+  for (const [key, held] of workspaces) if (key.startsWith('request:') && held.real === real) workspaces.delete(key);
 }
 
 /** Drops one conversation-scoped workspace without touching any agent-scoped mirror. */
@@ -273,11 +337,13 @@ async function hasMarker(real: string): Promise<boolean> {
  */
 export async function projectFolderOf(
   resolved: { real: string; virtual: string },
-  rootReal: string
+  rootReal: string,
+  io: FolderIo = localIo
 ): Promise<{ real: string; virtual: string }> {
-  const startReal = (await isDirectory(resolved.real)) ? resolved.real : path.dirname(resolved.real);
+  const startIsDirectory = await io.isDirectory(resolved.real);
+  const startReal = startIsDirectory ? resolved.real : io.path.dirname(resolved.real);
   const depth = path.posix.normalize(resolved.virtual).split('/').filter(Boolean).length;
-  const startVirtual = (await isDirectory(resolved.real))
+  const startVirtual = startIsDirectory
     ? path.posix.normalize(resolved.virtual)
     : path.posix.dirname(path.posix.normalize(resolved.virtual));
 
@@ -286,15 +352,40 @@ export async function projectFolderOf(
   // Bounded by the virtual depth, so a malformed pair can never spin.
   for (let step = 0; step <= depth; step++) {
     // Never above the approved root: containment is the boundary, here as everywhere.
-    const relative = path.relative(rootReal, currentReal);
-    if (relative.startsWith('..') || path.isAbsolute(relative)) break;
-    if (await hasMarker(currentReal)) return { real: currentReal, virtual: currentVirtual };
-    const parentReal = path.dirname(currentReal);
+    if (!io.contained(rootReal, currentReal)) break;
+    if (await io.hasMarker(currentReal)) return { real: currentReal, virtual: currentVirtual };
+    const parentReal = io.path.dirname(currentReal);
     if (parentReal === currentReal) break;
     currentReal = parentReal;
     currentVirtual = path.posix.dirname(currentVirtual);
   }
   return { real: startReal, virtual: startVirtual };
+}
+
+/** How `projectFolderOf` looks at a folder: on this computer, or on a server over SFTP (#1469). */
+interface FolderIo {
+  path: path.PlatformPath;
+  isDirectory(real: string): Promise<boolean>;
+  hasMarker(real: string): Promise<boolean>;
+  contained(rootReal: string, real: string): boolean;
+}
+const localIo: FolderIo = { path, isDirectory, hasMarker, contained: isContained };
+function serverIo(files: ProjectFs): FolderIo {
+  const isDirectoryThere = (real: string) => files.getMetadata(real).then(meta => meta.isDirectory, () => false);
+  return {
+    path: path.posix,
+    isDirectory: isDirectoryThere,
+    async hasMarker(real) {
+      for (const marker of PROJECT_MARKERS) {
+        if (await files.getMetadata(path.posix.join(real, marker)).then(() => true, () => false)) return true;
+      }
+      return false;
+    },
+    contained: (rootReal, real) => {
+      const root = rootReal.replace(/\/+$/, '');
+      return real === root || real.startsWith(`${root}/`) || root === '';
+    }
+  };
 }
 
 /**
@@ -306,8 +397,13 @@ export async function projectFolderOf(
  * already proven it can reach.
  */
 export async function learnWorkspace(resolved: { real: string; virtual: string; root: Root }): Promise<void> {
-  if (isSkillPath(resolved.real)) return;
+  if (isSkillPath(resolved.real) || isSkillVirtualPath(resolved.virtual) || resolved.root.name.toLowerCase() === 'skills') return;
   if (!workspaceKey()) return;
+  // A folder on a server (#1469) is walked there, with the server's own path rules.
+  if (resolved.root.remote) {
+    setCurrentWorkspace(await projectFolderOf(resolved, resolved.root.remote.path, serverIo(fsForRoot(resolved.root))));
+    return;
+  }
   let rootReal: string;
   try {
     rootReal = await fs.realpath(resolved.root.path);

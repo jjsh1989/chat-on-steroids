@@ -1,7 +1,9 @@
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { app } from 'electron';
+vi.mock('electron', () => ({ app: { getAppPath: vi.fn(() => process.cwd()) } }));
 import {
   commonBinaryDirsForPlatform,
   locateBinary,
@@ -26,10 +28,23 @@ afterEach(async () => {
     value: originalResourcesPath
   });
   resetTunnelLocatorCacheForTests();
+  vi.mocked(app.getAppPath).mockReturnValue(process.cwd());
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
 describe('tunnel binary location', () => {
+  it('finds development resources from the app root regardless of bundle nesting or cwd', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'clf-tunnel-layout-'));
+    roots.push(root);
+    const dir = path.join(root, 'resources', 'tunnel');
+    await mkdir(dir, { recursive: true });
+    const binary = path.join(dir, tunnelExecutableName('tunnel-client'));
+    await executable(binary, 'development');
+    vi.mocked(app.getAppPath).mockReturnValue(root);
+    Object.defineProperty(process, 'resourcesPath', { configurable: true, value: path.join(root, 'electron-resources') });
+    expect(locateBinary('tunnel-client')).toBe(binary);
+  });
+
   it('prefers the tested bundled client over an unrelated PATH copy', async () => {
     const resources = await mkdtemp(path.join(os.tmpdir(), 'clf-tunnel-resources-'));
     const fakePath = await mkdtemp(path.join(os.tmpdir(), 'clf-tunnel-path-'));
@@ -62,6 +77,27 @@ describe('tunnel binary location', () => {
     await executable(selected, 'selected');
 
     expect(path.normalize(locateBinary('tunnel-client', selected)!)).toBe(path.normalize(selected));
+  });
+
+  it('does not replace an invalid explicit selection with an available PATH binary', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'clf-tunnel-explicit-'));
+    roots.push(root);
+    const fileName = tunnelExecutableName('tunnel-client');
+    const alternative = path.join(root, fileName);
+    await executable(alternative, 'unrelated');
+    process.env.PATH = root;
+    resetTunnelLocatorCacheForTests();
+    expect(locateBinary('tunnel-client', path.join(root, 'missing', fileName))).toBeNull();
+  });
+
+  it('still resolves cloudflared beside an explicitly selected tunnel-client', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'clf-tunnel-sibling-'));
+    roots.push(root);
+    const client = path.join(root, tunnelExecutableName('tunnel-client'));
+    const sibling = path.join(root, tunnelExecutableName('cloudflared'));
+    await executable(client, 'client');
+    await executable(sibling, 'cloudflared');
+    expect(locateBinary('cloudflared', client)).toBe(sibling);
   });
 
   it('constructs native common-location fallbacks without leaking Windows paths onto POSIX', () => {

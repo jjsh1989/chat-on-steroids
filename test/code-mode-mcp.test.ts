@@ -4,7 +4,7 @@ import path from 'node:path';
 import { beforeAll, afterAll, afterEach, expect, it, vi } from 'vitest';
 import { defaultConfig, getConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { initDurableStore, flushDurable, resetDurableForTests } from '../src/main/durable.js';
-import { initSessionStore, createSession, readSessionPlan, readEvents, rebindSession, appendEvent, observeSessionModel, resetSessionStoreForTests } from '../src/main/session/store.js';
+import { initSessionStore, createSession, getSession, readSessionPlan, readEvents, rebindSession, appendEvent, observeSessionModel, resetSessionStoreForTests } from '../src/main/session/store.js';
 import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { flushRecorder, recordChatObservations } from '../src/main/session/recorder.js';
 import { cancelInput, enqueueInput, listInputs, resetInputForTests } from '../src/main/session/input.js';
@@ -12,23 +12,40 @@ import { setChatBlocked, resetBlockedChatsForTests } from '../src/main/session/b
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
 import type { ToolContext } from '../src/main/mcp/kernel.js';
 import { currentCall } from '../src/main/mcp/call-context.js';
+import { eventTokens } from '../src/shared/session.js';
 import * as backend from '../src/main/codex/read-backend.js';
 import * as desktopBackend from '../src/main/computer/index.js';
 import sharp from 'sharp';
 import { randomBytes } from 'node:crypto';
 import { unifiedExecManager } from '../src/main/codex/manager.js';
+import { onLog } from '../src/main/logger.js';
 import { noteExecOwner, forgetExecOwner } from '../src/main/codex/ownership.js';
 import * as ownership from '../src/main/codex/ownership.js';
 import type { ExecCommandToolOutput } from '../src/main/codex/unified-exec.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let directory: string, endpoint: McpEndpoint, ctx: ToolContext;
+/**
+ * Finished MCP requests, counted from the server's own `request POST …` line. That line is written
+ * in the response's `finish` handler right after it stamps the publication's `completedAt`.
+ */
+let finishedRequests = 0;
+onLog(entry => { if (/^request POST mcp\//.test(entry.message)) finishedRequests++; });
+
 async function rpc(method: string, params: object, requestId?: string, surface: 'core' | 'desktop' = 'core'): Promise<any> {
+  const before = finishedRequests;
   const response = await fetch(endpoint.urls[surface], { method: 'POST', headers: {
     'content-type': 'application/json', accept: 'application/json, text/event-stream',
     ...(requestId ? { 'x-request-id': `${requestId}/attempt` } : {})
   }, body: JSON.stringify({ jsonrpc: '2.0', id: randomUUID(), method, params }) });
   const raw = await response.text();
+  // On loopback the body can arrive before the server's `finish` handler has run, and a next call in
+  // the same millisecond reads as concurrent: it does not acknowledge background output that the
+  // previous answer delivered (`startedAt <= completedAt`). ChatGPT's next call comes seconds later;
+  // act like it by letting the server record this answer and the clock move past it.
+  await vi.waitFor(() => expect(finishedRequests).toBeGreaterThan(before));
+  const finishedAt = Date.now();
+  while (Date.now() <= finishedAt) await new Promise(resolve => setTimeout(resolve, 1));
   return JSON.parse(raw.startsWith('{') ? raw : [...raw.matchAll(/^data: (.+)$/gm)].at(-1)![1]!);
 }
 async function identity() {
@@ -39,6 +56,7 @@ async function identity() {
 }
 const call = (requestId: string | undefined, code: string) => rpc('tools/call', { name: 'exec', arguments: { code } }, requestId);
 const text = (response: any) => response.result.content.filter((item: any) => item.type === 'text').map((item: any) => item.text).join('\n');
+const emittedText = (response: any): string => response.result.content.find((item: any) => item.type === 'text')?.text ?? '';
 
 it.each(['current', 'superseded'] as const)('resolves late session_finish identity before enforcing its %s owner', async state => {
   const conversationId = randomUUID(), requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
@@ -68,10 +86,12 @@ it.each(['current', 'superseded'] as const)('resolves late session_finish identi
 });
 
 it('delivers one recovered-identity notice on the real structured MCP wire after a refused plan update', async () => {
+  const config = getConfig();
+  await saveConfig({ ...config, multiAgent: { ...config.multiAgent, allowUnattributedCalls: false } });
   const requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
   const rejected = await rpc('tools/call', { name: 'update_plan', arguments: { plan: [{ step: 'Verify recovery', status: 'in_progress' }] } }, requestId);
   expect(rejected.result.isError).toBe(true);
-  expect(text(rejected)).toContain('Exact chat identity is required');
+  expect(text(rejected)).toContain('Exact chat identity');
   const conversationId = randomUUID();
   const session = await createSession({ conversationId, title: 'Identity recovery wire' });
   observeRequestCorrelation({ requestId, conversationId, sessionId: session.id, messageId: randomUUID(), tool: 'update_plan', observedAt: Date.now() });
@@ -149,6 +169,27 @@ it('preserves a nonzero terminal exit and leaves nested correction delivery with
   expect(child).not.toHaveProperty('supplemental_context');
   expect(text(nested).match(/OUTER_ONLY_CORRECTION/g)).toHaveLength(1);
   await call(who.requestId, 'text("receipt")');
+});
+
+it('enforces command allowlist rejection identically for direct and code-mode calls', async () => {
+  const original = getConfig();
+  await saveConfig({ ...original, commandAllowlist: { enabled: true, mode: 'allow', rules: ['git status'] } });
+  const who = await identity();
+  const launch = vi.spyOn(unifiedExecManager, 'execCommand');
+  try {
+    const direct = await rpc('tools/call', {
+      name: 'exec_command', arguments: { cmd: 'git diff', workdir: '/workspace' }
+    }, who.requestId);
+    expect(direct.result.isError).toBe(true);
+    expect(text(direct)).toContain('COMMAND_NOT_ALLOWED');
+
+    const nested = await call(who.requestId, 'text(await tools.exec_command({cmd:"git diff",workdir:"/workspace"}));');
+    expect(text(nested)).toContain('COMMAND_NOT_ALLOWED');
+    expect(launch).not.toHaveBeenCalled();
+  } finally {
+    launch.mockRestore();
+    await saveConfig(original);
+  }
 });
 
 it('projects corrections for other Core structured results without changing the empty worker family', async () => {
@@ -251,6 +292,15 @@ it('initializes, discovers and executes the actual model-facing MCP contract wit
   const events = (await readEvents(who.session.id)).filter(event => event.kind === 'tool_call');
   expect(events.map(event => event.call.tool).sort()).toEqual(['exec', 'read', 'read']);
   expect(new Set(events.map(event => event.call.callId)).size).toBe(3);
+  const children = events.filter(event => event.call.tool === 'read');
+  expect(children.every(event => event.call.nested === true)).toBe(true);
+  expect(children.map(eventTokens)).toEqual([0, 0]);
+  const outer = events.find(event => event.call.tool === 'exec')!;
+  expect(outer.call.nested).toBeUndefined();
+  expect(eventTokens(outer)).toBeGreaterThan(0);
+  expect(await getSession(who.session.id)).toMatchObject({
+    estimatedTokens: eventTokens(outer), contextTokens: eventTokens(outer), toolCalls: 3
+  });
   expect(JSON.stringify(events.filter(event => event.call.tool === 'read'))).toContain('PRIVATE_ALPHA');
   expect(JSON.stringify(events.filter(event => event.call.tool === 'exec'))).not.toContain('PRIVATE_ALPHA');
 });
@@ -264,8 +314,8 @@ it.runIf(process.platform === 'win32').each([true, false])('routes sky through D
     callers.push(currentCall()!.caller.sessionId!);
     return { windows: [window], screen: { x: 0, y: 0, width: 2, height: 2 } } as never;
   });
-  vi.spyOn(desktopBackend, 'getWindowState').mockResolvedValue({ window, elements: [{ ref: 'fixture-ref', role: 'Button', name: 'Owned button', actions: ['invoke'] }],
-    screenshot: { frameId: 1, data, windowId: 77, region: { x: 0, y: 0, width: 2, height: 2 }, scale: 1 }, related: []
+  vi.spyOn(desktopBackend, 'getWindowState').mockResolvedValue({ window, elements: [{ ref: 'fixture-ref', role: 'Button', name: 'Owned button', actions: ['invoke'], bounds: { x: 0, y: 0, width: 2, height: 2 } }],
+    screenshot: { frameId: 1, data, width: 2, height: 2, windowId: 77, region: { x: 0, y: 0, width: 2, height: 2 }, scale: 1 }, related: []
   } as never);
   const action = vi.spyOn(desktopBackend, 'act').mockImplementation(async () => {
     callers.push(currentCall()!.caller.sessionId!);
@@ -277,7 +327,8 @@ it.runIf(process.platform === 'win32').each([true, false])('routes sky through D
   expect(text(observed)).toContain('0: Button');
   const publicWindow = { app: window.app, id: window.id, title: window.title };
   const clicked = await rpc('tools/call', { name: 'exec', arguments: { code: `await sky.click({window:${JSON.stringify(publicWindow)},element_index:0}); text("accepted");` } }, who.requestId, 'desktop');
-  expect(text(clicked)).toBe('accepted');
+  expect(emittedText(clicked)).toBe('accepted');
+  if (!attributed) expect(text(clicked)).toContain('does not switch on Read-only mode or disable tools');
   expect(action).toHaveBeenCalledExactlyOnceWith([{ type: 'click_ref', ref: 'fixture-ref', button: 'left', count: 1 }], { window: 77, app: 'fixture.exe' });
   expect(callers).toEqual([who.session.id, who.session.id]);
   ctx.caps = { ...ctx.caps, control: false };
@@ -321,11 +372,17 @@ it('delivers completed terminal output on the outer result even when code filter
   const started = await call(who.requestId, `text(await tools.exec_command({cmd:${JSON.stringify(command)},workdir:"/workspace",yield_time_ms:25}));`);
   const id = Number(text(started).match(/Process running with session ID (\d+)/)?.[1]);
   expect(Number.isInteger(id), text(started)).toBe(true);
-  await vi.waitFor(() => expect(unifiedExecManager.exitedUnread(new Set([id]))).toHaveLength(1), { timeout: 5_000 });
+  // A busy Windows runner can take more than 5 s to report the PowerShell child's exit (3 of 15
+  // runs on a freshly installed test VM; about 1 s once idle), so wait for the exit itself.
+  await vi.waitFor(() => expect(unifiedExecManager.exitedUnread(new Set([id]))).toHaveLength(1), { timeout: 20_000, interval: 50 });
   const full = await call(who.requestId, 'text("x".repeat(39_900));');
   expect(Buffer.byteLength(text(full)), text(full).slice(0, 400)).toBe(39_900);
   expect(text(full)).not.toContain('OUTER_AUTO_RESULT');
-  expect(unifiedExecManager.exitedUnread(new Set([id]))).toHaveLength(1);
+  // Seen once on Windows CI (2026-10-22): the exited session was no longer unread here. Say where it went.
+  expect(unifiedExecManager.exitedUnread(new Set([id])), JSON.stringify({
+    listed: unifiedExecManager.listProcesses().map(entry => entry.processId === id ? entry : null).filter(Boolean),
+    state: unifiedExecManager.backgroundState(new Set([id]))
+  })).toHaveLength(1);
   const response = await call(who.requestId, 'await Promise.all([tools.read({paths:["/workspace/alpha.txt"]}),tools.read({paths:["/workspace/beta.txt"]})]); text("filtered children");');
   expect(text(response)).toContain('OUTER_AUTO_RESULT');
   expect(text(response)).toContain('Exit code: 7');
@@ -334,7 +391,7 @@ it('delivers completed terminal output on the outer result even when code filter
   const receipt = await call(who.requestId, 'text("receipt");');
   expect(text(receipt)).not.toContain('OUTER_AUTO_RESULT');
   expect(unifiedExecManager.exitedUnread(new Set([id]))).toEqual([]);
-});
+}, 60_000);
 
 it('rejects missing proof, foreign tools, invalid child arguments and nested lifecycle calls', async () => {
   const config = getConfig();
@@ -352,21 +409,29 @@ it('allows unattributed file edits through code mode while preserving permission
   const patch = '*** Begin Patch\n*** Add File: /workspace/unattributed.txt\n+created anonymously\n*** End Patch';
   const response = await call(undefined, `text(await tools.apply_patch({patch:${JSON.stringify(patch)}}));`);
   expect(response.result.isError, text(response)).not.toBe(true);
-  expect(JSON.parse(text(response)).isError).not.toBe(true);
+  expect(JSON.parse(emittedText(response)).isError).not.toBe(true);
   expect(await fs.readFile(path.join(directory, 'unattributed.txt'), 'utf8')).toBe('created anonymously\n');
   const read = await call(`wfr_${randomUUID().replaceAll('-', '')}`, 'text(await tools.read({paths:["/workspace/unattributed.txt"]}));');
   expect(text(read)).toContain('created anonymously');
   const edit = '*** Begin Patch\n*** Update File: /workspace/unattributed.txt\n@@\n-created anonymously\n+edited anonymously\n*** End Patch';
   const edited = await call(undefined, `text(await tools.apply_patch({patch:${JSON.stringify(edit)}}));`);
-  expect(JSON.parse(text(edited)).isError).not.toBe(true);
+  expect(JSON.parse(emittedText(edited)).isError).not.toBe(true);
   expect(await fs.readFile(path.join(directory, 'unattributed.txt'), 'utf8')).toBe('edited anonymously\n');
   ctx.caps = { ...ctx.caps, edit: false };
   const deniedPatch = edit.replace('-created anonymously', '-edited anonymously').replace('+edited anonymously', '+must not change');
   const denied = await call(undefined, `text(await tools.apply_patch({patch:${JSON.stringify(deniedPatch)}}));`);
-  expect(JSON.parse(text(denied)).isError).toBe(true);
+  expect(JSON.parse(emittedText(denied)).isError).toBe(true);
   expect(await fs.readFile(path.join(directory, 'unattributed.txt'), 'utf8')).toBe('edited anonymously\n');
-  const plan = await call(undefined, 'text(await tools.update_plan({plan:[{step:"Anonymous plan",status:"in_progress"}]}));');
-  expect(JSON.parse(text(plan)).isError).toBe(true);
+  const planRequest = `wfr_${randomUUID().replaceAll('-', '')}`;
+  const plan = await call(planRequest, 'text(await tools.update_plan({plan:[{step:"Anonymous plan",status:"in_progress"}]}));');
+  expect(JSON.parse(emittedText(plan)).isError).not.toBe(true);
+  expect(text(plan)).toContain('will attach when its chat identity arrives');
+  const planConversation = randomUUID();
+  const planSession = await createSession({ conversationId: planConversation, title: 'Request plan owner' });
+  expect(observeRequestCorrelation({ requestId: planRequest, conversationId: planConversation, sessionId: planSession.id,
+    messageId: randomUUID(), tool: 'update_plan', observedAt: Date.now() })).toBe('stored');
+  await vi.waitFor(async () => expect((await readSessionPlan(planSession.id))?.plan)
+    .toEqual([{ step: 'Anonymous plan', status: 'in_progress' }]), { timeout: 2_000 });
   const finish = await rpc('tools/call', { name: 'session_finish', arguments: { summary: 'done' } });
   expect(finish.result.isError).toBe(true);
   expect(text(finish)).toContain('Exact session identity');
@@ -374,7 +439,7 @@ it('allows unattributed file edits through code mode while preserving permission
   try {
     await saveConfig({ ...config, multiAgent: { ...config.multiAgent, enabled: true } });
     const spawn = await call(undefined, 'text(await tools.agents({action:"spawn",workers:[{task:"Must never start"}]}));');
-    expect(JSON.parse(text(spawn)).isError).toBe(true);
+    expect(JSON.parse(emittedText(spawn)).isError).toBe(true);
     expect(text(spawn)).toContain('UNIDENTIFIED_CALLER');
   } finally {
     await saveConfig(config);
@@ -449,4 +514,12 @@ it('uses existing process custody for nested exec and write_stdin across a conve
   observeRequestCorrelation({ requestId, conversationId: replacement, sessionId: a.session.id, messageId: randomUUID(), tool: 'exec', observedAt: Date.now() });
   const continued = await call(requestId, `text(await tools.write_stdin({session_id:${processId},chars:"owner\\r",yield_time_ms:1000}));`);
   expect(text(continued)).toContain('OWNED_RESULT');
+});
+
+it('explains a "not a function" from another connector\'s tool in a Core script (#1287)', async () => {
+  const who = await identity();
+  const response = await call(who.requestId, 'try { await tools.read_clipboard({}); } catch (error) { text(String(error)); }');
+  const all = text(response);
+  expect(all).toContain('not a function');
+  expect(all).toContain('UNKNOWN_TOOL_NAMES: this script used tools.read_clipboard (a Chat On Steroids Desktop tool), which Chat On Steroids Core does not offer');
 });

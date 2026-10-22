@@ -25,7 +25,8 @@ import {
   type PollHealth
 } from './tunnel/health.js';
 
-import type { Capabilities, Check, Diagnosis, MacOSDesktopAccessStatus } from '../shared/types.js';
+import type { Capabilities, Check, Diagnosis, MacOSDesktopAccessStatus, SurfaceId } from '../shared/types.js';
+import { connectorsSharingTunnel, type ConnectorTunnelIds } from '../shared/tunnel-ids.js';
 import { surfaceIsUseful } from './mcp/surfaces.js';
 import { refreshMacOSDesktopAccess } from './computer/index.js';
 
@@ -159,32 +160,39 @@ export function describeMacOSDesktopAccess(
 
   const check = (
     name: string,
-    state: MacOSDesktopAccessStatus['screen'],
+    permission: 'screen' | 'accessibility',
     missing: string
-  ): Check => ({
-    name,
-    status: state === 'granted' ? 'pass' : state === 'missing' ? 'fail' : 'not-run',
-    ok: state === 'granted' ? true : state === 'missing' ? false : null,
-    detail:
-      state === 'granted'
-        ? 'Granted to the in-process Desktop backend.'
-        : state === 'missing'
-          ? `${missing} Fully quit and reopen the app after changing the macOS permission.`
-          : access.error ?? 'The in-process Desktop backend could not determine the live TCC decision.'
-  });
+  ): Check => {
+    const state = access[permission];
+    // An unsigned update is a new app to macOS: the old grant still shows, but no longer applies.
+    const earlier = access.grantedBefore?.[permission] === true
+      ? ' It was granted to an earlier version; after an update macOS still shows it as allowed. Use Repair permissions in Settings → Workspace.'
+      : '';
+    return {
+      name,
+      status: state === 'granted' ? 'pass' : state === 'missing' ? 'fail' : 'not-run',
+      ok: state === 'granted' ? true : state === 'missing' ? false : null,
+      detail:
+        state === 'granted'
+          ? 'Permission preflight passed in the current Desktop process; capture and control have not been tested.'
+          : state === 'missing'
+            ? `${missing}${earlier} Fully quit and reopen the app after changing the macOS permission.`
+            : access.error ?? 'The in-process Desktop backend could not determine the live TCC decision.'
+    };
+  };
 
   if (caps.screen) {
     checks.push(check(
       'macOS Screen Recording',
-      access.screen,
-      'macOS denied Screen Recording to the current Desktop process. Open Privacy & Security → Device Control and Data Access.'
+      'screen',
+      'Screen Recording permission preflight did not pass in the current Desktop process. Check this installed Chat On Steroids.app in Privacy & Security → Screen & System Audio Recording (or Device Control and Data Access).'
     ));
   }
   if (caps.control) {
     checks.push(check(
       'macOS Accessibility',
-      access.accessibility,
-      'macOS denied AXUIElement access to the in-process Chat On Steroids.app backend. Open Privacy & Security → Accessibility (Device Control and Data Access on newer macOS).'
+      'accessibility',
+      'Accessibility permission preflight did not pass in the current Desktop process. Check this installed Chat On Steroids.app in Privacy & Security → Accessibility (Device Control and Data Access on newer macOS).'
     ));
   }
   return checks;
@@ -269,7 +277,7 @@ function developerMode(seen: number | null, called: number | null): Check {
       name: 'ChatGPT allowed to use the tools',
       status: 'pass',
       ok: true,
-      detail: `Yes — ChatGPT last ran a tool ${ago(called)}, so Developer mode is on and the whole chain works.`
+      detail: `Yes — ChatGPT last ran a tool ${ago(called)}, so the app is enabled in ChatGPT and the whole chain works.`
     };
   }
   if (seen === null) {
@@ -287,9 +295,30 @@ function developerMode(seen: number | null, called: number | null): Check {
     detail:
       'Cannot tell — ChatGPT connected and read the tool list, but has never run a tool. ' +
       'That is normal if you have not asked it to do anything yet. If you have asked and it ' +
-      'answered “does not support developer MCPs”, the cause is on ChatGPT’s side: turn ' +
-      'Developer mode back on in ChatGPT → Settings → Apps & Connectors → Advanced. It can ' +
-      'switch itself off after a ChatGPT update.'
+      'answered “does not support developer MCPs”, the cause is on ChatGPT’s side: check that ' +
+      'the CoS app is still added and enabled under ChatGPT → Plugins.'
+  };
+}
+
+/**
+ * Two connectors on one Secure Tunnel ID (#1401). OpenAI hands requests to every client on an ID in
+ * turn, so ChatGPT can read one connector's tool list for the other and then offers none of the
+ * expected tools, or calls land on the wrong connector. Every other check passes in that state,
+ * which is why it has a row of its own. Null when fewer than two connectors have an ID.
+ */
+export function describeSeparateTunnels(tunnel: ConnectorTunnelIds): Check | null {
+  const labels: Record<SurfaceId, string> = { core: 'Core', desktop: 'Desktop', plugins: 'Plugins' };
+  const surfaces = Object.keys(labels) as SurfaceId[];
+  const configured = surfaces.filter(surface => (surface === 'core' ? tunnel.tunnelId : surface === 'desktop' ? tunnel.desktopTunnelId : tunnel.pluginsTunnelId)?.trim());
+  if (configured.length < 2) return null;
+  const first = configured.find(surface => connectorsSharingTunnel(tunnel, surface).length > 0);
+  if (!first) return { name: 'One tunnel per connector', status: 'pass', ok: true, detail: 'Each connector has its own tunnel ID.' };
+  const names = [first, ...connectorsSharingTunnel(tunnel, first)].map(surface => labels[surface]);
+  const list = names.length > 2 ? `${names.slice(0, -1).join(', ')} and ${names.at(-1)}` : names.join(' and ');
+  return {
+    name: 'One tunnel per connector', status: 'fail', ok: false,
+    detail: `${list} use the same tunnel ID. OpenAI hands requests to each of them in turn, so ChatGPT can lose a connector's tools or call the wrong one. ` +
+      'Create a separate tunnel for each connector, enter its ID in Setup, reconnect, then refresh the plugins in ChatGPT.'
   };
 }
 
@@ -333,7 +362,9 @@ export async function runDiagnostics(): Promise<Diagnosis> {
     checks.push(await checkLocalServer(status.localUrl));
   }
 
-  // 3. The tunnel process itself.
+  // 3. The tunnel process itself, after the one mistake in its settings that nothing else shows.
+  const separate = config.tunnel.kind === 'openai' ? describeSeparateTunnels(config.tunnel) : null;
+  if (separate) checks.push(separate);
   const base = tunnelHealthBase();
   if (config.tunnel.kind !== 'openai') {
     checks.push({

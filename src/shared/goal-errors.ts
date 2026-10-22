@@ -1,6 +1,6 @@
 /** Presentation only. Keep machine errors and retry/ownership decisions unchanged. */
 const explanations: Readonly<Record<string, string>> = {
-  loop_mcp_call_missing: 'No MCP tool call was recorded in the last response, so the app cannot tell whether the tool connection was lost. Automatic continuation is paused; Loop remains enabled. Check the tunnel and Core connector before continuing.',
+  loop_mcp_call_missing: 'No MCP tool call was recorded in the last response. ChatGPT may be asking you something, or the tool connection may have been lost. Answer it, or check the tunnel if tools stopped working. Automatic continuation is paused; Loop remains enabled.',
   goal_reply_not_pending: 'There is no pending continuation for this answer. It may already have been handled or replaced by newer work. Check the latest chat activity before trying again.',
   goal_context_too_large: 'The task and Goal/Loop instructions are too long to send to the helper. Shorten the task or the custom continuation instructions in Settings.',
   reply_too_long: 'The helper wrote a continuation that is too long to send. Ask for shorter continuation instructions or choose another helper model in Settings.',
@@ -29,6 +29,7 @@ const explanations: Readonly<Record<string, string>> = {
   no_conversation: 'No recorded conversation is available to continue. Send a task first.',
   no_objective: 'No task was provided. Enter a task before starting Goal/Loop.',
   nothing_to_open_with: 'The helper did not produce an opening message. Make the task more specific and try again.',
+  goal_helper_stop_unverified: 'The helper says the goal is met, but this has not been checked. No follow-up was sent. Review the chat and continue if work remains.',
   loop_stop_refused: 'The helper kept choosing to stop instead of writing a Loop continuation. Review the Loop instructions or choose another helper model.',
   goal_marker_missing: 'The answer is missing the completion marker required by offline Goal templates. Check the template instructions or choose another continuation source.',
   goal_reply_not_durable: 'The app could not save the pending continuation. Check free disk space and the app diagnostics.',
@@ -36,6 +37,25 @@ const explanations: Readonly<Record<string, string>> = {
   goal_switch_not_durable: 'The app could not save the Goal/Loop setting. Check free disk space and try saving it again.',
   goal_objective_not_durable: 'The app could not save the task. Check free disk space and try saving it again.'
 };
+
+/**
+ * The catalog key of a fixed explanation, so pages without the app catalog can show it in the
+ * user's language. Null when the explanation carries dynamic detail and must stay as sent.
+ */
+export function goalErrorKey(error: string): string | null {
+  let raw = error.trim();
+  let wrapped = false;
+  for (let depth = 0; depth < 4 && raw.startsWith('request_failed:'); depth += 1) {
+    raw = raw.slice('request_failed:'.length).trim();
+    wrapped = true;
+  }
+  const code = raw.split(':', 1)[0]!;
+  if (code === 'goal_browser_send_failed' && raw.includes(':')) return null;
+  if (Object.hasOwn(explanations, code)) return code;
+  if (/^(?:invalid_goal_decision_(?:json|schema)|malformed_(?:completion_response|stream_record)|empty_reply|control_tokens_only|unsafe_control_tokens)$/.test(code)) return null;
+  if (/^provider_(?:completion|stream)_error$/.test(code) || /^http_\d{3}$/.test(code)) return null;
+  return wrapped ? 'request_failed' : null;
+}
 
 export function goalErrorMessage(error: string): string {
   let raw = error.trim();

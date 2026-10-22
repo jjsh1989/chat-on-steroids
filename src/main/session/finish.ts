@@ -4,10 +4,13 @@ import { currentCall } from '../mcp/call-context.js';
 import { getSession } from './store.js';
 import { onSessionChange, recordProgress } from './recorder.js';
 import { isChatBlocked } from './blocked-chats.js';
-import { draftFastFollowup, conversationMessages, automaticFinishEnabled, onGoalChange } from '../goal.js';
+// The one worker-wait rule, owned where worker state lives: the page asks the same question
+// over HTTP for `/goal/draft`, and the two must not be able to disagree about it.
+import { waitingForSubAgents } from '../agents.js';
+import { draftFastFollowup, conversationMessages, automaticFinishEnabled, goalDrivingMode, goalObjectiveFor, goalProgressFor, onGoalChange } from '../goal.js';
 import { hasEligibleToolInput, finishNeedsBrowserInput, onInputChange, listInputs, enqueueInput } from './input.js';
 
-import { logWarn } from '../logger.js';
+import { logInfo, logWarn } from '../logger.js';
 import { retryTaskRequest } from '../task-request.js';
 
 let notify: ((title: string, body: string, sessionId: string, turnId: string) => boolean | void) | null = null;
@@ -46,14 +49,18 @@ async function prepareNotice(sessionId: string, summary: string, userRequested =
     throw new Error('Session finish requires this caller’s exact active session and turn');
   }
   const key = `${sessionId}:${turnId}`;
-  const mode = 'loop' as const;
+  const mode = goalDrivingMode(session.conversationId);
+  const objective = goalObjectiveFor(session.conversationId);
+  const settingsCurrent = () => getConfig() === configuration &&
+    automaticFinishEnabled(session.conversationId!) === automatic &&
+    goalDrivingMode(session.conversationId!) === mode && goalObjectiveFor(session.conversationId!) === objective;
   const existing = running.get(key);
   if (existing) {
     const finish = (await getSession(sessionId))?.finishTurn;
     if (finish?.turnId !== turnId || finish.startedAt > requestedAt) throw new Error('This request predates the active turn');
     return existing.promise;
   }
-  const draft: FinishDraft = { stage: 'sending', model: (configuration.goal.loopBackend ?? 'chatgpt') === 'chatgpt' ? configuration.goal.helperModel ?? configuration.goal.model : configuration.goal.model, text: '', error: null };
+  const draft: FinishDraft = { stage: 'sending', model: goalProgressFor(mode).model, text: '', error: null };
   const work = (async () => {
     const current = await getSession(sessionId);
     const authority = current?.finishTurn;
@@ -66,8 +73,8 @@ async function prepareNotice(sessionId: string, summary: string, userRequested =
     const description = summary.trim().slice(0, 1000);
     const stillCurrent = async () => {
       const latest = await getSession(sessionId);
-      return getConfig() === configuration && latest?.activeTurnId === turnId && latest.conversationId === session.conversationId &&
-        getConfig().ui.finishTool && automaticFinishEnabled(session.conversationId!) === automatic && !isChatBlocked(session.conversationId!) &&
+      return settingsCurrent() && latest?.activeTurnId === turnId && latest.conversationId === session.conversationId &&
+        getConfig().ui.finishTool && !isChatBlocked(session.conversationId!) &&
         await sessionFinishHeld(sessionId, turnId, session.conversationId);
     };
     const inputs = await listInputs();
@@ -86,19 +93,30 @@ async function prepareNotice(sessionId: string, summary: string, userRequested =
       await recordProgress(sessionId, noticeId, `Astra is wrapping up: ${description}\n${notification}`, anchor, turnId);
     }
     let result = `${notification} ${REMAINING}`;
+    let unverifiedStop = false;
     if (!userRequested && !automatic) return result;
+    // The chat's own workers report back into it. Drafting now would take the decision from a
+    // context that is about to change and then type the instruction into a chat that is still
+    // working, so the hold is released instead: the work continues, and the finished answer
+    // leaves the reply obligation owed, which the pickup tree collects once the last worker
+    // stops. Checked after every earlier return so a notice-only hold is never released here.
+    if (waitingForSubAgents(session.conversationId)) {
+      try { await releaseSessionFinish(sessionId, turnId, 'end'); }
+      catch { /* the turn moved on; that turn's own authority owns the release */ }
+      return 'Waiting for this chat’s sub-agents to finish before deciding the next step.';
+    }
     const generated = new Set(inputs.filter(entry => entry.finishOwner).map(entry => entry.id));
     // A request id, timestamp, hold result or app status is not new work. Hash actual
     // authored context; tool-only work cannot change the provider's next decision input.
     const appInput = inputs.filter(entry => entry.sessionId === sessionId && entry.purpose !== 'decision' && !entry.finishOwner &&
       ['tool', 'sent'].includes(entry.state)).slice(-5).map(entry => ({ id: entry.id, text: entry.text }));
-    const inputRevision = createHash('sha256').update(JSON.stringify({ mode, appInput })).digest('hex');
+    const inputRevision = createHash('sha256').update(JSON.stringify({ mode, objective, appInput })).digest('hex');
     if (authority.decisionRevision && authority.workSeq <= authority.decisionSeq && authority.decisionInputRevision === inputRevision) {
       return `${result} No new work has been recorded since the previous Goal decision; no follow-up was repeated.`;
     }
     const context = await conversationMessages(sessionId, appInput.map(entry => entry.text), generated);
     if (!(await stillCurrent())) return 'The turn or settings changed; the Goal check was discarded.';
-    const revision = createHash('sha256').update(JSON.stringify({ mode, context })).digest('hex');
+    const revision = createHash('sha256').update(JSON.stringify({ mode, objective, context })).digest('hex');
     const progressId = `finish-goal:${turnId}:${revision}`;
     if (authority.decisionRevision === revision) {
       // A repeated streaming snapshot advanced the source cursor without changing content.
@@ -120,8 +138,8 @@ async function prepareNotice(sessionId: string, summary: string, userRequested =
       entry.sessionId === sessionId && !entry.finishOwner && !knownInputs.has(entry.id) &&
       ['queued', 'browser', 'tool', 'sent'].includes(entry.state));
     const checkDecision = () => {
-      // Revoke before awaiting IO: Off -> On cannot revive the old request.
-      if (getConfig() !== configuration || automaticFinishEnabled(session.conversationId!) !== automatic)
+      // Revoke before awaiting IO: Off/On or Goal/Loop/Goal cannot revive a request.
+      if (!settingsCurrent())
         controller.abort(new Error('The Goal settings changed; the Goal check was discarded.'));
       void currentDecision().then(current => {
         if (!current) controller.abort(new Error('The turn, settings or user instructions changed; the Goal check was discarded.'));
@@ -155,14 +173,30 @@ async function prepareNotice(sessionId: string, summary: string, userRequested =
           const hash = createHash('sha256').update(`${sessionId}:${progressId}`).digest('hex');
           const id = `${hash.slice(0,8)}-${hash.slice(8,12)}-5${hash.slice(13,16)}-8${hash.slice(17,20)}-${hash.slice(20,32)}`;
           await enqueueInput({ id, sessionId, text: reply, mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null },
-            { turnId, periodic: false, ...(userRequested ? { userRequested: true } : {}) });
+            { turnId, periodic: false, mode, ...(userRequested ? { userRequested: true } : {}) });
           result = `${notification} An automatic Goal instruction is queued once. ${REMAINING}`;
         }
+      } else if (mode === 'goal' && settings.finishHoldOnStop === true) {
+        unverifiedStop = true;
+        logInfo(`finish: ${draft.model} says the goal is met in ${session.conversationId}; unverified, finish hold kept`);
+        notification = 'Desktop notification is unavailable.';
+        if (notify) {
+          try {
+            notification = notify('Goal result needs review', 'The Goal helper thinks the work is complete, but this has not been checked. Review the chat or send another instruction.', sessionId, turnId) === false
+              ? 'The app is open; no desktop notification was shown.'
+              : 'The user has been notified.';
+          } catch { notification = 'The desktop notification could not be shown.'; }
+        }
+        result = `Goal helper says the goal is met, which is unverified. The finish hold was kept. ${notification} ${REMAINING}`;
+      } else if (mode === 'goal') {
+        await releaseSessionFinish(sessionId, turnId);
+        result = 'Goal found no remaining requested work. The finish hold was released; ChatGPT may complete its answer.';
       }
     } catch (error) {
       result = `${notification} Goal follow-up was not available: ${(error as Error).message}. ${REMAINING}`;
     } finally { stopInput(); stopSession(); stopGoal(); }
-    await recordProgress(sessionId, progressId, result, anchor, turnId);
+    const recorded = await recordProgress(sessionId, progressId, result, anchor, turnId, undefined, unverifiedStop ? 'helper_stop_unverified' : undefined);
+    if (unverifiedStop && !recorded) logWarn(`finish: unverified stop could not be recorded in ${session.conversationId}`);
     return result;
   })();
   // Notification-only holds are not pending automatic continuations.

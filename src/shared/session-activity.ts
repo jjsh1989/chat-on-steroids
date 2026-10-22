@@ -16,7 +16,7 @@ export function workerReportedFinish(summary: SessionSummary): boolean {
     summary.lastFinishReportAt >= (summary.lastToolCallAt ?? 0);
 }
 
-/** Shared by the displayed label and the opening cohort of attribution recovery. */
+/** Displayed work is independent of permission to reopen or reload its browser tab. */
 export function sessionWorkingAt(summary: SessionSummary, now: number): boolean {
-  return summary.endedAt === null && !workerReportedFinish(summary) && recentChatActivity(summary, now);
+  return !workerReportedFinish(summary) && recentChatActivity(summary, now);
 }

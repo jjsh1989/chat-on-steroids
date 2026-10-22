@@ -18,8 +18,8 @@
  * So ordering is turn-local. A turn this log opened is a durable, bounded group — everything
  * in it carries the same generation id, which the extension mints per turn — and inside that
  * group the recorded times are all live observations of one run, directly comparable. Outside
- * it nothing moves: user messages, turn boundaries, and any event whose turn this window does
- * not contain keep the position `seq` gave them.
+ * it nothing moves: unowned messages and events retain their recorded position. Store reads
+ * carry the owning start as presentation metadata even when it lies outside the loaded page.
  *
  * Both consumers use this. The desktop transcript and the stream the extension injects back
  * into ChatGPT are the same record, and they must not be able to disagree about its order.
@@ -32,16 +32,284 @@ export interface Chronological {
   origin?: number;
   /** When the item logically happened: `startedAt` for a call, first appearance for prose. */
   time: number;
+  /** Provider creation time is presentation metadata, never an execution clock. */
+  authoredAt?: number;
+  /** Recorded owning start, supplied before pagination; null means no proven group. */
+  turnOrigin?: number | null;
+  messageId?: string;
+  inputId?: string;
   kind: string;
+  source?: string;
+  agent?: string;
+  call?: { requestId?: string | null; conversationId?: string | null; attribution?: string };
   turnId?: string | null;
   /** ChatGPT's own terminal flag for the one message that ended a turn. See `closing()`. */
   final?: boolean;
+  /** Sequence of the latest authored content of a canonical message. See `residenceOf()`. */
+  contentSeq?: number;
+  /** On a turn end: the response went on into the next turn (#1301). */
+  continued?: boolean;
   state?: string;
 }
+
+export type TimelineTurns = Record<string, {
+  origin: number; time: number; endTime?: number; endOrigin?: number;
+  questionId?: string;
+  /** Another document observed the same exact request while this response was open. */
+  responseTurnId?: string;
+  /** Ended by a message the user sent into the running answer; the response went on (#1301). */
+  continued?: true;
+}>;
+
+export interface TurnIdentity {
+  timelineTurns?: TimelineTurns;
+  requestTurns?: RequestTurns;
+  /** Latest native question, excluding instructions handed out inside tool results. */
+  nativeQuestion?: { messageId: string; origin: number } | null;
+}
+
+export function injectedUserMessage(entry: Chronological, turns?: TimelineTurns): boolean {
+  // Browser-delivered app messages also retain inputId, and their native echo
+  // can carry a provider turn id. Only the tool-input key or a recorded local
+  // generation establishes injection; inputId alone is not transport evidence.
+  return entry.kind === 'user_message' && !!entry.inputId &&
+    (entry.messageId?.startsWith('input:') === true ||
+      (!!entry.turnId && !!turns && Object.hasOwn(turns, entry.turnId)));
+}
+
+/** The journal keeps document-local ids; this derived relation names their one response. */
+export function responseTurnId(turns: TimelineTurns | undefined, id: string): string {
+  const turn = turns?.[id], owner = turn?.responseTurnId;
+  return owner && turns?.[owner] && turns[owner].origin < turn.origin ? owner : id;
+}
+
+/** Only usable alongside a matching, exactly attributed request. A question alone is
+ * insufficient: retries after an end and different native questions remain distinct. */
+export function overlappingRequestTurns(
+  turns: TimelineTurns | undefined, left: string, right: string, requests: RequestTurns | undefined, requestId: string
+): boolean {
+  if (!turns) return false;
+  const first = responseTurnId(turns, left), second = responseTurnId(turns, right);
+  const a = turns[first], b = turns[second];
+  if (!a || !b || !a.questionId || a.questionId !== b.questionId) return false;
+  // A late old call can arrive while Regenerate is already answering the same
+  // question. Its new request is positive evidence of a different response,
+  // even if the earlier document has not published its end yet.
+  if (first !== second && Object.entries(requests ?? {}).some(([id, owner]) => id !== requestId && owner &&
+      [first, second].includes(responseTurnId(turns, owner.turnId)))) return false;
+  const earlier = a.origin <= b.origin ? a : b, later = earlier === a ? b : a;
+  return earlier.endOrigin === undefined || later.origin < earlier.endOrigin;
+}
+
+/**
+ * The turn a request continued into after its first turn ended (#1301).
+ *
+ * ChatGPT keeps one request id across a message the user sends while it works, and the page
+ * ends the local turn at that message. A call that *started* after that turn ended cannot be
+ * part of it; it belongs to the turn that began at or after that end. A late result of a call
+ * that started before the end stays where it was. Undefined when the request did not continue.
+ */
+export function continuedRequestTurn(
+  turns: TimelineTurns | undefined, held: string, later: string | null | undefined, startedAt: number
+): string | undefined {
+  if (!turns || !later) return undefined;
+  const ended = turns[responseTurnId(turns, held)];
+  const next = turns[responseTurnId(turns, later)];
+  if (!ended || !next || responseTurnId(turns, held) === responseTurnId(turns, later)) return undefined;
+  if (ended.continued !== true || ended.endTime === undefined || !(startedAt > ended.endTime) || next.time < ended.endTime || startedAt < next.time) return undefined;
+  return responseTurnId(turns, later);
+}
+
+/** The turn that was open when something started: the latest one begun by then and not yet ended. */
+export function turnOpenAt(turns: TimelineTurns | undefined, at: number): string | undefined {
+  let found: string | undefined;
+  for (const [id, turn] of Object.entries(turns ?? {})) {
+    if (turn.time > at || (turn.endTime !== undefined && at > turn.endTime)) continue;
+    if (!found || turns![found]!.time < turn.time) found = id;
+  }
+  return found ? responseTurnId(turns, found) : undefined;
+}
+
+/** Store-owned, rebuildable identity projection. Raw events and MCP attribution stay intact. */
+export function applyTurnIdentity(identity: TurnIdentity, event: Chronological): void {
+  const origin = positionOf(event);
+  if (event.kind === 'user_message' && event.messageId && !injectedUserMessage(event, identity.timelineTurns) &&
+      (!identity.nativeQuestion || origin > identity.nativeQuestion.origin)) {
+    identity.nativeQuestion = { messageId: event.messageId, origin };
+  }
+  let turns = identity.timelineTurns ?? {};
+  if (event.turnId && event.kind === 'turn_start' && !Object.hasOwn(turns, event.turnId)) {
+    identity.timelineTurns = turns = { ...turns, [event.turnId]: { origin, time: event.time,
+      ...(identity.nativeQuestion ? { questionId: identity.nativeQuestion.messageId } : {}) } };
+  } else if (event.turnId && event.kind === 'turn_start' && turns[event.turnId]?.endOrigin !== undefined &&
+      origin > turns[event.turnId]!.endOrigin!) {
+    // The turn reopened after an end its page reported too early (the same request kept calling
+    // tools). Held as ended, untagged rows of its reopened stretch (worker reports) had no turn and
+    // were drawn after its final answer (2026-10-12). It is open until its next end.
+    const { endTime: _endTime, endOrigin: _endOrigin, ...open } = turns[event.turnId]!;
+    identity.timelineTurns = turns = { ...turns, [event.turnId]: open };
+  } else if (event.turnId && event.kind === 'turn_end' && turns[event.turnId]) {
+    const start = turns[event.turnId]!;
+    identity.timelineTurns = turns = { ...turns, [event.turnId]: { ...start,
+      endTime: Math.max(start.endTime ?? 0, event.time), endOrigin: Math.min(start.endOrigin ?? Infinity, origin),
+      ...(event.continued === true || start.continued ? { continued: true as const } : {}) } };
+  }
+  if (event.kind !== 'tool_call' || event.source !== 'mcp' || !event.turnId ||
+      event.call?.attribution !== 'request_id' || !event.call.requestId || !event.call.conversationId) return;
+  const { requestId, conversationId } = event.call;
+  const requests = identity.requestTurns ?? {};
+  const held = recordedRequestTurn(requests, requestId, conversationId);
+  let owner = responseTurnId(turns, event.turnId);
+  if (held && responseTurnId(turns, held.turnId) !== owner &&
+      continuedRequestTurn(turns, held.turnId, owner, event.time) === owner) {
+    // The request continued into a newer turn (#1301): later calls of it belong there.
+    identity.requestTurns = { ...requests, [requestId]: { turnId: owner, conversationId, origin } };
+    return;
+  }
+  const heldTurn = held ? turns[responseTurnId(turns, held.turnId)] : undefined;
+  if (held && heldTurn && responseTurnId(turns, held.turnId) !== owner &&
+      continuedRequestTurn(turns, owner, held.turnId, Number.MAX_SAFE_INTEGER) === responseTurnId(turns, held.turnId) &&
+      event.time <= (turns[owner]?.endTime ?? -Infinity)) {
+    // A late result of a call that ran before the request continued keeps its own turn and
+    // leaves the request with the newer one.
+    return;
+  }
+  if (held && responseTurnId(turns, held.turnId) !== owner) {
+    if (!overlappingRequestTurns(turns, held.turnId, owner, requests, requestId)) {
+      identity.requestTurns = { ...requests, [requestId]: null };
+      return;
+    }
+    const prior = responseTurnId(turns, held.turnId);
+    const earlier = turns[prior]!.origin <= turns[owner]!.origin ? prior : owner;
+    const later = earlier === prior ? owner : prior;
+    const joined = { ...turns };
+    for (const [id, turn] of Object.entries(turns)) {
+      if (id === later || turn.responseTurnId === later) joined[id] = { ...turn, responseTurnId: earlier };
+    }
+    identity.timelineTurns = turns = joined;
+    owner = earlier;
+  }
+  if (held === null) {
+    if (requests[requestId] !== null) identity.requestTurns = { ...requests, [requestId]: null };
+    return;
+  }
+  if (held && held.turnId === owner && held.origin <= origin) return;
+  identity.requestTurns = { ...requests, [requestId]: {
+    turnId: owner, conversationId, origin: Math.min(held?.origin ?? Infinity, origin)
+  } };
+}
+
+/** Derived from exact, already turn-owned MCP records. Null retains contradictory proof. */
+export type RequestTurns = Record<string, { turnId: string; conversationId: string; origin: number } | null>;
+
+/** Undefined is unobserved; null is conflicting. Neither grants a turn or a conversation. */
+export function recordedRequestTurn(
+  requests: RequestTurns | undefined, requestId: string | null | undefined, conversationId: string | null | undefined
+): RequestTurns[string] | undefined {
+  if (!requestId || !requests || !Object.hasOwn(requests, requestId)) return undefined;
+  const owner = requests[requestId];
+  return owner && owner.conversationId === conversationId ? owner : null;
+}
+
+/** The older canonical assistant key already contains this exact provider timestamp. */
+export function authoredTimeOf(entry: Chronological): number | undefined {
+  if (Number.isFinite(entry.authoredAt) && entry.authoredAt! > 0) return entry.authoredAt;
+  if (entry.kind !== 'assistant_message') return undefined;
+  const id = entry.messageId?.match(/^assistant:([a-f0-9-]{36})?:([a-f0-9-]{36})?:(\d{13})$/i);
+  return id && (id[1] || id[2]) ? Number(id[3]) : undefined;
+}
+
+/** Both canonical formats retain the native response's working/exchange UUIDs.
+ * The parent or creation stamp identifies a message inside it, not another response. */
+function assistantResponseKey(entry: Chronological): string | undefined {
+  if (entry.kind !== 'assistant_message' || entry.source !== 'extension') return undefined;
+  const parts = entry.messageId?.split(':');
+  if (parts?.length !== 4 || parts[0] !== 'assistant') return undefined;
+  const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+  const timestamped = /^\d{13}$/.test(parts[3]!);
+  if (!timestamped && !uuid.test(parts[1]!)) return undefined;
+  const working = parts[timestamped ? 1 : 2]!, exchange = parts[timestamped ? 2 : 3]!;
+  if (!uuid.test(working) || !uuid.test(exchange)) return undefined;
+  return `${entry.agent ?? ''}\u0000${working.toLowerCase()}:${exchange.toLowerCase()}`;
+}
+
+/** Attach the session's recorded boundaries before selecting/rendering a small page.
+ * These fields affect presentation only; seq, origin, time and turnId stay untouched. */
+export function projectTimeline<T extends Chronological>(
+  entries: readonly T[], turns: TimelineTurns = {}, requests: RequestTurns = {},
+  messages: Iterable<Chronological> = entries
+): T[] {
+  const starts = Object.values(turns).sort((a, b) => a.origin - b.origin);
+  // Reload can lose the document-local owner of later public prose. An earlier
+  // canonical message of that exact native response still proves its display group.
+  // Resolve from all canonical messages, including anchors/conflicts outside this
+  // page. This neither coalesces sibling messages nor grants a lifecycle turnId.
+  const responses = new Map<string, TimelineTurns[string] | null>();
+  for (const message of messages) {
+    if (!message.turnId) continue;
+    const key = assistantResponseKey(message);
+    if (!key) continue;
+    const boundary = turns[responseTurnId(turns, message.turnId)] ?? null;
+    if (!responses.has(key)) responses.set(key, boundary);
+    else if (!boundary || responses.get(key)?.origin !== boundary.origin) responses.set(key, null);
+  }
+  return entries.map(entry => {
+    let boundary = entry.turnId ? turns[responseTurnId(turns, entry.turnId)] : undefined;
+    if (!entry.turnId) {
+      const response = assistantResponseKey(entry);
+      if (response) boundary = responses.get(response) ?? undefined;
+    }
+    // Older recorders dropped the local turn after its end. Its earlier exact request
+    // proof still places the call, including when that proof lies outside this page.
+    const requestOwner = !entry.turnId && entry.kind === 'tool_call' && entry.source === 'mcp' && entry.call?.attribution === 'request_id'
+      ? recordedRequestTurn(requests, entry.call.requestId, entry.call.conversationId) : undefined;
+    if (requestOwner) boundary = turns[responseTurnId(turns, requestOwner.turnId)];
+    // A paragraph the page reported only after a newer turn began (a reload re-read it, 23 minutes
+    // late in one run) was positioned at that late write and drawn below the newer turn's work. Its
+    // provider timestamp names the turn it was written in.
+    const written = !boundary && !entry.turnId && entry.kind === 'assistant_message' ? authoredTimeOf(entry) : undefined;
+    if (written !== undefined && starts.some(start => start.time > written && start.origin < positionOf(entry))) {
+      const owner = turnOpenAt(turns, written);
+      if (owner) boundary = turns[owner];
+    }
+    if (!boundary && requestOwner === undefined && !entry.turnId && entry.kind !== 'user_message' && entry.kind !== 'assistant_message' && entry.kind !== 'native_image') {
+      let low = 0, high = starts.length;
+      while (low < high) {
+        const mid = (low + high) >>> 1;
+        if (starts[mid]!.origin < positionOf(entry)) low = mid + 1; else high = mid;
+      }
+      const candidate = starts[low - 1];
+      if (candidate && (candidate.endTime === undefined || entry.time <= candidate.endTime)) boundary = candidate;
+    }
+    const authoredAt = authoredTimeOf(entry);
+    return { ...entry, turnOrigin: boundary?.origin ?? null, ...(authoredAt !== undefined ? { authoredAt } : {}) };
+  });
+}
+
+/** Entries recorded from one read of the page land within this many milliseconds of each other. */
+const SAME_READ_MS = 50;
+/** A call ChatGPT issued reaches this app through the tunnel within this many milliseconds. */
+const CALL_TRANSIT_MS = 1_000;
 
 /** Where an entry sits in the log: its first appearance if it has revisions, else its seq. */
 export function positionOf(entry: Chronological): number {
   return typeof entry.origin === 'number' && Number.isFinite(entry.origin) ? entry.origin : entry.seq;
+}
+
+/**
+ * Which page of history an entry lives on: its position, except for an answer that ended a turn.
+ *
+ * ChatGPT can open its answer message early in a long turn and fill it only at the end. In one
+ * report it was opened at 18:12 and became the final summary at 18:42, after about 200 calls.
+ * The answer is drawn at the end of its turn (see `closing()`), but pages were cut by where the
+ * message first appeared, so the newest page never held it and the chat seemed to stop at its
+ * last work heading. A final answer therefore lives where its final text was written, beside its
+ * turn's end. Display order and turn identity keep `positionOf`.
+ */
+export function residenceOf(entry: Chronological): number {
+  const position = positionOf(entry);
+  return entry.kind === 'assistant_message' && entry.final === true && typeof entry.contentSeq === 'number' && Number.isFinite(entry.contentSeq)
+    ? Math.max(position, entry.contentSeq) : position;
 }
 
 /**
@@ -83,18 +351,22 @@ function closing<T extends Chronological>(group: readonly T[]): T | null {
 export function chronological<T extends Chronological>(entries: readonly T[]): T[] {
   const position = (entry: T): number => positionOf(entry);
   const bySeq = [...entries].sort((a, b) => position(a) - position(b) || a.seq - b.seq);
-  // Only turns this window actually opened. A tail delivered from a cursor can hold events of
-  // a turn whose `turn_start` is far behind it, and a group with no anchor has no bounded
-  // extent — its members could be reordered past events that are not part of it at all. Those
-  // keep their seq position, which is the honest answer for a window that cannot see the turn.
+  // A page retains the durable start even when the start row is outside its window.
+  // Old callers with no projection still use only boundaries they actually hold.
   const anchors = new Map<string, number>();
   // Where each opened turn stops, so an event that names no turn can be told whether it
   // happened inside one. A turn still running has no end and holds everything after it.
   const ends = new Map<number, number>();
   for (const entry of bySeq) {
+    // A new delta can join this exact local turn to an earlier response origin.
+    // Apply the store's monotonic proof to older rows already resident in the UI.
+    if (entry.turnId && Number.isFinite(entry.turnOrigin))
+      anchors.set(entry.turnId, Math.min(anchors.get(entry.turnId) ?? Infinity, entry.turnOrigin!));
     if (entry.kind === 'turn_start' && entry.turnId && !anchors.has(entry.turnId)) {
       anchors.set(entry.turnId, position(entry));
     }
+  }
+  for (const entry of bySeq) {
     if (entry.kind === 'turn_end' && entry.turnId) {
       const anchor = anchors.get(entry.turnId);
       if (anchor !== undefined) ends.set(anchor, Math.max(ends.get(anchor) ?? 0, entry.time));
@@ -108,11 +380,46 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
   const rank = (entry: T, ends: T | null): number =>
     entry.kind === 'turn_start' ? -1 : entry.kind === 'turn_end' ? 1 : entry === ends ? 0.5 : 0;
 
+  /*
+   * A native ChatGPT step (a web search, a round's recap) carries only the moment it was read,
+   * while prose carries the moment ChatGPT opened it — and ChatGPT opens a paragraph before the
+   * steps drawn above it can be read. Compared as they are, a round's recap fell after the paragraph
+   * that follows it and headed the next round. A step read after a paragraph was opened but no later
+   * than its text (the same pass included) is placed just before the paragraph.
+   *
+   * A call carries the moment it reached this app, after its trip through the tunnel. One ChatGPT
+   * issued just before opening the paragraph arrives a moment after it, so a call that arrived
+   * within CALL_TRANSIT_MS of the opening is placed before the paragraph too. A later one stays
+   * below it even when the paragraph was read later still: a hidden tab is read slowly.
+   */
+  const readBefore = new Map<T, number>();
+  const placeBefore = (group: readonly T[]): void => {
+    const paragraphs = group.filter(entry => entry.kind === 'assistant_message' && authoredTimeOf(entry) !== undefined)
+      .sort((a, b) => position(a) - position(b) || a.seq - b.seq);
+    // A call only moves above prose read live: the turn went on after it. A paragraph first seen
+    // after a reload was read long after the work below it.
+    const live = paragraphs.filter(entry => group.some(later => later.kind !== 'turn_end' && later.time > entry.time))
+      .sort((a, b) => authoredTimeOf(a)! - authoredTimeOf(b)!);
+    for (const work of group) {
+      if ((work.kind !== 'page_tool' && work.kind !== 'tool_call') || authoredTimeOf(work) !== undefined) continue;
+      // A step belongs to the paragraph after it on the page, which is read after it: when a whole
+      // turn is read late in one pass, every step still keeps to its own paragraph.
+      const prose = work.kind === 'page_tool'
+        ? paragraphs.find(entry => position(entry) > position(work) && authoredTimeOf(entry)! < work.time && work.time <= entry.time + SAME_READ_MS)
+        : live.find(entry => authoredTimeOf(entry)! < work.time && work.time <= authoredTimeOf(entry)! + CALL_TRANSIT_MS);
+      if (!prose) continue;
+      // One scale for steps and calls alike, so the ones moved before a paragraph keep their order.
+      const opened = authoredTimeOf(prose)!, span = Math.max(prose.time + SAME_READ_MS, opened + CALL_TRANSIT_MS) - opened;
+      // Strictly between anything that happened before the paragraph opened and the paragraph itself.
+      readBefore.set(work, opened - 1 + 0.9 * (work.time - opened) / span);
+    }
+  };
+
   // An entry with no usable time is ordered by its stable position (`origin` for a mutable
   // canonical item, otherwise `seq`) rather than being flung to one end of its turn: a
   // missing timestamp is not evidence about when the thing happened.
   const byTime = (a: T, b: T): number => {
-    const apart = a.time - b.time;
+    const apart = (readBefore.get(a) ?? authoredTimeOf(a) ?? a.time) - (readBefore.get(b) ?? authoredTimeOf(b) ?? b.time);
     return Number.isFinite(apart) && apart !== 0
       ? apart
       : position(a) - position(b) || a.seq - b.seq;
@@ -136,11 +443,11 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
       currentPosition = entryPosition;
     }
     let inferredAnchor: number | undefined;
-    if (!entry.turnId && activeAnchor !== undefined) {
+    if (entry.turnOrigin !== null && !entry.turnId && entry.kind !== 'user_message' && activeAnchor !== undefined) {
       const end = ends.get(activeAnchor);
       if (end === undefined || entry.time <= end) inferredAnchor = activeAnchor;
     }
-    const anchor = (entry.turnId ? anchors.get(entry.turnId) : inferredAnchor) ?? entryPosition;
+    const anchor = (entry.turnId ? anchors.get(entry.turnId) : undefined) ?? entry.turnOrigin ?? inferredAnchor ?? entryPosition;
     const held = groups.get(anchor);
     if (held) held.push(entry);
     else groups.set(anchor, [entry]);
@@ -151,6 +458,7 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
   for (const anchor of [...groups.keys()].sort((a, b) => a - b)) {
     const group = groups.get(anchor)!;
     const ends = closing(group);
+    placeBefore(group);
     group.sort((a, b) => rank(a, ends) - rank(b, ends) || byTime(a, b));
     out.push(...group);
   }
