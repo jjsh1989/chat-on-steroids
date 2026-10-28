@@ -25,6 +25,19 @@ afterAll(async () => {
   await removeTempDir(dir);
 });
 
+describe('Lite / Full interface mode', () => {
+  it('defaults old settings to Full and round-trips an explicit Lite choice', async () => {
+    const legacy = defaultConfig();
+    delete legacy.ui.interfaceMode;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+    expect((await loadConfig()).ui.interfaceMode).toBe('full');
+    await saveConfig({ ...legacy, ui: { ...legacy.ui, interfaceMode: 'lite' } });
+    expect((await loadConfig()).ui.interfaceMode).toBe('lite');
+    await saveConfig({ ...legacy, ui: { ...legacy.ui, interfaceMode: 'full' } });
+    expect((await loadConfig()).ui.interfaceMode).toBe('full');
+  });
+});
+
 describe('browser bridge port config', () => {
   it('defaults fresh and legacy configs to Auto and round-trips every supported choice', async () => {
     expect(defaultConfig().ui.browserBridgePort).toBe('auto');

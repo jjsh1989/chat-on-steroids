@@ -10,6 +10,8 @@
  */
 export const MAIN_TEXTS = [
   'Open',
+  'Open ChatGPT',
+  'Projects and settings…',
   'Show browser',
   'Hide browser',
   'Connect',

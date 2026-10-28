@@ -787,6 +787,7 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark'; appearance?:
       keepAwake: $<HTMLSelectElement>('keepAwake').value !== 'off',
       keepScreenAwake: $<HTMLSelectElement>('keepAwake').value === 'screen',
       minimizeToTray: $<HTMLInputElement>('minimizeToTray').checked,
+      interfaceMode: $<HTMLSelectElement>('interfaceMode').value === 'lite' ? 'lite' : 'full',
       developerMode: $<HTMLInputElement>('developerMode').checked,
       playfulStatus: $<HTMLInputElement>('playfulStatus').checked,
       playfulContinue: $<HTMLInputElement>('playfulContinue').checked,
@@ -1809,6 +1810,7 @@ function apply(next: AppState): void {
     config.ui.minimizeToTray,
     previousState?.config.ui.minimizeToTray
   );
+  applyValue($<HTMLSelectElement>('interfaceMode'), config.ui.interfaceMode ?? 'full', previousState?.config.ui.interfaceMode ?? 'full');
   applyChecked(
     $<HTMLInputElement>('privacyScreenshots'),
     config.ui.privacyScreenshots,
@@ -2914,6 +2916,7 @@ for (const id of [
   'startAtLogin',
   'keepAwake',
   'minimizeToTray',
+  'interfaceMode',
   'developerMode',
   'playfulStatus',
   'playfulContinue',

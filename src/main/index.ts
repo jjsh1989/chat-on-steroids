@@ -125,6 +125,8 @@ import { loadedCosBrowser, onCosBrowserLoaded, syncCosBrowser } from './cos-brow
 import {
   applyLoginStartup,
   isBackgroundLaunch,
+  shouldPresentStartupWindow,
+  shouldKeepWindowInTray,
   createWindowActivationGate,
   ownsAppRuntime,
   registerNativeWindowActivation,
@@ -264,9 +266,10 @@ function createWindow(): void {
   window.webContents.on('will-attach-webview', (event) => event.preventDefault());
 
   window.on('close', (event) => {
-    if (!quitting && getConfig().ui.minimizeToTray) {
+    if (!quitting && shouldKeepWindowInTray(getConfig().ui.minimizeToTray, getConfig().ui.interfaceMode)) {
       event.preventDefault();
       window?.hide();
+      if (process.platform === 'darwin' && getConfig().ui.interfaceMode === 'lite') app.dock?.hide();
     }
   });
 
@@ -300,6 +303,7 @@ function showWindow(): void {
   // below additionally protects the long pre-window startup interval, while this invariant makes
   // a direct caller harmless once `before-quit` has started.
   if (quitting) return;
+  if (process.platform === 'darwin' && getConfig().ui.interfaceMode === 'lite') app.dock?.show();
   if (!window) {
     createWindow();
     return;
@@ -403,7 +407,10 @@ function refreshTray(): void {
     Menu.buildFromTemplate([
       { label, enabled: false },
       { type: 'separator' },
-      { label: mainText('Open'), click: windowActivation.request },
+      ...(getConfig().ui.interfaceMode === 'lite' ? [
+        { label: mainText('Open ChatGPT'), click: () => void openInPreferredBrowser('https://chatgpt.com/', { reveal: true }).catch(error => logWarn(`lite: opening ChatGPT: ${error instanceof Error ? error.message : String(error)}`)) },
+        { label: mainText('Projects and settings…'), click: windowActivation.request }
+      ] : [{ label: mainText('Open'), click: windowActivation.request }]),
       // The CoS browser lives in the tray: its windows never sit in a taskbar or dock. Only once
       // it is selected and loaded; the default extension path shows exactly the menu it had.
       ...(cosBrowser && getConfig().ui.chatBrowser === 'cos' ? [{
@@ -751,17 +758,25 @@ void app.whenReady().then(async () => {
   // Chats are restored here; the window, once enabled, can ask for its state before the pet overlay is ready.
   markStartup('restored');
   windowActivation.enable();
-  if (!isBackgroundLaunch(process.argv)) windowActivation.request();
+  // Lite is an explicit tray-first choice. Do not construct the full renderer at startup.
+  // The tray always offers a way back to its project and settings interface.
+  if (shouldPresentStartupWindow(process.argv, getConfig().ui.interfaceMode)) windowActivation.request();
   // The desktop pet overlay is independent of the main window once started; it stays hidden
   // until a pet is enabled.
   await startPetOverlay(() => window, () => windowActivation.request());
   // macOS `activate` can fire on first launch, so do not wire it at module load where it could
   // create a BrowserWindow before Electron is ready. Once the initial window path is established,
   // Dock activation/re-launch can safely recreate or focus it.
-  registerNativeWindowActivation(app, windowActivation.request);
+  registerNativeWindowActivation(app, () => {
+    if (getConfig().ui.interfaceMode !== 'lite') windowActivation.request();
+  });
 
   tray = new Tray(trayIcon(false), ...trayGuidArgsForPlatform());
-  tray.on('click', windowActivation.request);
+  // Hide the Dock entry only after the menu-bar escape hatch exists.
+  if (process.platform === 'darwin' && getConfig().ui.interfaceMode === 'lite') app.dock?.hide();
+  tray.on('click', () => {
+    if (getConfig().ui.interfaceMode !== 'lite') windowActivation.request();
+  });
   refreshTray();
   onStatusChange(refreshTray);
   // The built-in browser's own hooks live in its module, which loads only once it is selected.
@@ -818,7 +833,7 @@ app.on('window-all-closed', () => {
   // macOS convention: closing the last window is not quitting the application. The Dock/menu
   // bar stay alive and `activate` recreates it. Windows/Linux retain the explicit close-to-tray
   // preference; Cmd+Q / app.quit bypasses this event and still enters the shutdown sequence.
-  if (shouldQuitOnWindowAllClosed(process.platform, getConfig().ui.minimizeToTray)) app.quit();
+  if (shouldQuitOnWindowAllClosed(process.platform, shouldKeepWindowInTray(getConfig().ui.minimizeToTray, getConfig().ui.interfaceMode))) app.quit();
 });
 
 /**

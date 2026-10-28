@@ -144,6 +144,16 @@ export function isBackgroundLaunch(argv: readonly string[]): boolean {
   return argv.includes('--background');
 }
 
+/** Full opens its workspace at startup; Lite runs the same services from the tray. */
+export function shouldPresentStartupWindow(argv: readonly string[], mode: 'full' | 'lite' = 'full'): boolean {
+  return mode !== 'lite' && !isBackgroundLaunch(argv);
+}
+
+/** Lite must not exit when its temporary settings window is closed. */
+export function shouldKeepWindowInTray(minimizeToTray: boolean, mode: 'full' | 'lite' = 'full'): boolean {
+  return minimizeToTray || mode === 'lite';
+}
+
 export function supportsLoginStartup(platform: NodeJS.Platform, packaged: boolean): boolean {
   return platform === 'win32' && packaged;
 }

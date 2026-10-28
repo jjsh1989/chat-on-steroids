@@ -207,6 +207,8 @@ export interface UiPrefs {
   /** Set once the notice that the CoS browser hid to the tray, still running, was shown. */
   cosBrowserTrayHint?: boolean;
   minimizeToTray: boolean;
+  /** Full desktop workspace or tray-first, ChatGPT-led operation. Default is Full. */
+  interfaceMode?: 'full' | 'lite';
   autoConnect: boolean;
   startAtLogin?: boolean;
   /** A notification when a chat finishes a turn while the window is in the background. Missing means on. */

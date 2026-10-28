@@ -399,6 +399,7 @@ const configSchema = z.object({
     autoSelectSkills: z.boolean().optional().default(false),
     tabsToKeepOpen: z.number().int().min(1).max(50).optional(),
     minimizeToTray: z.boolean(),
+    interfaceMode: z.enum(['full', 'lite']).optional().default('full').catch('full'),
     autoConnect: z.boolean(),
     startAtLogin: z.boolean().optional().default(false),
     turnNotifications: z.boolean().optional().default(true),

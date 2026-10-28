@@ -4,6 +4,8 @@ import vm from 'node:vm';
 import {
   applyLoginStartup,
   isBackgroundLaunch,
+  shouldPresentStartupWindow,
+  shouldKeepWindowInTray,
   supportsLoginStartup,
   createWindowActivationGate,
   ownsAppRuntime,
@@ -42,7 +44,8 @@ describe('native window activation', () => {
       restore: () => operations.push('restore'),
       show: () => operations.push('show'), focus: () => operations.push('focus') };
     const createWindow = vi.fn();
-    const context = vm.createContext({ window: native, quitting: false, createWindow });
+    const context = vm.createContext({ window: native, quitting: false, createWindow,
+      process: { platform: 'win32' }, getConfig: () => ({ ui: { interfaceMode: 'full' } }), app: {} });
     vm.runInContext(present + '\nshowWindow();', context);
     expect(operations.splice(0)).toEqual(['show', 'focus']);
     state.minimized = true;
@@ -113,6 +116,22 @@ describe('native window activation', () => {
     expect(shouldBeginAppBootstrap(false, false)).toBe(false);
     expect(shouldBeginAppBootstrap(false, true)).toBe(false);
     expect(shouldBeginAppBootstrap(true, true)).toBe(false);
+  });
+
+  it('starts Lite in the tray but keeps Full visible and login-background launches hidden', () => {
+    expect(shouldPresentStartupWindow([], 'full')).toBe(true);
+    expect(shouldPresentStartupWindow([], 'lite')).toBe(false);
+    expect(shouldPresentStartupWindow(['--background'], 'full')).toBe(false);
+    expect(shouldPresentStartupWindow(['--background'], 'lite')).toBe(false);
+    expect(shouldPresentStartupWindow([])).toBe(true);
+  });
+
+  it('never quits on close in Lite even when the old minimize setting was off', () => {
+    for (const platform of ['darwin', 'win32', 'linux'] as const) {
+      expect(shouldKeepWindowInTray(false, 'lite')).toBe(true);
+      expect(shouldKeepWindowInTray(false, 'full')).toBe(false);
+      expect(shouldQuitOnWindowAllClosed(platform, shouldKeepWindowInTray(false, 'lite'))).toBe(false);
+    }
   });
 
   it('drops second-instance focus requests until renderer security and IPC startup are ready', () => {
@@ -261,6 +280,6 @@ describe('Windows login startup', () => {
     received({}, ['app.exe']);
     expect(request).toHaveBeenCalledOnce();
     expect(isBackgroundLaunch(['app.exe', '--background=false'])).toBe(false);
-    expect(source).toContain('if (!isBackgroundLaunch(process.argv)) windowActivation.request();');
+    expect(source).toContain('if (shouldPresentStartupWindow(process.argv, getConfig().ui.interfaceMode)) windowActivation.request();');
   });
 });
