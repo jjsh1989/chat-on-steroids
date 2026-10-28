@@ -28,6 +28,7 @@ const projectSchema = z.object({
   id: z.string().uuid(), name: z.string().min(1).max(160), path: z.string().min(1).max(32768),
   color: z.enum(PROJECT_COLORS).optional(),
   createdAt: z.number().finite().nonnegative(), ungrouped: z.boolean().optional(), secretsShieldOff: z.boolean().optional(),
+  chatgptSetup: z.enum(['pending', 'local-only']).optional(),
   chatgpt: chatgptSchema.optional(),
   remote: z.object({ host: z.string().min(1).max(255), port: z.number().int().min(1).max(65535).optional(), path: z.string().min(1).max(4096) }).optional()
 });
@@ -67,9 +68,9 @@ export function addProject(folderPath: string, options: { chatgpt?: 'later' } = 
     // Only a project created here gets a native ChatGPT Project; an existing or restored one
     // above keeps exactly what it had.
     const project: LocalProject = { id: randomUUID(), name: (path.basename(resolved.real) || resolved.real).slice(0, 160), path: resolved.real, createdAt: Date.now(),
-      ...(options.chatgpt === 'later' ? {} : { chatgpt: { state: 'requested', requestId: randomUUID(), updatedAt: Date.now() } as const }) };
+      ...(options.chatgpt === 'later' ? { chatgptSetup: 'pending' as const } : { chatgpt: { state: 'requested', requestId: randomUUID(), updatedAt: Date.now() } as const }) };
     await writeDurableNow('projects', [...projects, project]);
-    logInfo(`projects: project ${project.id} asks for a new ChatGPT Project`);
+    logInfo(`projects: project ${project.id} ${options.chatgpt === 'later' ? 'awaits an explicit ChatGPT Project choice' : 'asks for a new ChatGPT Project'}`);
     return project;
   });
   mutations = operation.catch(() => undefined);
@@ -115,7 +116,7 @@ export function addRemoteProject(address: string, folder: string, deps: { connec
     }
     if (projects.length >= 200) throw new Error('Project catalog limit reached');
     const project: LocalProject = { id: randomUUID(), name: (path.posix.basename(realPath) || identity).slice(0, 160), path: identity, remote,
-      createdAt: Date.now(), ...(options.chatgpt === 'later' ? {} : { chatgpt: { state: 'requested', requestId: randomUUID(), updatedAt: Date.now() } as const }) };
+      createdAt: Date.now(), ...(options.chatgpt === 'later' ? { chatgptSetup: 'pending' as const } : { chatgpt: { state: 'requested', requestId: randomUUID(), updatedAt: Date.now() } as const }) };
     await writeDurableNow('projects', [...projects, project]);
     logInfo(`projects: project ${project.id} asks for a new ChatGPT Project`);
     return project;
@@ -164,7 +165,8 @@ export function linkChatgptProject(projectId: string, chatgptId: string): Promis
     if (!(await isListedChatgptProject(chatgptId))) refuse('not listed for this account', 'That Project is not one ChatGPT lists for this account');
     const owner = projects.find(row => !row.ungrouped && row.id !== projectId && row.chatgpt?.state === 'linked' && row.chatgpt.id === chatgptId);
     if (owner) refuse('already linked to another project', 'That ChatGPT Project is already linked to another project');
-    const updated: LocalProject = { ...project, chatgpt: { state: 'linked', id: chatgptId, updatedAt: Date.now() } };
+    const { chatgptSetup: _, ...withoutChoice } = project;
+    const updated: LocalProject = { ...withoutChoice, chatgpt: { state: 'linked', id: chatgptId, updatedAt: Date.now() } };
     await writeDurableNow('projects', projects.map(row => row.id === projectId ? updated : row));
     logInfo(`projects: project ${projectId} linked to the existing ChatGPT Project ${chatgptId}`);
     return updated;
@@ -187,7 +189,8 @@ export function createChatgptProjectFor(projectId: string, options: { replace?: 
     const link = project.chatgpt;
     if (link && !options.replace) return project;
     if (link && link.state !== 'linked' && link.state !== 'failed' && link.state !== 'uncertain') throw new Error('Its ChatGPT Project is being created');
-    const updated: LocalProject = { ...project, chatgpt: { state: 'requested', requestId: randomUUID(), updatedAt: Date.now() } };
+    const { chatgptSetup: _, ...withoutChoice } = project;
+    const updated: LocalProject = { ...withoutChoice, chatgpt: { state: 'requested', requestId: randomUUID(), updatedAt: Date.now() } };
     if (link) logInfo(`projects: project ${projectId} asks for a new ChatGPT Project in place of its previous one`);
     await writeDurableNow('projects', projects.map(row => row.id === projectId ? updated : row));
     return updated;
@@ -208,9 +211,10 @@ export function unlinkChatgptProject(projectId: string): Promise<LocalProject> {
     const project = projects.find(row => row.id === projectId && !row.ungrouped);
     if (!project) throw new Error('Project not found');
     const link = project.chatgpt;
-    if (!link) return project;
-    if (link.state !== 'linked' && link.state !== 'failed' && link.state !== 'uncertain') throw new Error('Its ChatGPT Project is being created');
-    const { chatgpt: _, ...updated } = project;
+    if (!link && project.chatgptSetup === 'local-only') return project;
+    if (link && link.state !== 'linked' && link.state !== 'failed' && link.state !== 'uncertain') throw new Error('Its ChatGPT Project is being created');
+    const { chatgpt: _, ...withoutLink } = project;
+    const updated: LocalProject = { ...withoutLink, chatgptSetup: 'local-only' };
     await writeDurableNow('projects', projects.map(row => row.id === projectId ? updated : row));
     logInfo(`projects: project ${projectId} no longer uses a ChatGPT Project (the Project stays in ChatGPT)`);
     return updated;

@@ -14,7 +14,7 @@ type Reply<T> = { ok: true; data: T } | { ok: false; error: string };
  * another one or a new one. A ChatGPT Project another project uses is shown but cannot be picked.
  */
 export function createChatgptProjectPicker(deps: {
-  api: Pick<AppApi, 'chatgptProjectChoices' | 'linkChatgptProject' | 'createChatgptProject'>;
+  api: Pick<AppApi, 'chatgptProjectChoices' | 'linkChatgptProject' | 'createChatgptProject' | 'unlinkChatgptProject'>;
   anchor: (projectId: string) => HTMLElement | null;
   onUpdated: (project: LocalProject) => void;
   onError: (message: string) => void;
@@ -56,6 +56,13 @@ export function createChatgptProjectPicker(deps: {
         fallback: true,
         pick: () => decide(() => deps.api.createChatgptProject(project.id, link ? { replace: true } : {}))
       }] : [];
+      // A local-only project is an explicit decision. Escape/closing the picker never means skip.
+      const localOnly: SearchPopupChoice[] = !link && project.chatgptSetup === 'pending' ? [{
+        label: t('Use this folder without a ChatGPT Project'),
+        title: t('New chats will not be grouped in ChatGPT until you link a Project'),
+        lead: icon('i-folder'),
+        pick: () => decide(() => deps.api.unlinkChatgptProject(project.id))
+      }] : [];
       popup = createSearchPopup({
         trigger: () => deps.anchor(project.id),
         className: 'file-branch',
@@ -74,15 +81,20 @@ export function createChatgptProjectPicker(deps: {
             ...(elsewhere ? { hint: t('Linked to {0}', [elsewhere.name]) } : {}),
             pick: () => decide(() => deps.api.linkChatgptProject(project.id, choice.id))
           } satisfies SearchPopupChoice;
-        })],
+        }), ...localOnly],
         empty: () => t('No ChatGPT Project matches'),
         notes: () => [t('Missing one? Open chatgpt.com to refresh.'),
-          ...(mode === 'added' ? [t('Or choose later from the ⋯ menu.')] : [])]
+          ...(mode === 'added' ? [t('Closing this choice leaves ChatGPT Project setup pending. Finish from the project’s ⋯ menu.')] : [])],
+        onDismiss: () => {
+          if (mode === 'added' && !decided && project.chatgptSetup === 'pending') {
+            deps.onNotice(t('ChatGPT Project setup is pending. Finish from the project’s ⋯ menu.'));
+          }
+        }
       });
       popup.show();
       // No row to open the choice from (the sidebar hides it): after an add, nothing is created either;
       // the person learns where to choose instead.
-      if (!popup.open && mode === 'added' && !decided) deps.onNotice(t('Choose its ChatGPT Project later from the project’s ⋯ menu.'));
+      if (!popup.open && mode === 'added' && !decided) deps.onNotice(t('ChatGPT Project setup is pending. Finish from the project’s ⋯ menu.'));
     }
   };
 }

@@ -2262,7 +2262,7 @@ it('offers a local folder and a server folder from the sidebar +, and marks a se
   (doc.getElementById('sshProjectFolder') as HTMLInputElement).value = '/srv/app';
   doc.getElementById('sshProjectForm')!.dispatchEvent(new w.Event('submit', { cancelable: true }));
   await settle();
-  expect(api.addRemoteProject).toHaveBeenCalledWith('me@devbox', '/srv/app');
+  expect(api.addRemoteProject).toHaveBeenCalledWith('me@devbox', '/srv/app', { chatgpt: 'later' });
   const badge = doc.querySelector(`[data-project-id="${remote.id}"] .project-badge`);
   expect(badge?.textContent).toBe('SSH');
   expect(badge?.getAttribute('title')).toBe('me@devbox');
@@ -2276,7 +2276,7 @@ describe('choosing a ChatGPT Project for a project', () => {
     const { w } = await boot([], false);
     const api = (w as any).api;
     api.chatgptProjectChoices = vi.fn(async () => ({ ok: true, data: choices }));
-    api.addProject = vi.fn(async () => ({ ok: true, data: local }));
+    api.addProject = vi.fn(async () => ({ ok: true, data: { ...local, chatgptSetup: 'pending' } }));
     api.linkChatgptProject = vi.fn(async (id: string, chatgptId: string) => ({ ok: true, data: { ...local, id, chatgpt: { state: 'linked', id: chatgptId, updatedAt: 4 } } }));
     api.createChatgptProject = vi.fn(async (id: string) => ({ ok: true, data: { ...local, id, chatgpt: { state: 'requested', requestId: 'cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee', updatedAt: 4 } } }));
     (w.document.getElementById('addProject') as HTMLButtonElement).click();
@@ -2291,9 +2291,9 @@ describe('choosing a ChatGPT Project for a project', () => {
   it('links the new project to a Project the account already has', async () => {
     const { w, api, options } = await adding(listed);
     expect(api.addProject).toHaveBeenCalledWith({ chatgpt: 'later' });
-    expect(options().map(option => option.textContent)).toEqual(['New ChatGPT Project “Local”', 'Existing', 'TakenLinked to Other']);
+    expect(options().map(option => option.textContent)).toEqual(['New ChatGPT Project “Local”', 'Existing', 'TakenLinked to Other', 'Use this folder without a ChatGPT Project']);
     expect(options()[2]!.disabled).toBe(true);
-    expect(options().map(option => option.title)).toEqual(['New ChatGPT Project “Local”', 'Existing', 'Taken\nLinked to Other']);
+    expect(options().map(option => option.title)).toEqual(['New ChatGPT Project “Local”', 'Existing', 'Taken\nLinked to Other', 'New chats will not be grouped in ChatGPT until you link a Project']);
     options()[1]!.click();
     await settle();
     expect(api.linkChatgptProject).toHaveBeenCalledWith(local.id, existing);
@@ -2303,17 +2303,20 @@ describe('choosing a ChatGPT Project for a project', () => {
 
   it('creates nothing when the choice is closed, and says it can be made later from the menu', async () => {
     const { w, api } = await adding(listed);
-    expect(w.document.querySelector('.chatgpt-project-picker')!.textContent).toContain('Or choose later from the ⋯ menu.');
+    expect(w.document.querySelector('.chatgpt-project-picker')!.textContent).toContain('Closing this choice leaves ChatGPT Project setup pending.');
     w.document.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     await settle();
     expect(api.createChatgptProject).not.toHaveBeenCalled();
     expect(api.linkChatgptProject).not.toHaveBeenCalled();
   });
 
-  it('adds as before when ChatGPT listed nothing to choose', async () => {
+  it('still offers creating a native Project or explicit local-only when none is available to link', async () => {
     const { w, api } = await adding([listed[1]]);
-    expect(api.addProject).toHaveBeenCalledWith();
-    expect(w.document.querySelector('.chatgpt-project-picker')).toBeNull();
+    expect(api.addProject).toHaveBeenCalledWith({ chatgpt: 'later' });
+    const choices = [...w.document.querySelectorAll('.chatgpt-project-picker [role="option"]')];
+    expect(choices.map(option => option.textContent)).toEqual([
+      'New ChatGPT Project “Local”', 'TakenLinked to Other', 'Use this folder without a ChatGPT Project'
+    ]);
     expect(api.createChatgptProject).not.toHaveBeenCalled();
   });
 

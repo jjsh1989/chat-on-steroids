@@ -86,8 +86,10 @@ it('links a project without a ChatGPT Project to one the person already has, one
   await noteChatgptProjects([{ id: id('a'), name: 'Kunden' }, { id: id('b'), name: 'Other' }]);
   const first = await addProject(path.join(approved, 'first'), { chatgpt: 'later' });
   expect(first.chatgpt).toBeUndefined();
+  expect(first.chatgptSetup).toBe('pending');
   const linked = await linkChatgptProject(first.id, id('a'));
   expect(linked.chatgpt).toMatchObject({ state: 'linked', id: id('a') });
+  expect(linked.chatgptSetup).toBeUndefined();
   expect(await linkChatgptProject(first.id, id('a'))).toMatchObject({ chatgpt: { state: 'linked', id: id('a') } });
   const choices = await chatgptProjectChoices();
   expect(choices.find(choice => choice.id === id('a'))?.linkedTo).toEqual({ id: first.id, name: 'first' });
@@ -137,15 +139,30 @@ it('unlinks a ChatGPT Project without touching it, and starts a new one in place
   expect((await createChatgptProjectFor(project.id)).chatgpt).toMatchObject({ state: 'linked', id: id('a') });
   // Unlinking frees it for another project; nothing in ChatGPT changes, so it is listed as before.
   expect((await unlinkChatgptProject(project.id)).chatgpt).toBeUndefined();
+  expect((await getProject(project.id))?.chatgptSetup).toBe('local-only');
   expect((await chatgptProjectChoices()).find(choice => choice.id === id('a'))?.linkedTo).toBeNull();
   expect((await getProject(project.id))?.chatgpt).toBeUndefined();
   // Unlinking what is not linked is a no-op, never an error.
   expect((await unlinkChatgptProject(project.id)).chatgpt).toBeUndefined();
   await linkChatgptProject(project.id, id('a'));
+  expect((await getProject(project.id))?.chatgptSetup).toBeUndefined();
   expect((await createChatgptProjectFor(project.id, { replace: true })).chatgpt).toMatchObject({ state: 'requested' });
   // While a new one is being created, neither unlinking nor relinking may race it.
   await expect(unlinkChatgptProject(project.id)).rejects.toThrow(/being created/);
   await expect(linkChatgptProject(project.id, id('a'))).rejects.toThrow(/being created/);
+});
+
+it('persists explicit local-only choice without creating or deleting a native Project', async () => {
+  const project = await addProject(path.join(approved, 'first'), { chatgpt: 'later' });
+  expect(project).toMatchObject({ chatgptSetup: 'pending' });
+  const skipped = await unlinkChatgptProject(project.id);
+  expect(skipped.chatgpt).toBeUndefined();
+  expect(skipped.chatgptSetup).toBe('local-only');
+  expect((await getProject(project.id))?.chatgptSetup).toBe('local-only');
+  expect(await unlinkChatgptProject(project.id)).toEqual(skipped);
+  const requested = await createChatgptProjectFor(project.id);
+  expect(requested.chatgpt).toMatchObject({ state: 'requested' });
+  expect(requested.chatgptSetup).toBeUndefined();
 });
 
 it('never replaces a catalog it could not read, but rebuilds one that is damaged', async () => {

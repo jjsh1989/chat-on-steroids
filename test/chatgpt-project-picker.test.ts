@@ -23,7 +23,8 @@ async function picker(anchor: HTMLElement | null) {
   const api = {
     chatgptProjectChoices: vi.fn(() => ok(listed)),
     linkChatgptProject: vi.fn(() => ok(project)),
-    createChatgptProject: vi.fn(() => ok(project))
+    createChatgptProject: vi.fn(() => ok(project)),
+    unlinkChatgptProject: vi.fn(() => ok({ ...project, chatgptSetup: 'local-only' }))
   };
   const onNotice = vi.fn(), onError = vi.fn(), onUpdated = vi.fn();
   const { createChatgptProjectPicker } = await import('../src/renderer/chatgpt-project-picker.js');
@@ -34,13 +35,32 @@ async function picker(anchor: HTMLElement | null) {
 const button = () => { const node = document.createElement('button'); document.body.append(node); return node; };
 const options = () => [...document.querySelectorAll<HTMLButtonElement>('.chatgpt-project-picker [role="option"]')];
 
-it('creates nothing right after adding when there is no row to open the choice from, and says where to choose later', async () => {
+it('keeps setup pending when the new row is not visible instead of auto-creating', async () => {
   const { api, created, onNotice } = await picker(null);
-  await created.offer(project, 'added');
+  await created.offer({ ...project, chatgptSetup: 'pending' }, 'added');
   await settle();
   expect(api.createChatgptProject).not.toHaveBeenCalled();
   expect(api.linkChatgptProject).not.toHaveBeenCalled();
-  expect(onNotice).toHaveBeenCalledWith('Choose its ChatGPT Project later from the project’s ⋯ menu.');
+  expect(onNotice).toHaveBeenCalledWith('ChatGPT Project setup is pending. Finish from the project’s ⋯ menu.');
+});
+
+it('offers explicit local-only setup and never treats Escape as consent to skip', async () => {
+  const { api, created, onNotice, onUpdated } = await picker(button());
+  await created.offer({ ...project, chatgptSetup: 'pending' }, 'added');
+  expect(options().map(option => option.textContent)).toEqual([
+    'New ChatGPT Project “Local”', 'Existing', 'Current', 'Use this folder without a ChatGPT Project'
+  ]);
+  document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  await settle();
+  expect(api.unlinkChatgptProject).not.toHaveBeenCalled();
+  expect(api.createChatgptProject).not.toHaveBeenCalled();
+  expect(onNotice).toHaveBeenCalledWith('ChatGPT Project setup is pending. Finish from the project’s ⋯ menu.');
+
+  await created.offer({ ...project, chatgptSetup: 'pending' }, 'menu');
+  options()[3]!.click();
+  await settle();
+  expect(api.unlinkChatgptProject).toHaveBeenCalledWith(project.id);
+  expect(onUpdated).toHaveBeenCalledWith(expect.objectContaining({ chatgptSetup: 'local-only' }));
 });
 
 it('changes a linked project to a new ChatGPT Project in place of the old one', async () => {

@@ -288,6 +288,7 @@ const removingProject = new Set<string>();
 function projectMenuItems(id: string): RowMenuItem[] {
   const color = projects.find(row => row.id === id)?.color ?? null;
   const link = projects.find(row => row.id === id)?.chatgpt;
+  const chatgptSetup = projects.find(row => row.id === id)?.chatgptSetup;
   const shieldOff = projects.find(row => row.id === id)?.secretsShieldOff === true;
   const shieldEverywhere = deps.state()?.config.ui.secretsShield !== false;
   return [
@@ -296,7 +297,7 @@ function projectMenuItems(id: string): RowMenuItem[] {
     // A project without a ChatGPT Project, or whose creation failed, can take a new or an existing one (#1756).
     ...(!link || link.state === 'failed' || link.state === 'uncertain' ? [{
       action: 'chatgpt-link', icon: 'i-folder',
-      label: () => t('Choose a ChatGPT Project…'),
+      label: () => chatgptSetup === 'pending' ? t('Finish ChatGPT Project setup…') : t('Choose a ChatGPT Project…'),
       title: () => t('Use a new or an existing ChatGPT Project for this project\'s chats'),
       run: () => { const project = projects.find(row => row.id === id); if (project) void chatgptProjectPicker.offer(project, 'menu'); }
     } satisfies RowMenuItem] : []),
@@ -390,11 +391,13 @@ async function retryChatgptProject(id: string): Promise<void> {
  * Why a new chat of this project is still waiting, while its native ChatGPT Project is being
  * created or could not be; null once it exists or for a project without one.
  */
-function chatgptProjectWait(entry: InputEntry): 'chatgpt-project' | 'chatgpt-project-failed' | 'project-removed' | null {
+function chatgptProjectWait(entry: InputEntry): 'chatgpt-project-choice' | 'chatgpt-project' | 'chatgpt-project-failed' | 'project-removed' | null {
   if (!entry.projectId) return null;
   if (entry.sessionId && sessions.find(session => session.id === entry.sessionId)?.conversationId) return null;
   const project = projects.find(row => row.id === entry.projectId);
   const link = project?.chatgpt;
+  if (project?.ungrouped && (link || project.chatgptSetup === 'pending')) return 'project-removed';
+  if (project?.chatgptSetup === 'pending') return 'chatgpt-project-choice';
   if (!link || link.state === 'linked') return null;
   // Removed from the sidebar: nothing creates its ChatGPT Project any more and it has no menu to
   // retry from. Adding the folder again restores both, and the message goes out.
@@ -2390,6 +2393,11 @@ function paintSessions(): void {
       // A folder on a server (#1469): the address is the hover text, the badge says how it is reached.
       const badge = el('span', 'project-badge', () => 'SSH');
       ui(badge, 'title', () => project.remote ? `${project.remote.host}${project.remote.port ? `:${project.remote.port}` : ''}` : '');
+      heading.append(badge);
+    }
+    if (project?.chatgptSetup === 'pending' || project?.chatgpt?.state === 'failed' || project?.chatgpt?.state === 'uncertain') {
+      const badge = el('span', 'project-badge', () => t('Setup'));
+      ui(badge, 'title', () => t('Finish ChatGPT Project setup from the project’s ⋯ menu.'));
       heading.append(badge);
     }
     section.append(heading);
@@ -8321,7 +8329,7 @@ function heldBySendCheck(entry: InputEntry): boolean {
   return entry.state === 'queued' && !!entry.sendCheck && sendCheckConfigured && entry.sendCheck.nextAt > Date.now();
 }
 
-function queuedWaitReason(entry: InputEntry): 'send-check' | 'extension' | 'tool-call' | 'chatgpt-project' | 'chatgpt-project-failed' | 'project-removed' | null {
+function queuedWaitReason(entry: InputEntry): 'send-check' | 'extension' | 'tool-call' | 'chatgpt-project-choice' | 'chatgpt-project' | 'chatgpt-project-failed' | 'project-removed' | null {
   if (entry.state !== 'queued' || entry.error || entry.dueAt > Date.now() || entry.delivery === 'tool') return null;
   if (heldBySendCheck(entry)) return 'send-check';
   if (!bridgePresent) return 'extension';
@@ -8509,7 +8517,7 @@ function inputMessageRow(entry: InputEntry, notice: boolean): HTMLElement {
   if (!visibleInputIds.has(entry.id)) row.classList.add('is-entering');
   visibleInputIds.add(entry.id);
   if (visibleInputIds.size > 100) visibleInputIds.delete(visibleInputIds.values().next().value!);
-  const status = () => entry.error ? t(entry.error) : held ? t("Sending in a moment…") : waiting === 'send-check' ? sendCheckHold(entry)! : waiting === 'extension' ? t("Waiting for the browser extension to connect") : waiting === 'tool-call' ? t("Waiting for the running tool call to finish") : waiting === 'chatgpt-project' ? t("Creating this project in ChatGPT…") : waiting === 'chatgpt-project-failed' ? t("This project's ChatGPT Project isn't available. Retry it from the project's menu.") : waiting === 'project-removed' ? t("This chat's project was removed from the sidebar. Add its folder again to send this message, or cancel it.") : (entry.state === 'failed' ? t("Delivery not confirmed") : entry.state === 'decision' ? t("Preparing follow-up") : entry.state === 'browser' ? t("Delivery confirmation pending") : entry.state === 'tool' ? t("Sent to the active turn · awaiting receipt") : entry.dueAt > Date.now() ? t("Scheduled {0}", [new Date(entry.dueAt).toLocaleString(currentLanguage())]) : entry.delivery === 'tool' ? t("Waiting for the next tool call") : t("Queued"));
+  const status = () => entry.error ? t(entry.error) : held ? t("Sending in a moment…") : waiting === 'send-check' ? sendCheckHold(entry)! : waiting === 'extension' ? t("Waiting for the browser extension to connect") : waiting === 'tool-call' ? t("Waiting for the running tool call to finish") : waiting === 'chatgpt-project-choice' ? t("Choose a ChatGPT Project or use this folder only from the project’s ⋯ menu.") : waiting === 'chatgpt-project' ? t("Creating this project in ChatGPT…") : waiting === 'chatgpt-project-failed' ? t("This project's ChatGPT Project isn't available. Retry it from the project's menu.") : waiting === 'project-removed' ? t("This chat's project was removed from the sidebar. Add its folder again to send this message, or cancel it.") : (entry.state === 'failed' ? t("Delivery not confirmed") : entry.state === 'decision' ? t("Preparing follow-up") : entry.state === 'browser' ? t("Delivery confirmation pending") : entry.state === 'tool' ? t("Sent to the active turn · awaiting receipt") : entry.dueAt > Date.now() ? t("Scheduled {0}", [new Date(entry.dueAt).toLocaleString(currentLanguage())]) : entry.delivery === 'tool' ? t("Waiting for the next tool call") : t("Queued"));
   const files = el('div', 'message-attachments');
   if (entry.attachments?.length) files.append(...entry.attachments.map(file => attachmentCard(file)));
   for (const image of entry.images ?? []) { const preview = document.createElement('img'); preview.src = image.dataUrl; preview.alt = image.name; files.append(preview); }
@@ -9558,17 +9566,16 @@ export function initChat(next: Deps): void {
     if (generation === selectionGeneration) selectNewChat(project.id); else paintSessions();
   };
   // With ChatGPT Projects to choose from, a new project's own is decided right after it is added (#1756).
-  const offerChatgptProject = (project: LocalProject, known: ReadonlySet<string>, asked: boolean) => {
-    if (asked && !known.has(project.id) && !project.chatgpt) setTimeout(() => void chatgptProjectPicker.offer(project, 'added'), 0);
+  const offerChatgptProject = (project: LocalProject, known: ReadonlySet<string>, _asked: boolean) => {
+    if (!known.has(project.id) && project.chatgptSetup === 'pending') setTimeout(() => void chatgptProjectPicker.offer(project, 'added'), 0);
   };
   const addLocalProject = async () => {
     const button = $<HTMLButtonElement>('addProject'); button.disabled = true;
     const generation = selectionGeneration;
     try {
-      const asked = await chatgptProjectPicker.hasChoices();
       const known = new Set(projects.map(row => row.id));
-      const project = await run(asked ? api.addProject({ chatgpt: 'later' }) : api.addProject());
-      if (project) { showAddedProject(project, generation); offerChatgptProject(project, known, asked); }
+      const project = await run(api.addProject({ chatgpt: 'later' }));
+      if (project) { showAddedProject(project, generation); offerChatgptProject(project, known, true); }
     } finally { button.disabled = false; }
   };
   // The composer's Share a folder means a folder on this computer: straight to the picker.
@@ -9578,7 +9585,7 @@ export function initChat(next: Deps): void {
   const sshProjectDialog = initSshProjectDialog(api, (project, known, asked) => {
     showAddedProject(project, sshDialogGeneration);
     offerChatgptProject(project, known, asked);
-  }, async () => ({ asked: await chatgptProjectPicker.hasChoices(), known: new Set(projects.map(row => row.id)) }));
+  }, async () => ({ asked: true, known: new Set(projects.map(row => row.id)) }));
   // A folder on this computer, or one on a server (#1469).
   $('addProject').addEventListener('click', event => {
     event.preventDefault();

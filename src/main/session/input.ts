@@ -1751,8 +1751,12 @@ export function pendingBrowserInputs(): Promise<Array<{ id: string; conversation
         // A new chat of a project with a native ChatGPT Project opens in that Project and nowhere
         // else: it waits while the Project is being created or could not be, never the root.
         // A branch is made where its source chat lives in ChatGPT, never on a Project's page.
-        const chatgptProject = !conversationId && entry.projectId && entry.purpose !== 'decision' && !entry.lifetime && !entry.branch
-          ? (await getProject(entry.projectId))?.chatgpt : undefined;
+        const targetProject = !conversationId && entry.projectId && entry.purpose !== 'decision' && !entry.lifetime && !entry.branch
+          ? await getProject(entry.projectId) : null;
+        // A dismissed setup picker must never silently start this project's first chat at the root.
+        // An explicit local-only choice clears this hold; the project folder grants no extra access.
+        if (targetProject?.chatgptSetup === 'pending') continue;
+        const chatgptProject = targetProject?.chatgpt;
         if (chatgptProject && chatgptProject.state !== 'linked') continue;
         const [end] = !entry.silenceBoundary && manualInput(entry) && entry.sessionId
           ? await readRecentEvents(entry.sessionId, 1, { kinds: ['turn_start', 'turn_end'] }) : [];

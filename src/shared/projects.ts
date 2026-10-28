@@ -15,6 +15,8 @@ export interface LocalProject {
   ungrouped?: boolean;
   /** The secrets shield is off for this project's chats (on everywhere else, unless off in Settings). */
   secretsShieldOff?: boolean;
+  /** A pending choice requires attention; local-only is an explicit decision, not a dismissed picker. */
+  chatgptSetup?: 'pending' | 'local-only';
   /**
    * The native ChatGPT Project this CoS project's new chats open in. Only projects created after
    * this existed have one; it grants no filesystem permission.
