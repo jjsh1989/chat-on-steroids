@@ -1175,10 +1175,12 @@ describe("a new chat's first message held for its project's ChatGPT Project", ()
   // again restores the project and its pending ChatGPT Project.
   const removed = "This chat's project was removed from the sidebar. Add its folder again to send this message, or cancel it.";
   it.each([
+    ['awaiting an explicit ChatGPT Project choice', { ...project, chatgpt: undefined, chatgptSetup: 'pending' }, 'Choose a ChatGPT Project or use this folder only from the project’s ⋯ menu.'],
     ['being created', project, 'Creating this project in ChatGPT…'],
     ['that could not be created', failed, "This project's ChatGPT Project isn't available. Retry it from the project's menu."],
     ['removed while it was being created', { ...project, ungrouped: true }, removed],
-    ['removed after it could not be created', { ...failed, ungrouped: true }, removed]
+    ['removed after it could not be created', { ...failed, ungrouped: true }, removed],
+    ['removed while waiting for setup', { ...project, chatgpt: undefined, chatgptSetup: 'pending', ungrouped: true }, removed]
   ] as const)('says why it waits for a project %s', async (_case, row, expected) => {
     const { w, live, append } = await boot([], false, [], [row as LocalProject], { summary: { conversationId: null, projectId: project.id } });
     // The chat sits in its project while the project is in the sidebar, under Chats once it is removed.

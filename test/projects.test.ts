@@ -7,7 +7,7 @@ import { bindBrowserInputProject, claimBrowserInput, enqueueInput, listInputs, p
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { flushDurable, initDurableStore, resetDurableForTests, writeDurableNow } from '../src/main/durable.js';
 import { createSession, getSession, initSessionStore, rebindSession, resetSessionStoreForTests, setSessionOrigin } from '../src/main/session/store.js';
-import { addProject, armProjectCreate, assignSessionProject, bindChatToLinkedProject, claimProjectCreate, completeProjectCreate, failProjectCreate, getProject, getSessionProject, inheritSessionProject, listProjects, markProjectGone, pendingProjectCreates, PROJECT_CREATE_ARMED_MS, PROJECT_CREATE_CLAIM_MS, projectWorkspace, removeProject, retryProjectCreate, sessionSecretsShieldOff, setProjectColor, setProjectSecretsShieldOff } from '../src/main/projects.js';
+import { addProject, armProjectCreate, assignSessionProject, bindChatToLinkedProject, claimProjectCreate, completeProjectCreate, failProjectCreate, getProject, getSessionProject, inheritSessionProject, listProjects, markProjectGone, pendingProjectCreates, PROJECT_CREATE_ARMED_MS, PROJECT_CREATE_CLAIM_MS, projectWorkspace, removeProject, retryProjectCreate, sessionSecretsShieldOff, setProjectColor, setProjectSecretsShieldOff, unlinkChatgptProject } from '../src/main/projects.js';
 import { validateNewRoot } from '../src/main/sandbox.js';
 import { resetWorkspaces, setWorkspaceFor } from '../src/main/workspace.js';
 
@@ -252,6 +252,18 @@ it("holds a new chat of a project until its native ChatGPT Project exists, then 
   // A project without one is unchanged: its new chat is offered without a Project.
   const plain = await enqueueInput({ id: randomUUID(), projectId: null, sessionId: null, text: 'Plain', dueAt: 0, mode: 'auto', model: null, reasoningEffort: null });
   expect((await pendingBrowserInputs()).find(row => row.id === plain.id)).not.toHaveProperty('project');
+});
+
+it('holds new messages in a pending-choice project until the person explicitly chooses local-only', async () => {
+  const project = await addProject(path.join(approved, 'first'), { chatgpt: 'later' });
+  expect(project.chatgptSetup).toBe('pending');
+  const input = await enqueueInput({ id: randomUUID(), projectId: project.id, sessionId: null, text: 'Hello', dueAt: 0, mode: 'auto', model: null, reasoningEffort: null });
+  // Escape in the picker is not authorization to send outside the intended ChatGPT Project.
+  expect((await pendingBrowserInputs()).find(row => row.id === input.id)).toBeUndefined();
+  await unlinkChatgptProject(project.id);
+  const ready = (await pendingBrowserInputs()).find(row => row.id === input.id);
+  expect(ready).toMatchObject({ conversationId: null });
+  expect(ready).not.toHaveProperty('project');
 });
 
 it('turns only the exact linked Project ChatGPT no longer opens into a failure that offers Retry', async () => {

@@ -41,7 +41,9 @@ export function createChatgptProjectPicker(deps: {
     },
     async offer(project, mode) {
       popup?.close();
-      if (mode === 'menu') await load();
+      // A newly added folder now always opens this picker, including when ChatGPT last listed
+      // nothing. Refresh choices for both entry points, not just the project's menu.
+      await load();
       let decided = false;
       const decide = (work: () => Promise<Reply<LocalProject>>) => { decided = true; void settle(work()); };
       const link = project.chatgpt;
